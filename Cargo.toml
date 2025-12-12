@@ -21,4 +21,5 @@ hf-hub = "0.4"
 
 # Tokenizer to decode Parakeet's SentencePiece/BPE tokens
 tokenizers = { version = "0.20", features = ["http"] }
-
+hound = "3.5"
+rustfft = "6.2"

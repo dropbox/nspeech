@@ -1,11 +1,15 @@
 use anyhow::{anyhow, Result};
 use candle_core::{DType, Device, Module, ModuleT, Tensor, D};
 use candle_nn::{
-    batch_norm, conv1d, conv1d_no_bias, layer_norm, linear, BatchNorm, BatchNormConfig, Conv1d,
-    Conv1dConfig, Dropout, LayerNorm, LayerNormConfig, Linear, VarBuilder,
+    batch_norm, conv1d, conv1d_no_bias, conv2d, layer_norm, linear, BatchNorm, BatchNormConfig,
+    Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, Dropout, LayerNorm, LayerNormConfig, Linear,
+    VarBuilder,
 };
 use hf_hub::api::sync::Api;
+use rustfft::{num_complex::Complex32, Fft, FftPlanner};
 use serde::Deserialize;
+use std::fs;
+use std::path::Path;
 use tokenizers::Tokenizer;
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -18,6 +22,8 @@ pub struct FastConformerConfig {
     pub conv_kernel_size: usize,
     pub dropout: f64,
     pub subsampling_channels: usize,
+    pub subsampling_stride: usize,
+    pub subsampling_factor: usize,
     pub vocab_size: usize,
     pub blank_id: usize,
 }
@@ -33,13 +39,15 @@ impl Default for FastConformerConfig {
             conv_kernel_size: 31,
             dropout: 0.1,
             subsampling_channels: 256,
+            subsampling_stride: 2,
+            subsampling_factor: 8,
             vocab_size: 1024,
             blank_id: 0,
         }
     }
 }
 
-// Simple sinusoidal positional encoding.
+// Sinusoidal positional encoding.
 fn sinusoidal_positional_encoding(length: usize, dim: usize, device: &Device) -> Result<Tensor> {
     let mut data = vec![0f32; length * dim];
     for pos in 0..length {
@@ -52,73 +60,98 @@ fn sinusoidal_positional_encoding(length: usize, dim: usize, device: &Device) ->
             }
         }
     }
-
     Ok(Tensor::from_slice(&data, (1, length, dim), device)?)
 }
 
-/// 8x time-reduction conv front-end:
-/// input:  [B, T, F]  (features)
-/// output: [B, T/8, D_model]
+/// HF-compatible 2D subsampling front-end (matches Parakeet checkpoint).
+/// input: [B, T, F] -> output: [B, T/8, D_model]
 pub struct ConvSubsampling {
-    conv1: Conv1d,
-    conv2: Conv1d,
-    conv3: Conv1d,
-    proj: Linear,
+    layers0: Conv2d,
+    layers2: Conv2d,
+    layers3: Conv2d,
+    layers5: Conv2d,
+    layers6: Conv2d,
+    linear: Linear,
 }
 
 impl ConvSubsampling {
     pub fn new(cfg: &FastConformerConfig, vb: VarBuilder<'_>) -> Result<Self> {
-        let mut c1 = Conv1dConfig::default();
-        c1.stride = 2;
-        c1.padding = 1;
-        let conv1 = conv1d(
-            cfg.feat_in,
-            cfg.subsampling_channels,
-            3,
-            c1,
-            vb.pp("conv1"),
-        )?;
+        let mut c = Conv2dConfig::default();
+        c.stride = cfg.subsampling_stride;
+        c.padding = 1;
+        let conv0 = conv2d(1, cfg.subsampling_channels, 3, c, vb.pp("layers.0"))?;
 
-        let mut c2 = Conv1dConfig::default();
-        c2.stride = 2;
+        let mut c2 = Conv2dConfig::default();
+        c2.stride = cfg.subsampling_stride;
         c2.padding = 1;
-        let conv2 = conv1d(
+        c2.groups = cfg.subsampling_channels; // depthwise
+        let conv2 = conv2d(
             cfg.subsampling_channels,
             cfg.subsampling_channels,
             3,
             c2,
-            vb.pp("conv2"),
+            vb.pp("layers.2"),
         )?;
 
-        let mut c3 = Conv1dConfig::default();
-        c3.stride = 2;
-        c3.padding = 1;
-        let conv3 = conv1d(
+        let mut c3 = Conv2dConfig::default();
+        c3.stride = 1;
+        c3.padding = 0;
+        let conv3 = conv2d(
+            cfg.subsampling_channels,
+            cfg.subsampling_channels,
+            1,
+            c3,
+            vb.pp("layers.3"),
+        )?;
+
+        let mut c5 = Conv2dConfig::default();
+        c5.stride = cfg.subsampling_stride;
+        c5.padding = 1;
+        c5.groups = cfg.subsampling_channels; // depthwise
+        let conv5 = conv2d(
             cfg.subsampling_channels,
             cfg.subsampling_channels,
             3,
-            c3,
-            vb.pp("conv3"),
+            c5,
+            vb.pp("layers.5"),
         )?;
 
-        let proj = linear(cfg.subsampling_channels, cfg.d_model, vb.pp("proj"))?;
+        let mut c6 = Conv2dConfig::default();
+        c6.stride = 1;
+        c6.padding = 0;
+        let conv6 = conv2d(
+            cfg.subsampling_channels,
+            cfg.subsampling_channels,
+            1,
+            c6,
+            vb.pp("layers.6"),
+        )?;
+
+        let flatten_dim = cfg.subsampling_channels * (cfg.feat_in / cfg.subsampling_factor);
+        let linear = linear(flatten_dim, cfg.d_model, vb.pp("linear"))?;
 
         Ok(Self {
-            conv1,
-            conv2,
-            conv3,
-            proj,
+            layers0: conv0,
+            layers2: conv2,
+            layers3: conv3,
+            layers5: conv5,
+            layers6: conv6,
+            linear,
         })
     }
 
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        // xs: [B, T, F] -> [B, F, T]
-        let xs = xs.transpose(1, 2)?;
-        let xs = self.conv1.forward(&xs)?.relu()?;
-        let xs = self.conv2.forward(&xs)?.relu()?;
-        let xs = self.conv3.forward(&xs)?.relu()?;
-        let xs = xs.transpose(1, 2)?; // [B, T/8, C]
-        let xs = self.proj.forward(&xs)?; // [B, T/8, D]
+        // xs: [B, T, F] -> [B, 1, T, F]
+        let (b, t, f) = xs.dims3()?;
+        let xs = xs.reshape((b, t, f, 1))?.transpose(1, 3)?.transpose(2, 3)?;
+        let xs = self.layers0.forward(&xs)?.relu()?;
+        let xs = self.layers2.forward(&xs)?.relu()?;
+        let xs = self.layers3.forward(&xs)?.relu()?;
+        let xs = self.layers5.forward(&xs)?.relu()?;
+        let xs = self.layers6.forward(&xs)?.relu()?;
+        let (b, c, h, w) = xs.dims4()?;
+        let xs = xs.transpose(1, 2)?.reshape((b, h, c * w))?;
+        let xs = self.linear.forward(&xs)?;
         Ok(xs)
     }
 }
@@ -132,14 +165,14 @@ pub struct FeedForward {
 impl FeedForward {
     pub fn new(d_model: usize, ff_mult: usize, drop: f64, vb: VarBuilder<'_>) -> Result<Self> {
         let hidden = d_model * ff_mult;
-        let w1 = linear(d_model, hidden, vb.pp("w1"))?;
-        let w2 = linear(hidden, d_model, vb.pp("w2"))?;
+        let w1 = linear(d_model, hidden, vb.pp("linear1"))?;
+        let w2 = linear(hidden, d_model, vb.pp("linear2"))?;
         let dropout = Dropout::new(drop as f32);
         Ok(Self { w1, w2, dropout })
     }
 
     pub fn forward(&self, xs: &Tensor, train: bool) -> Result<Tensor> {
-        let xs = self.w1.forward(xs)?.silu()?; // swish-ish non-linearity
+        let xs = self.w1.forward(xs)?.silu()?;
         let xs = self.dropout.forward(&xs, train)?;
         let xs = self.w2.forward(&xs)?;
         Ok(xs)
@@ -164,10 +197,10 @@ impl MultiHeadSelfAttention {
             ));
         }
         let head_dim = d_model / num_heads;
-        let q_proj = linear(d_model, d_model, vb.pp("q"))?;
-        let k_proj = linear(d_model, d_model, vb.pp("k"))?;
-        let v_proj = linear(d_model, d_model, vb.pp("v"))?;
-        let o_proj = linear(d_model, d_model, vb.pp("o"))?;
+        let q_proj = linear(d_model, d_model, vb.pp("q_proj"))?;
+        let k_proj = linear(d_model, d_model, vb.pp("k_proj"))?;
+        let v_proj = linear(d_model, d_model, vb.pp("v_proj"))?;
+        let o_proj = linear(d_model, d_model, vb.pp("o_proj"))?;
         Ok(Self {
             q_proj,
             k_proj,
@@ -180,33 +213,18 @@ impl MultiHeadSelfAttention {
     }
 
     pub fn forward(&self, xs: &Tensor, train: bool) -> Result<Tensor> {
-        // xs: [B, T, D]
         let (b, t, d) = xs.dims3()?;
-
         let q = self.q_proj.forward(xs)?;
         let k = self.k_proj.forward(xs)?;
         let v = self.v_proj.forward(xs)?;
-
-        // [B, T, D] -> [B, H, T, Dh]
-        let q = q
-            .reshape((b, t, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((b, t, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b, t, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
+        let q = q.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?;
+        let k = k.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?;
+        let v = v.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?;
         let scale = (self.head_dim as f64).sqrt();
-        let attn_scores =
-            (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? / scale)?;
+        let attn_scores = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? / scale)?;
         let attn_weights = candle_nn::ops::softmax(&attn_scores, D::Minus1)?;
-
         let attn_weights = self.dropout.forward(&attn_weights, train)?;
-        let context = attn_weights.matmul(&v)?; // [B, H, T, Dh]
-
-        // -> [B, T, D]
+        let context = attn_weights.matmul(&v)?;
         let context = context.transpose(1, 2)?.reshape((b, t, d))?;
         let out = self.o_proj.forward(&context)?;
         Ok(out)
@@ -214,9 +232,9 @@ impl MultiHeadSelfAttention {
 }
 
 pub struct ConvModule {
-    pw1: Conv1d,  // pointwise: D -> 2D
-    dw: Conv1d,   // depthwise: 2D -> 2D
-    pw2: Conv1d,  // pointwise: 2D -> D
+    pw1: Conv1d,
+    dw: Conv1d,
+    pw2: Conv1d,
     bn: BatchNorm,
     dropout: Dropout,
     d_model: usize,
@@ -227,13 +245,13 @@ impl ConvModule {
         let mut cfg_pw = Conv1dConfig::default();
         cfg_pw.stride = 1;
         cfg_pw.padding = 0;
-        let pw1 = conv1d(d_model, 2 * d_model, 1, cfg_pw, vb.pp("pw1"))?;
+        let pw1 = conv1d(d_model, 2 * d_model, 1, cfg_pw, vb.pp("pointwise_conv1"))?;
 
         let mut cfg_dw = Conv1dConfig::default();
         cfg_dw.stride = 1;
         cfg_dw.padding = kernel_size / 2;
         cfg_dw.groups = d_model;
-        let dw = conv1d_no_bias(d_model, d_model, kernel_size, cfg_dw, vb.pp("dw"))?;
+        let dw = conv1d_no_bias(d_model, d_model, kernel_size, cfg_dw, vb.pp("depthwise_conv"))?;
 
         let bn_cfg = BatchNormConfig {
             eps: 1e-5,
@@ -241,9 +259,9 @@ impl ConvModule {
             affine: true,
             remove_mean: false,
         };
-        let bn = batch_norm(d_model, bn_cfg, vb.pp("bn"))?;
+        let bn = batch_norm(d_model, bn_cfg, vb.pp("norm"))?;
 
-        let pw2 = conv1d(d_model, d_model, 1, cfg_pw, vb.pp("pw2"))?;
+        let pw2 = conv1d(d_model, d_model, 1, cfg_pw, vb.pp("pointwise_conv2"))?;
 
         Ok(Self {
             pw1,
@@ -256,7 +274,6 @@ impl ConvModule {
     }
 
     pub fn forward(&self, xs: &Tensor, train: bool) -> Result<Tensor> {
-        // xs: [B, T, D] -> [B, D, T]
         let (_b, _t, d) = xs.dims3()?;
         if d != self.d_model {
             return Err(anyhow!(
@@ -265,25 +282,18 @@ impl ConvModule {
                 d
             ));
         }
-
-        let xs = xs.transpose(1, 2)?; // [B, D, T]
-
-        // GLU pointwise: D -> 2D
+        let xs = xs.transpose(1, 2)?;
         let xs = self.pw1.forward(&xs)?;
         let a = xs.narrow(1, 0, d)?;
         let b = xs.narrow(1, d, d)?;
         let gated = candle_nn::ops::sigmoid(&b)?;
         let xs = (a * gated)?;
-
-        // depthwise conv
         let xs = self.dw.forward(&xs)?;
         let xs = self.bn.forward_t(&xs, train)?;
         let xs = xs.silu()?;
-
-        // pointwise projection back to D
         let xs = self.pw2.forward(&xs)?;
         let xs = self.dropout.forward(&xs, train)?;
-        let xs = xs.transpose(1, 2)?; // [B, T, D]
+        let xs = xs.transpose(1, 2)?;
         Ok(xs)
     }
 }
@@ -308,43 +318,33 @@ impl FastConformerBlock {
             affine: true,
             remove_mean: true,
         };
-
         Ok(Self {
-            ff1: FeedForward::new(d_model, cfg.ff_mult, cfg.dropout, vb.pp("ff1"))?,
-            ff2: FeedForward::new(d_model, cfg.ff_mult, cfg.dropout, vb.pp("ff2"))?,
+            ff1: FeedForward::new(d_model, cfg.ff_mult, cfg.dropout, vb.pp("feed_forward1"))?,
+            ff2: FeedForward::new(d_model, cfg.ff_mult, cfg.dropout, vb.pp("feed_forward2"))?,
             self_attn: MultiHeadSelfAttention::new(
                 d_model,
                 cfg.num_heads,
                 cfg.dropout,
-                vb.pp("mha"),
+                vb.pp("self_attn"),
             )?,
             conv_module: ConvModule::new(d_model, cfg.conv_kernel_size, cfg.dropout, vb.pp("conv"))?,
-            ln_ff1: layer_norm(d_model, ln_cfg, vb.pp("ln_ff1"))?,
-            ln_mha: layer_norm(d_model, ln_cfg, vb.pp("ln_mha"))?,
-            ln_conv: layer_norm(d_model, ln_cfg, vb.pp("ln_conv"))?,
-            ln_ff2: layer_norm(d_model, ln_cfg, vb.pp("ln_ff2"))?,
-            ln_out: layer_norm(d_model, ln_cfg, vb.pp("ln_out"))?,
+            ln_ff1: layer_norm(d_model, ln_cfg, vb.pp("norm_feed_forward1"))?,
+            ln_mha: layer_norm(d_model, ln_cfg, vb.pp("norm_self_att"))?,
+            ln_conv: layer_norm(d_model, ln_cfg, vb.pp("norm_conv"))?,
+            ln_ff2: layer_norm(d_model, ln_cfg, vb.pp("norm_feed_forward2"))?,
+            ln_out: layer_norm(d_model, ln_cfg, vb.pp("norm_out"))?,
         })
     }
 
     pub fn forward(&self, xs: &Tensor, train: bool) -> Result<Tensor> {
-        // 1) Macaron FFN (scaled by 0.5 in literature; kept simple here).
         let y_ff1 = self.ff1.forward(&self.ln_ff1.forward(xs)?, train)?;
         let mut y = (xs + &y_ff1)?;
-
-        // 2) Self-attention
         let y_attn = self.self_attn.forward(&self.ln_mha.forward(&y)?, train)?;
         y = (&y + &y_attn)?;
-
-        // 3) Conv module
         let y_conv = self.conv_module.forward(&self.ln_conv.forward(&y)?, train)?;
         y = (&y + &y_conv)?;
-
-        // 4) Second FFN
         let y_ff2 = self.ff2.forward(&self.ln_ff2.forward(&y)?, train)?;
         y = (&y + &y_ff2)?;
-
-        // 5) Final layer norm
         let y_out = self.ln_out.forward(&y)?;
         Ok(y_out)
     }
@@ -362,7 +362,10 @@ impl FastConformerEncoder {
         let subsampling = ConvSubsampling::new(&cfg, vb.pp("subsampling"))?;
         let mut blocks = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
-            blocks.push(FastConformerBlock::new(&cfg, vb.pp(format!("layers.{i}")))?);
+            blocks.push(FastConformerBlock::new(
+                &cfg,
+                vb.pp(format!("layers.{i}")),
+            )?);
         }
         Ok(Self {
             subsampling,
@@ -372,11 +375,9 @@ impl FastConformerEncoder {
         })
     }
 
-    /// xs: [B, T, F]
-    /// returns: [B, T', D_model]
     pub fn forward(&self, xs: &Tensor, train: bool) -> Result<Tensor> {
         let device = xs.device();
-        let xs = self.subsampling.forward(xs)?; // [B, T', D]
+        let xs = self.subsampling.forward(xs)?;
         let (b, t, d) = xs.dims3()?;
         if d != self.cfg.d_model {
             return Err(anyhow!(
@@ -385,13 +386,10 @@ impl FastConformerEncoder {
                 d
             ));
         }
-
-        // Add sinusoidal positional encoding
         let pe = sinusoidal_positional_encoding(t, d, device)?;
         let pe = pe.broadcast_as((b, t, d))?;
         let mut h = (xs + pe)?;
         h = self.pos_dropout.forward(&h, train)?;
-
         for blk in &self.blocks {
             h = blk.forward(&h, train)?;
         }
@@ -401,7 +399,7 @@ impl FastConformerEncoder {
 
 pub struct ParakeetFastConformerCtc {
     pub encoder: FastConformerEncoder,
-    pub proj: Linear, // D_model -> vocab_size
+    pub proj: Conv1d,
     pub cfg: FastConformerConfig,
     tokenizer: Option<Tokenizer>,
     id2token: Option<Vec<String>>,
@@ -417,7 +415,10 @@ impl ParakeetFastConformerCtc {
             ));
         }
         let encoder = FastConformerEncoder::new(cfg.clone(), vb.pp("encoder"))?;
-        let proj = linear(cfg.d_model, cfg.vocab_size, vb.pp("ctc_head"))?;
+        let mut c = Conv1dConfig::default();
+        c.stride = 1;
+        c.padding = 0;
+        let proj = conv1d(cfg.d_model, cfg.vocab_size, 1, c, vb.pp("ctc_head"))?;
         Ok(Self {
             encoder,
             proj,
@@ -433,7 +434,10 @@ impl ParakeetFastConformerCtc {
         tokenizer: Tokenizer,
     ) -> Result<Self> {
         let encoder = FastConformerEncoder::new(cfg.clone(), vb.pp("encoder"))?;
-        let proj = linear(cfg.d_model, cfg.vocab_size, vb.pp("ctc_head"))?;
+        let mut c = Conv1dConfig::default();
+        c.stride = 1;
+        c.padding = 0;
+        let proj = conv1d(cfg.d_model, cfg.vocab_size, 1, c, vb.pp("ctc_head"))?;
         Ok(Self {
             encoder,
             proj,
@@ -443,22 +447,19 @@ impl ParakeetFastConformerCtc {
         })
     }
 
-    /// Forward pass:
-    ///  input:  [B, T, F]
-    ///  output: [B, T', V] (logits)
     pub fn forward(&self, xs: &Tensor, train: bool) -> Result<Tensor> {
-        let h = self.encoder.forward(xs, train)?; // [B, T', D]
-        let logits = self.proj.forward(&h)?; // [B, T', V]
+        let h = self.encoder.forward(xs, train)?; // [B,T,D]
+        let (_b, _t, _d) = h.dims3()?;
+        let h = h.transpose(1, 2)?; // [B,D,T]
+        let logits = self.proj.forward(&h)?; // [B,V,T]
+        let logits = logits.transpose(1, 2)?; // [B,T,V]
         Ok(logits)
     }
 
-    /// Greedy CTC decoding:
-    ///  logits: [B, T', V]
     pub fn greedy_decode(&self, logits: &Tensor) -> Result<Vec<String>> {
         let (b, t, _v) = logits.dims3()?;
-        let pred_ids = logits.argmax(D::Minus1)?; // [B, T']
+        let pred_ids = logits.argmax(D::Minus1)?;
         let pred_ids = pred_ids.to_vec2::<u32>()?;
-
         let mut transcripts = Vec::with_capacity(b);
         for bidx in 0..b {
             let mut prev = self.cfg.blank_id as u32;
@@ -475,26 +476,27 @@ impl ParakeetFastConformerCtc {
                 tokens.push(cur);
                 prev = cur;
             }
-
-            if let Some(ref tokenizer) = self.tokenizer {
-                let text = tokenizer
-                    .decode(tokens.as_slice(), true)
-                    .map_err(|e| anyhow!("decode error: {e}"))?;
-                transcripts.push(text);
-            } else if let Some(ref vocab) = self.id2token {
-                let mut pieces = Vec::with_capacity(tokens.len());
-                for id in tokens {
-                    let idx = id as usize;
-                    if idx < vocab.len() {
-                        pieces.push(vocab[idx].clone());
-                    }
-                }
-                transcripts.push(pieces.join(""));
-            } else {
-                return Err(anyhow!("no tokenizer or id2token available for decoding"));
-            }
+            let text = self.decode_tokens(&tokens)?;
+            transcripts.push(text);
         }
         Ok(transcripts)
+    }
+
+    pub fn decode_tokens(&self, ids: &[u32]) -> Result<String> {
+        if let Some(ref tok) = self.tokenizer {
+            return tok.decode(ids, true).map_err(|e| anyhow!("decode error: {e}"));
+        }
+        if let Some(ref vocab) = self.id2token {
+            let mut pieces = Vec::with_capacity(ids.len());
+            for &id in ids {
+                let idx = id as usize;
+                if idx < vocab.len() {
+                    pieces.push(vocab[idx].clone());
+                }
+            }
+            return Ok(pieces.join(""));
+        }
+        Err(anyhow!("no tokenizer or id2token available for decoding"))
     }
 }
 
@@ -533,31 +535,302 @@ impl FastConformerConfig {
             conv_kernel_size: enc.conv_kernel_size,
             dropout: enc.dropout,
             subsampling_channels: enc.subsampling_conv_channels,
+            subsampling_stride: enc.subsampling_conv_stride,
+            subsampling_factor: enc.subsampling_factor,
             vocab_size: hf.vocab_size,
             blank_id: hf.pad_token_id,
         }
     }
 }
 
-/// Download config/tokenizer/weights from the Hugging Face Hub and build a model.
 pub fn load_parakeet_ctc_from_hf(repo_id: &str, device: &Device) -> Result<ParakeetFastConformerCtc> {
     let api = Api::new()?;
     let repo = api.model(repo_id.to_string());
-
     let config_path = repo.get("config.json")?;
     let weights_path = repo.get("model.safetensors")?;
     let tokenizer_path = repo.get("tokenizer.json")?;
-
     let cfg_json = std::fs::read_to_string(config_path)?;
     let hf_cfg: HfParakeetCtcConfig = serde_json::from_str(&cfg_json)?;
     let cfg = FastConformerConfig::from_hf(&hf_cfg);
-
     let tokenizer = Tokenizer::from_file(tokenizer_path)
         .map_err(|e| anyhow!("tokenizer load error: {e}"))?;
-
-    // Parakeet configs typically specify bf16 weights.
     let vb =
-        unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DType::BF16, device)? };
-
+        unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, device)? };
     ParakeetFastConformerCtc::new_with_tokenizer(cfg, vb, tokenizer)
+}
+
+pub fn load_parakeet_ctc_from_local<P: AsRef<Path>>(
+    dir: P,
+    device: &Device,
+) -> Result<ParakeetFastConformerCtc> {
+    let dir = dir.as_ref();
+    let config_path = dir.join("config.json");
+    let weights_path = dir.join("model.safetensors");
+    let tokenizer_path = dir.join("tokenizer.json");
+    if !config_path.exists() || !weights_path.exists() || !tokenizer_path.exists() {
+        return Err(anyhow!(
+            "missing files in {:?}, need config.json, model.safetensors, tokenizer.json",
+            dir
+        ));
+    }
+    let cfg_json = fs::read_to_string(&config_path)?;
+    let hf_cfg: HfParakeetCtcConfig = serde_json::from_str(&cfg_json)?;
+    let cfg = FastConformerConfig::from_hf(&hf_cfg);
+    let tokenizer = Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| anyhow!("tokenizer load error: {e}"))?;
+    let vb =
+        unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, device)? };
+    ParakeetFastConformerCtc::new_with_tokenizer(cfg, vb, tokenizer)
+}
+
+// ----------------- Audio / log-mel frontend -----------------
+const SAMPLE_RATE: u32 = 16_000;
+const N_FFT: usize = 512;
+const WIN_LENGTH: usize = 400;
+const HOP_LENGTH: usize = 160;
+const EPS: f32 = 1e-6;
+
+fn hann_window(n: usize) -> Vec<f32> {
+    (0..n)
+        .map(|i| {
+            let phase = std::f32::consts::PI * i as f32 / (n as f32);
+            (phase.sin()).powi(2)
+        })
+        .collect()
+}
+
+fn hz_to_mel(hz: f32) -> f32 {
+    2595.0 * (1.0 + hz / 700.0).log10()
+}
+fn mel_to_hz(mel: f32) -> f32 {
+    700.0 * (10f32.powf(mel / 2595.0) - 1.0)
+}
+
+fn build_mel_filterbank(num_mels: usize, n_fft: usize, sample_rate: u32) -> Vec<f32> {
+    let n_freqs = n_fft / 2 + 1;
+    let mel_min = hz_to_mel(0.0);
+    let mel_max = hz_to_mel(sample_rate as f32 / 2.0);
+    let mel_points: Vec<f32> = (0..(num_mels + 2))
+        .map(|i| mel_min + (mel_max - mel_min) * i as f32 / (num_mels + 1) as f32)
+        .collect();
+    let hz_points: Vec<f32> = mel_points.iter().map(|m| mel_to_hz(*m)).collect();
+    let mut fb = vec![0f32; num_mels * n_freqs];
+    for m in 0..num_mels {
+        let f_m_left = hz_points[m];
+        let f_m_center = hz_points[m + 1];
+        let f_m_right = hz_points[m + 2];
+        for (k, f) in (0..n_freqs).map(|k| (k, k as f32 * sample_rate as f32 / n_fft as f32)) {
+            let weight = if f < f_m_left || f > f_m_right {
+                0.0
+            } else if f <= f_m_center {
+                (f - f_m_left) / (f_m_center - f_m_left + EPS)
+            } else {
+                (f_m_right - f) / (f_m_right - f_m_center + EPS)
+            };
+            fb[m * n_freqs + k] = weight.max(0.0);
+        }
+    }
+    fb
+}
+
+fn process_frame_to_mel(
+    frame: &[f32],
+    window: &[f32],
+    fft: &std::sync::Arc<dyn Fft<f32>>,
+    fb: &[f32],
+    num_mels: usize,
+    n_freqs: usize,
+    buffer: &mut [Complex32],
+    out: &mut Vec<f32>,
+) {
+    buffer.iter_mut().for_each(|c| *c = Complex32::new(0.0, 0.0));
+    for (i, sample) in frame.iter().enumerate() {
+        buffer[i] = Complex32::new(sample * window[i], 0.0);
+    }
+    fft.process(buffer);
+    let mut power = vec![0f32; n_freqs];
+    for i in 0..n_freqs {
+        let c = buffer[i];
+        power[i] = c.re * c.re + c.im * c.im;
+    }
+    for m in 0..num_mels {
+        let base = m * n_freqs;
+        let mut acc = 0f32;
+        for k in 0..n_freqs {
+            acc += fb[base + k] * power[k];
+        }
+        out.push((acc.max(EPS)).ln());
+    }
+}
+
+pub fn log_mel_spectrogram(samples: &[f32], sample_rate: u32, num_mels: usize) -> Result<Vec<f32>> {
+    if sample_rate != SAMPLE_RATE {
+        return Err(anyhow!(
+            "expected sample_rate {} got {}",
+            SAMPLE_RATE,
+            sample_rate
+        ));
+    }
+    let window = hann_window(WIN_LENGTH);
+    let mut planner = FftPlanner::new();
+    let fft = planner.plan_fft_forward(N_FFT);
+    let fb = build_mel_filterbank(num_mels, N_FFT, sample_rate);
+    let n_freqs = N_FFT / 2 + 1;
+    let mut frames = Vec::new();
+    let mut offset = 0usize;
+    while offset + WIN_LENGTH <= samples.len() {
+        frames.push(&samples[offset..offset + WIN_LENGTH]);
+        offset += HOP_LENGTH;
+    }
+    if frames.is_empty() {
+        frames.push(samples);
+    }
+    let mut mel_out = Vec::with_capacity(frames.len() * num_mels);
+    let mut buffer = vec![Complex32::default(); N_FFT];
+    for frame in frames {
+        process_frame_to_mel(
+            frame,
+            &window,
+            &fft,
+            &fb,
+            num_mels,
+            n_freqs,
+            &mut buffer,
+            &mut mel_out,
+        );
+    }
+    Ok(mel_out)
+}
+
+pub fn load_wav_as_features<P: AsRef<Path>>(
+    path: P,
+    feat_dim: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let mut reader = hound::WavReader::open(&path)?;
+    let spec = reader.spec();
+    if spec.channels != 1 {
+        return Err(anyhow!("expected mono wav, got {} channels", spec.channels));
+    }
+    if spec.sample_rate != SAMPLE_RATE {
+        return Err(anyhow!(
+            "expected {} Hz audio, got {} Hz",
+            SAMPLE_RATE,
+            spec.sample_rate
+        ));
+    }
+    let samples: Vec<f32> = match (spec.sample_format, spec.bits_per_sample) {
+        (hound::SampleFormat::Int, 16) => reader
+            .samples::<i16>()
+            .map(|s| s.map(|v| v as f32 / i16::MAX as f32))
+            .collect::<Result<_, _>>()?,
+        (hound::SampleFormat::Int, 24) => reader
+            .samples::<i32>()
+            .map(|s| s.map(|v| v as f32 / 8_388_608.0))
+            .collect::<Result<_, _>>()?,
+        (hound::SampleFormat::Int, 32) => reader
+            .samples::<i32>()
+            .map(|s| s.map(|v| v as f32 / i32::MAX as f32))
+            .collect::<Result<_, _>>()?,
+        (hound::SampleFormat::Float, 32) => reader
+            .samples::<f32>()
+            .collect::<Result<_, _>>()?,
+        _ => return Err(anyhow!("unsupported WAV format")),
+    };
+    if samples.is_empty() {
+        return Err(anyhow!("wav contains no samples"));
+    }
+    let feats = log_mel_spectrogram(&samples, SAMPLE_RATE, feat_dim)?;
+    let tensor = Tensor::from_slice(&feats, (1, feats.len() / feat_dim, feat_dim), device)?;
+    Ok(tensor)
+}
+
+pub fn stream_wav_as_feature_chunks<P: AsRef<Path>>(
+    path: P,
+    feat_dim: usize,
+    chunk_frames: usize,
+    device: &Device,
+) -> Result<Vec<Tensor>> {
+    let mut reader = hound::WavReader::open(&path)?;
+    let spec = reader.spec();
+    if spec.channels != 1 {
+        return Err(anyhow!("expected mono wav, got {} channels", spec.channels));
+    }
+    if spec.sample_rate != SAMPLE_RATE {
+        return Err(anyhow!(
+            "expected {} Hz audio, got {} Hz",
+            SAMPLE_RATE,
+            spec.sample_rate
+        ));
+    }
+    let samples: Vec<f32> = match (spec.sample_format, spec.bits_per_sample) {
+        (hound::SampleFormat::Int, 16) => reader
+            .samples::<i16>()
+            .map(|s| s.map(|v| v as f32 / i16::MAX as f32))
+            .collect::<Result<_, _>>()?,
+        (hound::SampleFormat::Int, 24) => reader
+            .samples::<i32>()
+            .map(|s| s.map(|v| v as f32 / 8_388_608.0))
+            .collect::<Result<_, _>>()?,
+        (hound::SampleFormat::Int, 32) => reader
+            .samples::<i32>()
+            .map(|s| s.map(|v| v as f32 / i32::MAX as f32))
+            .collect::<Result<_, _>>()?,
+        (hound::SampleFormat::Float, 32) => reader
+            .samples::<f32>()
+            .collect::<Result<_, _>>()?,
+        _ => return Err(anyhow!("unsupported WAV format")),
+    };
+    if samples.is_empty() {
+        return Err(anyhow!("wav contains no samples"));
+    }
+    let window = hann_window(WIN_LENGTH);
+    let mut planner = FftPlanner::new();
+    let fft = planner.plan_fft_forward(N_FFT);
+    let fb = build_mel_filterbank(feat_dim, N_FFT, SAMPLE_RATE);
+    let n_freqs = N_FFT / 2 + 1;
+    let mut chunks = Vec::new();
+    let mut chunk_buf: Vec<f32> = Vec::with_capacity(chunk_frames * feat_dim);
+    let mut buffer = vec![Complex32::default(); N_FFT];
+    let mut offset = 0usize;
+    while offset + WIN_LENGTH <= samples.len() {
+        process_frame_to_mel(
+            &samples[offset..offset + WIN_LENGTH],
+            &window,
+            &fft,
+            &fb,
+            feat_dim,
+            n_freqs,
+            &mut buffer,
+            &mut chunk_buf,
+        );
+        if chunk_buf.len() >= chunk_frames * feat_dim {
+            let frames = chunk_buf.len() / feat_dim;
+            let t = Tensor::from_slice(&chunk_buf, (1, frames, feat_dim), device)?;
+            chunks.push(t);
+            chunk_buf.clear();
+        }
+        offset += HOP_LENGTH;
+    }
+    if offset < samples.len() {
+        let mut last = vec![0f32; WIN_LENGTH];
+        let rem = samples.len() - offset;
+        last[..rem].copy_from_slice(&samples[offset..]);
+        process_frame_to_mel(
+            &last,
+            &window,
+            &fft,
+            &fb,
+            feat_dim,
+            n_freqs,
+            &mut buffer,
+            &mut chunk_buf,
+        );
+    }
+    if !chunk_buf.is_empty() {
+        let frames = chunk_buf.len() / feat_dim;
+        let t = Tensor::from_slice(&chunk_buf, (1, frames, feat_dim), device)?;
+        chunks.push(t);
+    }
+    Ok(chunks)
 }
