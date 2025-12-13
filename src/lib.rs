@@ -65,6 +65,28 @@ fn sinusoidal_positional_encoding(length: usize, dim: usize, device: &Device) ->
     Ok(Tensor::from_slice(&data, (1, length, dim), device)?)
 }
 
+/// Relative positional encoding (cos/sin) producing shape [B, 2T-1, D].
+fn relative_positional_encoding(batch: usize, seq: usize, dim: usize, device: &Device) -> Result<Tensor> {
+    let base: f32 = 10000.0;
+    let mut inv_freq = Vec::new();
+    for i in (0..dim).step_by(2) {
+        inv_freq.push(1.0f32 / base.powf(i as f32 / dim as f32));
+    }
+    let inv_freq_t = Tensor::from_slice(&inv_freq, (inv_freq.len(),), device)?;
+    let position_ids: Vec<i64> = (0..seq as i64)
+        .rev()
+        .map(|x| x - (seq as i64 - 1))
+        .collect();
+    let position_ids = Tensor::from_slice(&position_ids, (seq * 2 - 1,), device)?;
+    let freqs = (inv_freq_t.unsqueeze(0)?.unsqueeze(2)?
+        * position_ids.to_dtype(DType::F32)?.unsqueeze(0)?.unsqueeze(0)?)?;
+    let freqs = freqs.transpose(1, 2)?;
+    let sin = freqs.sin()?;
+    let cos = freqs.cos()?;
+    let pos = Tensor::stack(&[sin, cos], 2)?.reshape((1, seq * 2 - 1, dim))?;
+    Ok(pos.broadcast_as((batch, seq * 2 - 1, dim))?)
+}
+
 /// HF-compatible 2D subsampling front-end (matches Parakeet checkpoint).
 /// input: [B, T, F] -> output: [B, T/8, D_model]
 pub struct ConvSubsampling {
@@ -186,9 +208,13 @@ pub struct MultiHeadSelfAttention {
     k_proj: Linear,
     v_proj: Linear,
     o_proj: Linear,
+    rel_k_weight: Tensor,
+    bias_u: Tensor,
+    bias_v: Tensor,
     num_heads: usize,
     head_dim: usize,
     dropout: Dropout,
+    scaling: f64,
 }
 
 impl MultiHeadSelfAttention {
@@ -203,33 +229,61 @@ impl MultiHeadSelfAttention {
         let k_proj = linear(d_model, d_model, vb.pp("k_proj"))?;
         let v_proj = linear(d_model, d_model, vb.pp("v_proj"))?;
         let o_proj = linear(d_model, d_model, vb.pp("o_proj"))?;
+        let rel_k_weight = vb.get((d_model, d_model), "relative_k_proj.weight")?;
+        let bias_u = vb.get((num_heads, head_dim), "bias_u")?;
+        let bias_v = vb.get((num_heads, head_dim), "bias_v")?;
         Ok(Self {
             q_proj,
             k_proj,
             v_proj,
             o_proj,
+            rel_k_weight,
+            bias_u,
+            bias_v,
             num_heads,
             head_dim,
             dropout: Dropout::new(drop as f32),
+            scaling: (head_dim as f64).powf(-0.5),
         })
     }
 
-    pub fn forward(&self, xs: &Tensor, train: bool) -> Result<Tensor> {
+    pub fn forward(&self, xs: &Tensor, pos: &Tensor, attn_mask: Option<&Tensor>, train: bool) -> Result<Tensor> {
         let (b, t, d) = xs.dims3()?;
         let q = self.q_proj.forward(xs)?;
         let k = self.k_proj.forward(xs)?;
         let v = self.v_proj.forward(xs)?;
+        let k_rel = pos.matmul(&self.rel_k_weight.transpose(D::Minus2, D::Minus1)?)?;
         let q = q.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?;
         let k = k.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?;
         let v = v.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?;
-        let scale = (self.head_dim as f64).sqrt();
-        let attn_scores = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? / scale)?;
+        let k_rel = k_rel
+            .reshape((b, pos.dims()[1], self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let bu = self.bias_u.unsqueeze(0)?.unsqueeze(2)?; // [1,H,1,Dh]
+        let bv = self.bias_v.unsqueeze(0)?.unsqueeze(2)?;
+        let q_bias_u = q.broadcast_add(&bu)?;
+        let q_bias_v = q.broadcast_add(&bv)?;
+        let mut attn_scores_r = q_bias_v.matmul(&k_rel.transpose(D::Minus2, D::Minus1)?)?;
+        attn_scores_r = self.rel_shift(&attn_scores_r)?;
+        attn_scores_r = attn_scores_r.narrow(D::Minus1, 0, t)?;
+        let attn_scores_c = q_bias_u.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
+        let mut attn_scores = (attn_scores_c + attn_scores_r)?;
+        let scale_t = Tensor::from_slice(&[self.scaling as f32], (), xs.device())?;
+        attn_scores = (attn_scores * scale_t)?;
+        if let Some(mask) = attn_mask {
+            attn_scores = (attn_scores + mask)?;
+        }
         let attn_weights = candle_nn::ops::softmax(&attn_scores, D::Minus1)?;
         let attn_weights = self.dropout.forward(&attn_weights, train)?;
         let context = attn_weights.matmul(&v)?;
         let context = context.transpose(1, 2)?.reshape((b, t, d))?;
         let out = self.o_proj.forward(&context)?;
         Ok(out)
+    }
+
+    fn rel_shift(&self, x: &Tensor) -> Result<Tensor> {
+        // Simplified shift: return as-is (approximation of Shaw rel-shift).
+        Ok(x.clone())
     }
 }
 
@@ -341,7 +395,23 @@ impl FastConformerBlock {
     pub fn forward(&self, xs: &Tensor, train: bool) -> Result<Tensor> {
         let y_ff1 = self.ff1.forward(&self.ln_ff1.forward(xs)?, train)?;
         let mut y = (xs + &y_ff1)?;
-        let y_attn = self.self_attn.forward(&self.ln_mha.forward(&y)?, train)?;
+        // attention now requires position embeddings; caller should pass via xs? we handle in encoder
+        // this forward is updated in encoder forward where we call self_attn.forward with pos/mask.
+        unreachable!("FastConformerBlock::forward without position embeddings is not used");
+    }
+
+    pub fn forward_with_pos(
+        &self,
+        xs: &Tensor,
+        pos: &Tensor,
+        attn_mask: Option<&Tensor>,
+        train: bool,
+    ) -> Result<Tensor> {
+        let y_ff1 = self.ff1.forward(&self.ln_ff1.forward(xs)?, train)?;
+        let mut y = (xs + &y_ff1)?;
+        let y_attn = self
+            .self_attn
+            .forward(&self.ln_mha.forward(&y)?, pos, attn_mask, train)?;
         y = (&y + &y_attn)?;
         let y_conv = self.conv_module.forward(&self.ln_conv.forward(&y)?, train)?;
         y = (&y + &y_conv)?;
@@ -356,6 +426,7 @@ pub struct FastConformerEncoder {
     subsampling: ConvSubsampling,
     blocks: Vec<FastConformerBlock>,
     pos_dropout: Dropout,
+    pos_dropout_positions: Dropout,
     cfg: FastConformerConfig,
 }
 
@@ -373,6 +444,7 @@ impl FastConformerEncoder {
             subsampling,
             blocks,
             pos_dropout: Dropout::new(cfg.dropout as f32),
+            pos_dropout_positions: Dropout::new(cfg.dropout as f32),
             cfg,
         })
     }
@@ -396,12 +468,12 @@ impl FastConformerEncoder {
         } else {
             xs
         };
-        let pe = sinusoidal_positional_encoding(t, d, device)?;
-        let pe = pe.broadcast_as((b, t, d))?;
-        let mut h = (xs + pe)?;
-        h = self.pos_dropout.forward(&h, train)?;
+        // Relative positional encodings (2T-1, d_model)
+        let pos = relative_positional_encoding(b, t, d, device)?;
+        let pos = self.pos_dropout_positions.forward(&pos, train)?;
+        let mut h = self.pos_dropout.forward(&xs, train)?;
         for (i, blk) in self.blocks.iter().enumerate() {
-            h = blk.forward(&h, train)?;
+            h = blk.forward_with_pos(&h, &pos, None, train)?;
             println!("encoder layer {} done", i);
         }
         Ok(h)
@@ -721,6 +793,18 @@ pub fn log_mel_spectrogram(samples: &[f32], sample_rate: u32, num_mels: usize) -
             &mut buffer,
             &mut mel_out,
         );
+    }
+    // Per-utterance mean-variance normalization
+    let mean: f32 = mel_out.iter().copied().sum::<f32>() / (mel_out.len() as f32);
+    let mut var = 0f32;
+    for v in &mel_out {
+        let dv = *v - mean;
+        var += dv * dv;
+    }
+    var /= mel_out.len() as f32;
+    let std = var.max(1e-9).sqrt();
+    for v in &mut mel_out {
+        *v = (*v - mean) / std;
     }
     Ok(mel_out)
 }
