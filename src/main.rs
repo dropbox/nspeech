@@ -15,7 +15,7 @@ fn main() -> Result<()> {
     let mut wav_path: Option<String> = None;
     let mut hf_repo: Option<String> = None;
     let mut local_dir: Option<String> = None;
-    let mut max_chunks: Option<usize> = Some(5); // cap to avoid long CPU runs; 0 = no cap
+    let mut max_chunks: Option<usize> = None; // default: process all chunks; set via --max-chunks
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -58,6 +58,7 @@ fn main() -> Result<()> {
         subsampling_channels: 128,
         subsampling_stride: 2,
         subsampling_factor: 8,
+        scale_input: true,
         vocab_size: 40, // [blank] + 39 chars
         blank_id: 0,
     };

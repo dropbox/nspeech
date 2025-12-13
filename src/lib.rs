@@ -24,6 +24,7 @@ pub struct FastConformerConfig {
     pub subsampling_channels: usize,
     pub subsampling_stride: usize,
     pub subsampling_factor: usize,
+    pub scale_input: bool,
     pub vocab_size: usize,
     pub blank_id: usize,
 }
@@ -41,6 +42,7 @@ impl Default for FastConformerConfig {
             subsampling_channels: 256,
             subsampling_stride: 2,
             subsampling_factor: 8,
+            scale_input: true,
             vocab_size: 1024,
             blank_id: 0,
         }
@@ -386,12 +388,21 @@ impl FastConformerEncoder {
                 d
             ));
         }
+        let xs = if self.cfg.scale_input {
+            let scale = (self.cfg.d_model as f64).sqrt() as f32;
+            let scale_t = Tensor::from_slice(&[scale], (), device)?;
+            let scale_t = scale_t.broadcast_as(xs.shape())?;
+            (xs * scale_t)?
+        } else {
+            xs
+        };
         let pe = sinusoidal_positional_encoding(t, d, device)?;
         let pe = pe.broadcast_as((b, t, d))?;
         let mut h = (xs + pe)?;
         h = self.pos_dropout.forward(&h, train)?;
-        for blk in &self.blocks {
+        for (i, blk) in self.blocks.iter().enumerate() {
             h = blk.forward(&h, train)?;
+            println!("encoder layer {} done", i);
         }
         Ok(h)
     }
@@ -514,6 +525,7 @@ pub struct HfEncoderConfig {
     pub subsampling_conv_channels: usize,
     pub subsampling_conv_stride: usize,
     pub subsampling_factor: usize,
+    pub scale_input: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -537,6 +549,7 @@ impl FastConformerConfig {
             subsampling_channels: enc.subsampling_conv_channels,
             subsampling_stride: enc.subsampling_conv_stride,
             subsampling_factor: enc.subsampling_factor,
+            scale_input: enc.scale_input.unwrap_or(true),
             vocab_size: hf.vocab_size,
             blank_id: hf.pad_token_id,
         }
@@ -671,6 +684,16 @@ pub fn log_mel_spectrogram(samples: &[f32], sample_rate: u32, num_mels: usize) -
             sample_rate
         ));
     }
+    // Apply pre-emphasis from preprocessor_config.json
+    let preemph = 0.97f32;
+    let mut preemph_samples = Vec::with_capacity(samples.len());
+    for (i, &s) in samples.iter().enumerate() {
+        if i == 0 {
+            preemph_samples.push(s);
+        } else {
+            preemph_samples.push(s - preemph * samples[i - 1]);
+        }
+    }
     let window = hann_window(WIN_LENGTH);
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(N_FFT);
@@ -678,12 +701,12 @@ pub fn log_mel_spectrogram(samples: &[f32], sample_rate: u32, num_mels: usize) -
     let n_freqs = N_FFT / 2 + 1;
     let mut frames = Vec::new();
     let mut offset = 0usize;
-    while offset + WIN_LENGTH <= samples.len() {
-        frames.push(&samples[offset..offset + WIN_LENGTH]);
+    while offset + WIN_LENGTH <= preemph_samples.len() {
+        frames.push(&preemph_samples[offset..offset + WIN_LENGTH]);
         offset += HOP_LENGTH;
     }
     if frames.is_empty() {
-        frames.push(samples);
+        frames.push(&preemph_samples);
     }
     let mut mel_out = Vec::with_capacity(frames.len() * num_mels);
     let mut buffer = vec![Complex32::default(); N_FFT];
@@ -784,6 +807,16 @@ pub fn stream_wav_as_feature_chunks<P: AsRef<Path>>(
     if samples.is_empty() {
         return Err(anyhow!("wav contains no samples"));
     }
+    // pre-emphasis
+    let preemph = 0.97f32;
+    let mut preemph_samples = Vec::with_capacity(samples.len());
+    for (i, &s) in samples.iter().enumerate() {
+        if i == 0 {
+            preemph_samples.push(s);
+        } else {
+            preemph_samples.push(s - preemph * samples[i - 1]);
+        }
+    }
     let window = hann_window(WIN_LENGTH);
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(N_FFT);
@@ -795,7 +828,7 @@ pub fn stream_wav_as_feature_chunks<P: AsRef<Path>>(
     let mut offset = 0usize;
     while offset + WIN_LENGTH <= samples.len() {
         process_frame_to_mel(
-            &samples[offset..offset + WIN_LENGTH],
+            &preemph_samples[offset..offset + WIN_LENGTH],
             &window,
             &fft,
             &fb,
@@ -815,7 +848,7 @@ pub fn stream_wav_as_feature_chunks<P: AsRef<Path>>(
     if offset < samples.len() {
         let mut last = vec![0f32; WIN_LENGTH];
         let rem = samples.len() - offset;
-        last[..rem].copy_from_slice(&samples[offset..]);
+        last[..rem].copy_from_slice(&preemph_samples[offset..]);
         process_frame_to_mel(
             &last,
             &window,
