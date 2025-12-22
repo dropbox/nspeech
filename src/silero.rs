@@ -285,17 +285,12 @@ impl SileroVad {
 
         // STFT magnitude with reflection padding: [B, n_bins, frames]
         let mut z = self.stft.forward_streaming(&x)?;
-        eprintln!("STFT output shape: {:?}", z.shape());
 
         // Conv stack with relu
         z = self.enc[0].forward(&z)?.relu()?;
-        eprintln!("After enc0: {:?}", z.shape());
         z = self.enc[1].forward(&z)?.relu()?;
-        eprintln!("After enc1: {:?}", z.shape());
         z = self.enc[2].forward(&z)?.relu()?;
-        eprintln!("After enc2: {:?}", z.shape());
         z = self.enc[3].forward(&z)?.relu()?; // [B, C, T']
-        eprintln!("After enc3: {:?}", z.shape());
 
         // Prepare for RNN: [T', B, C]
         let z = z.transpose(1, 2)?; // [B,T',C]
@@ -318,6 +313,9 @@ impl SileroVad {
         // back to [B,H,T']
         let y = y.transpose(0, 1)?; // [B,T',H]
         let y = y.transpose(1, 2)?; // [B,H,T']
+
+        // Apply ReLU before head (official model has Dropout->ReLU->Conv->Sigmoid)
+        let y = y.relu()?;
 
         let p = nn::ops::sigmoid(&self.head.forward(&y)?)?; // [B,1,T']
         Ok((p.squeeze(1)?, h_new, c_new))
