@@ -22,7 +22,8 @@ fn main() -> Result<()> {
     // Create streaming wrapper (keeps LSTM (h,c) across pushes)
     let mut stream = VadStream::new(vad, &device)?;
 
-    let chunk_len = 160usize;
+    // Feed audio in small increments (10ms chunks)
+    let chunk_len = 160usize; // 10ms at 16kHz
 /*
     // Example: simulate “real-time” audio arriving in 10ms chunks @ 16kHz => 160 samples
 
@@ -96,20 +97,17 @@ fn main() -> Result<()> {
 
     // Stream it through
     let mut idx = 0usize;
-    let mut frame_idx = 0usize;
-    let mut total_samples_pushed = 0usize;
+    let mut total_samples_processed = 0usize;
 
     while idx < pcm.len() {
         let end = (idx + chunk_len).min(pcm.len());
-        total_samples_pushed += end - idx;
         let probs = stream.push(&pcm[idx..end])?;
 
-        // You'll get ~1 prob per 2048 samples (~128ms) once the internal buffer is warm.
+        // Each output probability corresponds to one 512-sample chunk (32ms at 16kHz)
         for p in probs {
-            // Each frame represents 2048 samples
-            let t_ms = frame_idx as f32 * (2048.0 / 16.0);  // 16000 samples/sec = 16 samples/ms
+            let t_ms = total_samples_processed as f32 * (1000.0 / 16.0);
             println!("{:7.1} ms  p_speech={:.3}", t_ms, p);
-            frame_idx += 1;
+            total_samples_processed += 512;
         }
 
         idx = end;

@@ -9,6 +9,10 @@ pub struct VadConfig {
     pub hop_length: usize,
     pub win_length: usize,
     pub n_fft: usize,
+    pub stft_right_padding: usize,
+    pub encoder_padding: usize,
+    pub context_size: usize,
+    pub chunk_size: usize,
 }
 
 pub struct StftMag {
@@ -18,6 +22,8 @@ pub struct StftMag {
     hop: usize,
     n_bins: usize,
     n_fft: usize,
+    /// Reflection padding on the right (official model uses 64 samples)
+    right_pad: usize,
 }
 
 impl StftMag {
@@ -27,13 +33,17 @@ impl StftMag {
             bail!("stft basis expected in_ch=1, got {ic}");
         }
         if k != cfg.win_length {
-            // Some versions use win_length == n_fft; if cfg is wrong you’ll notice here.
-            // Still allow it but warn by erroring loudly.
             bail!("win_length mismatch: basis kernel={k} cfg.win_length={}", cfg.win_length);
         }
         // Commonly oc == 2*(n_fft/2+1)
         let n_bins = oc / 2;
-        Ok(Self { basis, hop: cfg.hop_length, n_bins, n_fft: cfg.n_fft })
+        Ok(Self {
+            basis,
+            hop: cfg.hop_length,
+            n_bins,
+            n_fft: cfg.n_fft,
+            right_pad: cfg.stft_right_padding,
+        })
     }
 
     /// x: [B, 1, T] float
@@ -41,7 +51,7 @@ impl StftMag {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // Most Silero STFTs behave like center=True (pad n_fft/2 both sides).
         let pad = self.n_fft / 2;
-        let (b, c, _t) = x.dims3()?;
+        let (b, c, t) = x.dims3()?;
         if c != 1 { bail!("expected [B,1,T], got c={c}"); }
 
         let left = Tensor::zeros((b, 1, pad), x.dtype(), x.device())?;
@@ -64,37 +74,51 @@ impl StftMag {
         //Ok(mag)
     }
 
-    /// Streaming STFT magnitude with NO center padding.
-    /// Expects x: [B, 1, T] where T is whatever you currently have buffered.
-    /// Returns [B, n_bins, frames] where frames = floor((T - win)/hop) + 1 (if T>=win)
+    /// Streaming STFT magnitude with reflection padding on the right.
+    /// Expects x: [B, 1, T] where T is the input length (typically context + chunk).
+    /// Applies reflection padding on the right: [a,b,c,d] + pad=2 => [a,b,c,d,c,b]
+    /// Returns [B, n_bins, frames] - raw magnitude (no log transform)
     pub fn forward_streaming(&self, x: &Tensor) -> Result<Tensor> {
-    // x: [B, 1, T]
-        let (_b, c, _t) = x.dims3()?;
-        println!("c={c} t={_t}");
+        let (b, c, t) = x.dims3()?;
         anyhow::ensure!(c == 1, "expected mono [B,1,T], got c={c}");
 
-        // output: [B, 2*n_bins, frames]
-        let y = x.conv1d(&self.basis, 0, self.hop, 1, 1)?;
+        // Apply reflection padding on the right
+        // For reflection: mirror the last right_pad samples
+        if self.right_pad > 0 {
+            if t < self.right_pad {
+                bail!("input too short for reflection padding: t={t} < right_pad={}", self.right_pad);
+            }
+            // Extract the last right_pad samples and reverse them
+            // x[:, :, t-right_pad:t] becomes the padding
+            let pad_region = x.narrow(2, t - self.right_pad, self.right_pad)?;
 
-        let y_re = y.narrow(1, 0, self.n_bins)?;
-        let y_im = y.narrow(1, self.n_bins, self.n_bins)?;
-        let mag = ((&y_re * &y_re)? + (&y_im * &y_im)?)?.sqrt()?;
+            // Reverse along the time dimension by manually building reversed tensor
+            // This is a workaround since Candle may not have a flip operation
+            // We'll just extract each sample in reverse order
+            let mut pad_samples = Vec::new();
+            for i in (0..self.right_pad).rev() {
+                pad_samples.push(pad_region.narrow(2, i, 1)?);
+            }
+            let pad_reversed = Tensor::cat(&pad_samples, 2)?;
 
+            // Concatenate original + reflected padding
+            let x = Tensor::cat(&[x, &pad_reversed], 2)?;
 
-        // ✅ log1p compression: ln(1 + mag)
-        let mag1p = (&mag + 1.0)?;
-        let feat = mag1p.log()?; // if .log() exists; otherwise nn::ops::log(&mag1p)?
-        Ok(feat)
+            // Conv1d with no padding
+            let y = x.conv1d(&self.basis, 0, self.hop, 1, 1)?;
 
+            let y_re = y.narrow(1, 0, self.n_bins)?;
+            let y_im = y.narrow(1, self.n_bins, self.n_bins)?;
 
-        //Ok(((&y_re * &y_re)? + (&y_im * &y_im)?)?.sqrt()?)
-
-       // 🔥 add log-compression (Silero-style)
-        // mag_log = log(mag + 1e-6)
-
-        //let mag = (&mag + 1e-6)?;    // broadcast scalar add
-        //let mag = mag.log()?;          // if your Candle has .log()
-        //Ok(mag)
+            // Return raw magnitude (no log transform - that was the issue!)
+            Ok(((&y_re * &y_re)? + (&y_im * &y_im)?)?.sqrt()?)
+        } else {
+            // No padding case
+            let y = x.conv1d(&self.basis, 0, self.hop, 1, 1)?;
+            let y_re = y.narrow(1, 0, self.n_bins)?;
+            let y_im = y.narrow(1, self.n_bins, self.n_bins)?;
+            Ok(((&y_re * &y_re)? + (&y_im * &y_im)?)?.sqrt()?)
+        }
     }
 }
 
@@ -173,7 +197,7 @@ impl SileroVad {
         let buffer = std::fs::read(st_path)?;
         let st = safetensors::SafeTensors::deserialize(&buffer)?;
 
-        let (basis, enc, rnn, head) = Self::load_tensors(device, &st)?;
+        let (basis, enc, rnn, head) = Self::load_tensors(device, &st, &cfg)?;
 
         let stft = StftMag::new(basis, &cfg)?;
 
@@ -183,6 +207,7 @@ impl SileroVad {
     fn load_tensors(
         device: &Device,
         st: &safetensors::SafeTensors,
+        cfg: &VadConfig,
     ) -> Result<(Tensor, [nn::Conv1d; 4], LstmCell, nn::Conv1d)> {
         // Helper to load a tensor from safetensors
         fn load_tensor(st: &safetensors::SafeTensors, name: &str, device: &Device) -> Result<Tensor> {
@@ -210,6 +235,7 @@ impl SileroVad {
             wkey: &str,
             bkey: &str,
             stride: usize,
+            padding: usize,
         ) -> Result<nn::Conv1d> {
             // Load weight and bias tensors
             let weight = load_tensor(st, wkey, device)?;
@@ -218,8 +244,8 @@ impl SileroVad {
             // weight: [out_ch, in_ch, k]
             let (out_ch, in_ch, k) = weight.dims3()?;
 
-            // Use padding=0 to match the original model (no padding in encoder)
-            let cfg = nn::Conv1dConfig { stride, padding: 0, ..Default::default() };
+            // Use padding from config file
+            let cfg = nn::Conv1dConfig { stride, padding, ..Default::default() };
 
             // Create conv1d with dummy var builder (zeros), then replace weights manually
             let mut tensors = std::collections::HashMap::new();
@@ -231,10 +257,11 @@ impl SileroVad {
         }
 
         // Strides: [1, 2, 2, 1] as used in the original Silero VAD model
-        let enc0 = conv_from(st, device, "enc.0.weight", "enc.0.bias", 1)?;
-        let enc1 = conv_from(st, device, "enc.1.weight", "enc.1.bias", 2)?;
-        let enc2 = conv_from(st, device, "enc.2.weight", "enc.2.bias", 2)?;
-        let enc3 = conv_from(st, device, "enc.3.weight", "enc.3.bias", 1)?;
+        let padding = cfg.encoder_padding;
+        let enc0 = conv_from(st, device, "enc.0.weight", "enc.0.bias", 1, padding)?;
+        let enc1 = conv_from(st, device, "enc.1.weight", "enc.1.bias", 2, padding)?;
+        let enc2 = conv_from(st, device, "enc.2.weight", "enc.2.bias", 2, padding)?;
+        let enc3 = conv_from(st, device, "enc.3.weight", "enc.3.bias", 1, padding)?;
 
         // --- RNN tensors ---
         let w_ih = load_tensor(st, "rnn.weight_ih", device)?;
@@ -244,43 +271,62 @@ impl SileroVad {
 
         let rnn = LstmCell::new(w_ih, w_hh, b_ih, b_hh)?;
 
-        // --- Head conv (usually 1x1) ---
-        let head = conv_from(st, device, "head.weight", "head.bias", 1)?;
+        // --- Head conv (usually 1x1, no padding needed) ---
+        let head = conv_from(st, device, "head.weight", "head.bias", 1, 0)?;
 
         Ok((basis, [enc0, enc1, enc2, enc3], rnn, head))
     }
 
     /// x: [B, T] float PCM in [-1,1]
-    /// returns p: [B, frames] speech probability
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    /// h, c: optional RNN state from previous chunk
+    /// returns (p, h_new, c_new): probabilities and new RNN state
+    pub fn forward_stateful(&self, x: &Tensor, h: Option<Tensor>, c: Option<Tensor>) -> Result<(Tensor, Tensor, Tensor)> {
         let x = x.unsqueeze(1)?; // [B,1,T]
 
-        // STFT magnitude: [B, n_bins, frames]
-        let mut z = self.stft.forward(&x)?;
+        // STFT magnitude with reflection padding: [B, n_bins, frames]
+        let mut z = self.stft.forward_streaming(&x)?;
+        eprintln!("STFT output shape: {:?}", z.shape());
 
         // Conv stack with relu
         z = self.enc[0].forward(&z)?.relu()?;
+        eprintln!("After enc0: {:?}", z.shape());
         z = self.enc[1].forward(&z)?.relu()?;
+        eprintln!("After enc1: {:?}", z.shape());
         z = self.enc[2].forward(&z)?.relu()?;
+        eprintln!("After enc2: {:?}", z.shape());
         z = self.enc[3].forward(&z)?.relu()?; // [B, C, T']
+        eprintln!("After enc3: {:?}", z.shape());
 
         // Prepare for RNN: [T', B, C]
         let z = z.transpose(1, 2)?; // [B,T',C]
         let z = z.transpose(0, 1)?; // [T',B,C]
 
-        // init state zeros
-        let (_t, b, _c) = z.dims3()?;
-        let h0 = Tensor::zeros((b, self.rnn.hidden), DType::F32, z.device())?;
-        let c0 = Tensor::zeros((b, self.rnn.hidden), DType::F32, z.device())?;
+        let (t, b, ch) = z.dims3()?;
 
-        let (y, _hf, _cf) = self.rnn.forward(&z, h0, c0)?; // [T',B,H]
+        // Use provided state or zeros
+        let h0 = match h {
+            Some(h) => h,
+            None => Tensor::zeros((b, self.rnn.hidden), DType::F32, z.device())?,
+        };
+        let c0 = match c {
+            Some(c) => c,
+            None => Tensor::zeros((b, self.rnn.hidden), DType::F32, z.device())?,
+        };
+
+        let (y, h_new, c_new) = self.rnn.forward(&z, h0, c0)?; // [T',B,H]
 
         // back to [B,H,T']
         let y = y.transpose(0, 1)?; // [B,T',H]
         let y = y.transpose(1, 2)?; // [B,H,T']
 
         let p = nn::ops::sigmoid(&self.head.forward(&y)?)?; // [B,1,T']
-        Ok(p.squeeze(1)?) // [B,T']
+        Ok((p.squeeze(1)?, h_new, c_new))
+    }
+
+    /// Stateless version for compatibility
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let (p, _h, _c) = self.forward_stateful(x, None, None)?;
+        Ok(p)
     }
 }
 
@@ -288,21 +334,29 @@ pub struct VadStream {
     vad: SileroVad,
     device: Device,
     pcm_buf: Vec<f32>,
-    chunk_size: usize, // 512 samples @ 16kHz = 32ms
+    chunk_size: usize,
+    context_size: usize,
+    /// Context buffer: last context_size samples from previous chunk
+    context: Vec<f32>,
+    /// RNN state maintained across chunks
+    h: Option<Tensor>,
+    c: Option<Tensor>,
 }
 
 impl VadStream {
     pub fn new(vad: SileroVad, device: &Device) -> Result<Self> {
-        // Use 2048-sample chunks (128ms at 16kHz)
-        // Note: The official Silero model uses 512 samples, but our exported weights
-        // with strides [1,2,2,1] require more input to avoid zero frames after encoder
-        let chunk_size = 2048;
+        let chunk_size = vad.cfg.chunk_size;
+        let context_size = vad.cfg.context_size;
 
         Ok(Self {
             vad,
             device: device.clone(),
             pcm_buf: Vec::new(),
             chunk_size,
+            context_size,
+            context: vec![0.0; context_size],
+            h: None,
+            c: None,
         })
     }
 
@@ -316,18 +370,30 @@ impl VadStream {
             // Extract one chunk
             let chunk: Vec<f32> = self.pcm_buf.drain(..self.chunk_size).collect();
 
-            // Create tensor [1, chunk_size]
-            let x = Tensor::from_slice(&chunk, (1, self.chunk_size), &self.device)?;
+            // Prepend context to chunk (like official model does)
+            let mut with_context = self.context.clone();
+            with_context.extend_from_slice(&chunk);
 
-            // Call the standard forward method (processes chunk independently)
-            let p = self.vad.forward(&x)?; // Returns [1, frames]
+            // Create tensor [1, context_size + chunk_size]
+            let x = Tensor::from_slice(&with_context, (1, with_context.len()), &self.device)?;
 
-            // Get the mean probability across all frames (more robust than last frame)
+            // Call stateful forward, passing and receiving RNN state
+            let (p, h_new, c_new) = self.vad.forward_stateful(&x, self.h.take(), self.c.take())?;
+
+            // Store new state for next chunk
+            self.h = Some(h_new);
+            self.c = Some(c_new);
+
+            // Update context buffer with last context_size samples from this chunk
+            self.context.clear();
+            self.context.extend_from_slice(&chunk[chunk.len() - self.context_size..]);
+
+            // Output each frame separately for better temporal resolution
             let probs = p.to_vec2::<f32>()?;
             if !probs.is_empty() && !probs[0].is_empty() {
-                // Take the mean of all probability values
-                let mean_prob: f32 = probs[0].iter().sum::<f32>() / probs[0].len() as f32;
-                out.push(mean_prob);
+                for &prob in &probs[0] {
+                    out.push(prob);
+                }
             }
         }
 
@@ -336,6 +402,10 @@ impl VadStream {
 
     pub fn reset(&mut self) -> Result<()> {
         self.pcm_buf.clear();
+        self.context.clear();
+        self.context.resize(self.context_size, 0.0);
+        self.h = None;
+        self.c = None;
         Ok(())
     }
 }

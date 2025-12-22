@@ -53,9 +53,17 @@ def export_one(core, prefix: str, out_st: str, out_cfg: str):
     cfg = {
         "sample_rate": 16000 if "8k" not in prefix else 8000,
         "hop_length": int(pick_attr(stft, ["hop_length", "hop"], default=128)),
-        "win_length": int(pick_attr(stft, ["win_length", "win"], default=512)),
-        "n_fft": int(pick_attr(stft, ["n_fft", "filter_length", "fft_size"], default=512)),
-        # padding/centering vary; we’ll implement center-like padding in Rust.
+        "win_length": int(pick_attr(stft, ["win_length", "win"], default=256)),
+        "n_fft": int(pick_attr(stft, ["n_fft", "filter_length", "fft_size"], default=256)),
+        # STFT configuration: The official model uses ReflectionPad1d([0, 64])
+        # No left padding, 64 samples of reflection padding on right
+        "stft_right_padding": 64,
+        # Encoder configuration: All encoder layers use padding=1 with kernel=3
+        "encoder_padding": 1,
+        # Context buffer: 64 samples from previous chunk are prepended
+        "context_size": 64,
+        # Chunk size: Model processes 512-sample chunks (32ms at 16kHz)
+        "chunk_size": 512,
     }
     with open(out_cfg, "w") as f:
         json.dump(cfg, f, indent=2)
