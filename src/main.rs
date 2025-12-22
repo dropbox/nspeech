@@ -3,6 +3,8 @@ use candle_core::{DType, Device, Tensor, D};
 use candle_nn::{VarBuilder, VarMap};
 use std::env;
 use std::path::Path;
+mod silero;
+use silero::{SileroVad, VadStream };
 
 use parakeet::{
     load_parakeet_ctc_from_hf, load_parakeet_ctc_from_local, stream_wav_as_feature_chunks,
@@ -11,6 +13,112 @@ use parakeet::{
 
 fn main() -> Result<()> {
     let device = Device::Cpu;
+
+
+    let vad = SileroVad::load(&device, "vad16.safetensors", "vad16.config.json")?;
+
+
+
+    // Create streaming wrapper (keeps LSTM (h,c) across pushes)
+    let mut stream = VadStream::new(vad, &device)?;
+
+    let chunk_len = 160usize;
+/*
+    // Example: simulate “real-time” audio arriving in 10ms chunks @ 16kHz => 160 samples
+
+    // For demo: 5 seconds of audio. Replace this with mic / file reader chunks.
+    let total_samples = 5 * 16_000;
+    let mut pcm = vec![0.0f32; total_samples];
+
+    // Put a fake “speechy” region in the middle so you see non-zero probs.
+    // (Just a simple tone burst; real speech will work better.)
+    for i in (16_000..32_000).step_by(1) {
+        let t = (i - 16_000) as f32 / 16_000.0;
+        pcm[i] = (2.0 * std::f32::consts::PI * 220.0 * t).sin() * 0.2;
+    }
+
+    // Stream it through
+    let mut idx = 0usize;
+    let mut frame_idx = 0usize;
+
+    while idx < pcm.len() {
+        let end = (idx + chunk_len).min(pcm.len());
+        let probs = stream.push(&pcm[idx..end])?;
+
+        // You'll get ~1 prob per 2048 samples (~128ms) once the internal buffer is warm.
+        for p in probs {
+            // Convert "frame index" to time:
+            // each prob corresponds to 2048 samples at 16kHz
+            let t_ms = frame_idx as f32 * (2048.0 / 16_000.0) * 1000.0;
+            println!("{:7.1} ms  p_speech={:.3}", t_ms, p);
+            frame_idx += 1;
+        }
+
+        idx = end;
+    }
+    */
+
+    let args: Vec<String> = env::args().collect();
+    let path = &args[1];
+    let mut reader = hound::WavReader::open(&path)?;
+    let spec = reader.spec();
+    if spec.channels != 1 {
+        assert!(false);
+        //return Err(anyhow!("expected mono wav, got {} channels", spec.channels));
+    }
+    const SAMPLE_RATE: u32 = 16000;
+    if spec.sample_rate != SAMPLE_RATE {
+        assert!(false);
+    }
+    let samples: Vec<f32> = match (spec.sample_format, spec.bits_per_sample) {
+        (hound::SampleFormat::Int, 16) => reader
+            .samples::<i16>()
+            .map(|s| s.map(|v| v as f32 / i16::MAX as f32))
+            .collect::<Result<_, _>>()?,
+        (hound::SampleFormat::Int, 24) => reader
+            .samples::<i32>()
+            .map(|s| s.map(|v| v as f32 / 8_388_608.0))
+            .collect::<Result<_, _>>()?,
+        (hound::SampleFormat::Int, 32) => reader
+            .samples::<i32>()
+            .map(|s| s.map(|v| v as f32 / i32::MAX as f32))
+            .collect::<Result<_, _>>()?,
+        (hound::SampleFormat::Float, 32) => reader
+            .samples::<f32>()
+            .collect::<Result<_, _>>()?,
+        _ => [].into()
+    };
+    if samples.is_empty() {
+        assert!(false);
+    }
+
+    let pcm = samples;
+
+    // Stream it through
+    let mut idx = 0usize;
+    let mut frame_idx = 0usize;
+    let mut total_samples_pushed = 0usize;
+
+    while idx < pcm.len() {
+        let end = (idx + chunk_len).min(pcm.len());
+        total_samples_pushed += end - idx;
+        let probs = stream.push(&pcm[idx..end])?;
+
+        // You'll get ~1 prob per 2048 samples (~128ms) once the internal buffer is warm.
+        for p in probs {
+            // Each frame represents 2048 samples
+            let t_ms = frame_idx as f32 * (2048.0 / 16.0);  // 16000 samples/sec = 16 samples/ms
+            println!("{:7.1} ms  p_speech={:.3}", t_ms, p);
+            frame_idx += 1;
+        }
+
+        idx = end;
+    }
+
+    return Ok(());
+
+
+/*
     let args: Vec<String> = env::args().collect();
     let mut wav_path: Option<String> = None;
     let mut hf_repo: Option<String> = None;
@@ -158,4 +266,5 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+    */
 }

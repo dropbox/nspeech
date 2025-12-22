@@ -49,7 +49,8 @@ impl Default for FastConformerConfig {
     }
 }
 
-// Sinusoidal positional encoding.
+// Sinusoidal positional encoding (kept for reference; not used in HF path).
+#[allow(dead_code)]
 fn sinusoidal_positional_encoding(length: usize, dim: usize, device: &Device) -> Result<Tensor> {
     let mut data = vec![0f32; length * dim];
     for pos in 0..length {
@@ -65,26 +66,21 @@ fn sinusoidal_positional_encoding(length: usize, dim: usize, device: &Device) ->
     Ok(Tensor::from_slice(&data, (1, length, dim), device)?)
 }
 
-/// Relative positional encoding (cos/sin) producing shape [B, 2T-1, D].
 fn relative_positional_encoding(batch: usize, seq: usize, dim: usize, device: &Device) -> Result<Tensor> {
-    let base: f32 = 10000.0;
-    let mut inv_freq = Vec::new();
-    for i in (0..dim).step_by(2) {
-        inv_freq.push(1.0f32 / base.powf(i as f32 / dim as f32));
+    // Fallback: standard sinusoidal encoding (length = seq) broadcast over batch.
+    let mut data = vec![0f32; seq * dim];
+    for pos in 0..seq {
+        for i in 0..(dim / 2) {
+            let idx = 2 * i;
+            let div_term = (pos as f32) / (10000_f32.powf(2.0 * i as f32 / dim as f32));
+            data[pos * dim + idx] = div_term.sin();
+            if idx + 1 < dim {
+                data[pos * dim + idx + 1] = div_term.cos();
+            }
+        }
     }
-    let inv_freq_t = Tensor::from_slice(&inv_freq, (inv_freq.len(),), device)?;
-    let position_ids: Vec<i64> = (0..seq as i64)
-        .rev()
-        .map(|x| x - (seq as i64 - 1))
-        .collect();
-    let position_ids = Tensor::from_slice(&position_ids, (seq * 2 - 1,), device)?;
-    let freqs = (inv_freq_t.unsqueeze(0)?.unsqueeze(2)?
-        * position_ids.to_dtype(DType::F32)?.unsqueeze(0)?.unsqueeze(0)?)?;
-    let freqs = freqs.transpose(1, 2)?;
-    let sin = freqs.sin()?;
-    let cos = freqs.cos()?;
-    let pos = Tensor::stack(&[sin, cos], 2)?.reshape((1, seq * 2 - 1, dim))?;
-    Ok(pos.broadcast_as((batch, seq * 2 - 1, dim))?)
+    let pos = Tensor::from_slice(&data, (1, seq, dim), device)?;
+    Ok(pos.broadcast_as((batch, seq, dim))?)
 }
 
 /// HF-compatible 2D subsampling front-end (matches Parakeet checkpoint).
@@ -252,7 +248,10 @@ impl MultiHeadSelfAttention {
         let q = self.q_proj.forward(xs)?;
         let k = self.k_proj.forward(xs)?;
         let v = self.v_proj.forward(xs)?;
-        let k_rel = pos.matmul(&self.rel_k_weight.transpose(D::Minus2, D::Minus1)?)?;
+        let pos2 = pos.reshape((b * pos.dims()[1], d))?;
+        let k_rel = pos2
+            .matmul(&self.rel_k_weight.transpose(D::Minus2, D::Minus1)?)?
+            .reshape((b, pos.dims()[1], d))?;
         let q = q.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?;
         let k = k.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?;
         let v = v.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?;
@@ -263,16 +262,20 @@ impl MultiHeadSelfAttention {
         let bv = self.bias_v.unsqueeze(0)?.unsqueeze(2)?;
         let q_bias_u = q.broadcast_add(&bu)?;
         let q_bias_v = q.broadcast_add(&bv)?;
+        let attn_scores_c = q_bias_u.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
         let mut attn_scores_r = q_bias_v.matmul(&k_rel.transpose(D::Minus2, D::Minus1)?)?;
         attn_scores_r = self.rel_shift(&attn_scores_r)?;
-        attn_scores_r = attn_scores_r.narrow(D::Minus1, 0, t)?;
-        let attn_scores_c = q_bias_u.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
+        let last = attn_scores_r.dims4()?.3;
+        let take = last.min(t);
+        attn_scores_r = attn_scores_r.narrow(D::Minus1, 0, take)?;
         let mut attn_scores = (attn_scores_c + attn_scores_r)?;
-        let scale_t = Tensor::from_slice(&[self.scaling as f32], (), xs.device())?;
-        attn_scores = (attn_scores * scale_t)?;
         if let Some(mask) = attn_mask {
             attn_scores = (attn_scores + mask)?;
         }
+        let scale = (self.head_dim as f64).sqrt() as f32;
+        let scale_t = Tensor::from_slice(&[scale], (), xs.device())?;
+        let scale_t = scale_t.broadcast_as(attn_scores.shape())?;
+        attn_scores = (attn_scores / scale_t)?;
         let attn_weights = candle_nn::ops::softmax(&attn_scores, D::Minus1)?;
         let attn_weights = self.dropout.forward(&attn_weights, train)?;
         let context = attn_weights.matmul(&v)?;
@@ -282,8 +285,13 @@ impl MultiHeadSelfAttention {
     }
 
     fn rel_shift(&self, x: &Tensor) -> Result<Tensor> {
-        // Simplified shift: return as-is (approximation of Shaw rel-shift).
-        Ok(x.clone())
+        // x: [B,H,T,2T-1] -> shift to align relative positions.
+        let (b, h, t, p) = x.dims4()?;
+        let zeros = Tensor::zeros((b, h, t, 1), x.dtype(), x.device())?;
+        let x = Tensor::cat(&[zeros, x.clone()], 3)?;
+        let x = x.reshape((b, h, p + 1, t))?;
+        let x = x.narrow(D::Minus2, 1, p)?;
+        Ok(x)
     }
 }
 
@@ -392,11 +400,7 @@ impl FastConformerBlock {
         })
     }
 
-    pub fn forward(&self, xs: &Tensor, train: bool) -> Result<Tensor> {
-        let y_ff1 = self.ff1.forward(&self.ln_ff1.forward(xs)?, train)?;
-        let mut y = (xs + &y_ff1)?;
-        // attention now requires position embeddings; caller should pass via xs? we handle in encoder
-        // this forward is updated in encoder forward where we call self_attn.forward with pos/mask.
+    pub fn forward(&self, _xs: &Tensor, _train: bool) -> Result<Tensor> {
         unreachable!("FastConformerBlock::forward without position embeddings is not used");
     }
 

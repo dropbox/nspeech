@@ -23,3 +23,6 @@ hf-hub = "0.4"
 tokenizers = { version = "0.20", features = ["http"] }
 hound = "3.5"
 rustfft = "6.2"
+
+# For silero
+safetensors = "0.4"
