@@ -15,6 +15,9 @@ use tokenizers::Tokenizer;
 // Native Rust/Candle implementation of Parakeet CTC
 pub mod parakeet_ctc;
 
+// Quantized weight loader
+pub mod quantized_loader;
+
 /// Select the best available device for inference
 /// Prefers Metal on macOS if PARAKEET_DEVICE env var is not set to "cpu"
 /// Falls back to CPU with Accelerate framework

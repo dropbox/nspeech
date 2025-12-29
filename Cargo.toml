@@ -26,3 +26,7 @@ rustfft = "6.2"
 
 # For silero
 safetensors = "0.4"
+
+# For loading quantized weights
+npyz = { version = "0.8", features = ["npz", "half"] }
+half = "2.4"
