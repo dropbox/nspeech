@@ -169,61 +169,15 @@ impl ConvSubsampling {
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         // xs: [B, T, F] -> [B, 1, T, F]
         let (b, t, f) = xs.dims3()?;
-        let xs_input_flat = xs.flatten_all()?.to_vec1::<f32>()?;
-        println!("    Subsampling input: [{}, {}, {}], mean={:.6}, min={:.6}, max={:.6}",
-            b, t, f,
-            xs_input_flat.iter().sum::<f32>() / xs_input_flat.len() as f32,
-            xs_input_flat.iter().cloned().fold(f32::INFINITY, f32::min),
-            xs_input_flat.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-
         let xs = xs.reshape((b, t, f, 1))?.transpose(1, 3)?.transpose(2, 3)?;
-
         let xs = self.layers0.forward(&xs)?.relu()?;
-        let xs_flat = xs.flatten_all()?.to_vec1::<f32>()?;
-        println!("    After conv0+relu: shape={:?}, mean={:.6}, min={:.6}, max={:.6}",
-            xs.dims(), xs_flat.iter().sum::<f32>() / xs_flat.len() as f32,
-            xs_flat.iter().cloned().fold(f32::INFINITY, f32::min),
-            xs_flat.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-
         let xs = self.layers2.forward(&xs)?.relu()?;
-        let xs_flat = xs.flatten_all()?.to_vec1::<f32>()?;
-        println!("    After conv2+relu: shape={:?}, mean={:.6}, min={:.6}, max={:.6}",
-            xs.dims(), xs_flat.iter().sum::<f32>() / xs_flat.len() as f32,
-            xs_flat.iter().cloned().fold(f32::INFINITY, f32::min),
-            xs_flat.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-
         let xs = self.layers3.forward(&xs)?.relu()?;
-        let xs_flat = xs.flatten_all()?.to_vec1::<f32>()?;
-        println!("    After conv3+relu: shape={:?}, mean={:.6}, min={:.6}, max={:.6}",
-            xs.dims(), xs_flat.iter().sum::<f32>() / xs_flat.len() as f32,
-            xs_flat.iter().cloned().fold(f32::INFINITY, f32::min),
-            xs_flat.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-
         let xs = self.layers5.forward(&xs)?.relu()?;
-        let xs_flat = xs.flatten_all()?.to_vec1::<f32>()?;
-        println!("    After conv5+relu: shape={:?}, mean={:.6}, min={:.6}, max={:.6}",
-            xs.dims(), xs_flat.iter().sum::<f32>() / xs_flat.len() as f32,
-            xs_flat.iter().cloned().fold(f32::INFINITY, f32::min),
-            xs_flat.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-
         let xs = self.layers6.forward(&xs)?.relu()?;
-        let xs_flat = xs.flatten_all()?.to_vec1::<f32>()?;
-        println!("    After conv6+relu: shape={:?}, mean={:.6}, min={:.6}, max={:.6}",
-            xs.dims(), xs_flat.iter().sum::<f32>() / xs_flat.len() as f32,
-            xs_flat.iter().cloned().fold(f32::INFINITY, f32::min),
-            xs_flat.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-
         let (b, c, h, w) = xs.dims4()?;
         let xs = xs.transpose(1, 2)?.reshape((b, h, c * w))?;
-        println!("    After flatten: shape={:?}", xs.dims());
-
         let xs = self.linear.forward(&xs)?;
-        let xs_flat = xs.flatten_all()?.to_vec1::<f32>()?;
-        println!("    After linear: shape={:?}, mean={:.6}, min={:.6}, max={:.6}",
-            xs.dims(), xs_flat.iter().sum::<f32>() / xs_flat.len() as f32,
-            xs_flat.iter().cloned().fold(f32::INFINITY, f32::min),
-            xs_flat.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-
         Ok(xs)
     }
 }
@@ -297,36 +251,13 @@ impl MultiHeadSelfAttention {
 
     pub fn forward(&self, xs: &Tensor, pos: &Tensor, attn_mask: Option<&Tensor>, train: bool) -> Result<Tensor> {
         let (b, t, d) = xs.dims3()?;
-        let debug = t == 26;  // Debug for silence.wav
-
-        if debug {
-            let xs_vec = xs.flatten_all()?.to_vec1::<f32>()?;
-            println!("      Attention input: mean={:.6}", xs_vec.iter().sum::<f32>() / xs_vec.len() as f32);
-        }
-
         let q = self.q_proj.forward(xs)?;
         let k = self.k_proj.forward(xs)?;
         let v = self.v_proj.forward(xs)?;
-
-        if debug {
-            let q_vec = q.flatten_all()?.to_vec1::<f32>()?;
-            let k_vec = k.flatten_all()?.to_vec1::<f32>()?;
-            let v_vec = v.flatten_all()?.to_vec1::<f32>()?;
-            println!("      Q: mean={:.6}, K: mean={:.6}, V: mean={:.6}",
-                q_vec.iter().sum::<f32>() / q_vec.len() as f32,
-                k_vec.iter().sum::<f32>() / k_vec.len() as f32,
-                v_vec.iter().sum::<f32>() / v_vec.len() as f32);
-        }
         let pos2 = pos.reshape((b * pos.dims()[1], d))?;
         let k_rel = pos2
             .matmul(&self.rel_k_weight.transpose(D::Minus2, D::Minus1)?)?
             .reshape((b, pos.dims()[1], d))?;
-
-        if debug {
-            let k_rel_vec = k_rel.flatten_all()?.to_vec1::<f32>()?;
-            println!("      k_rel: mean={:.6}", k_rel_vec.iter().sum::<f32>() / k_rel_vec.len() as f32);
-        }
-
         let q = q.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?;
         let k = k.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?;
         let v = v.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?;
@@ -338,41 +269,12 @@ impl MultiHeadSelfAttention {
         let q_bias_u = q.broadcast_add(&bu)?;
         let q_bias_v = q.broadcast_add(&bv)?;
         let attn_scores_c = q_bias_u.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
-
-        if debug {
-            let ac_vec = attn_scores_c.flatten_all()?.to_vec1::<f32>()?;
-            println!("      attn_c: mean={:.6}", ac_vec.iter().sum::<f32>() / ac_vec.len() as f32);
-        }
-
         let mut attn_scores_r = q_bias_v.matmul(&k_rel.transpose(D::Minus2, D::Minus1)?)?;
-
-        if debug {
-            let ar_vec = attn_scores_r.flatten_all()?.to_vec1::<f32>()?;
-            println!("      attn_r (before shift): shape={:?}, mean={:.6}", attn_scores_r.dims(), ar_vec.iter().sum::<f32>() / ar_vec.len() as f32);
-        }
-
         attn_scores_r = self.rel_shift(&attn_scores_r)?;
-
-        if debug {
-            let ar_vec = attn_scores_r.flatten_all()?.to_vec1::<f32>()?;
-            println!("      attn_r (after shift): shape={:?}, mean={:.6}", attn_scores_r.dims(), ar_vec.iter().sum::<f32>() / ar_vec.len() as f32);
-        }
-
         let last = attn_scores_r.dims4()?.3;
         let take = last.min(t);
         attn_scores_r = attn_scores_r.narrow(D::Minus1, 0, take)?;
-
-        if debug {
-            println!("      after narrow: last={}, take={}, final shape={:?}", last, take, attn_scores_r.dims());
-        }
-
         let mut attn_scores = (attn_scores_c + attn_scores_r)?;
-
-        if debug {
-            let as_vec = attn_scores.flatten_all()?.to_vec1::<f32>()?;
-            println!("      combined attn_scores: mean={:.6}", as_vec.iter().sum::<f32>() / as_vec.len() as f32);
-        }
-
         if let Some(mask) = attn_mask {
             attn_scores = (attn_scores + mask)?;
         }
@@ -417,8 +319,6 @@ pub struct ConvModule {
 
 impl ConvModule {
     pub fn new(d_model: usize, kernel_size: usize, drop: f64, vb: VarBuilder<'_>) -> Result<Self> {
-        println!("DEBUG ConvModule::new: d_model={}, kernel_size={}", d_model, kernel_size);
-
         let mut cfg_pw = Conv1dConfig::default();
         cfg_pw.stride = 1;
         cfg_pw.padding = 0;
@@ -430,8 +330,6 @@ impl ConvModule {
         cfg_dw.groups = d_model;
         // IMPORTANT: Depthwise conv MUST have bias (Python uses bias=True)
         let dw = conv1d(d_model, d_model, kernel_size, cfg_dw, vb.pp("depthwise_conv"))?;
-        println!("DEBUG ConvModule: Created depthwise conv with kernel_size={}, padding={}, groups={}, WITH BIAS",
-            kernel_size, kernel_size / 2, d_model);
 
         let bn_cfg = BatchNormConfig {
             eps: 1e-5,
@@ -440,29 +338,6 @@ impl ConvModule {
             remove_mean: true,  // Must be true to match PyTorch BatchNorm (which always centers)
         };
         let bn = batch_norm(d_model, bn_cfg, vb.pp("norm"))?;
-
-        // Debug: Check if BatchNorm loaded running stats
-        // Try to access running_mean and running_var to verify they're loaded
-        if let Ok(running_mean) = vb.pp("norm").get(d_model, "running_mean") {
-            let rm_vec = running_mean.flatten_all()?.to_vec1::<f32>()?;
-            println!("DEBUG ConvModule BatchNorm: running_mean mean={:.6}, min={:.6}, max={:.6}",
-                rm_vec.iter().sum::<f32>() / rm_vec.len() as f32,
-                rm_vec.iter().cloned().fold(f32::INFINITY, f32::min),
-                rm_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-        } else {
-            println!("WARNING: BatchNorm running_mean not found!");
-        }
-
-        if let Ok(running_var) = vb.pp("norm").get(d_model, "running_var") {
-            let rv_vec = running_var.flatten_all()?.to_vec1::<f32>()?;
-            println!("DEBUG ConvModule BatchNorm: running_var mean={:.6}, min={:.6}, max={:.6}",
-                rv_vec.iter().sum::<f32>() / rv_vec.len() as f32,
-                rv_vec.iter().cloned().fold(f32::INFINITY, f32::min),
-                rv_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-        } else {
-            println!("WARNING: BatchNorm running_var not found!");
-        }
-
         let pw2 = conv1d(d_model, d_model, 1, cfg_pw, vb.pp("pointwise_conv2"))?;
 
         Ok(Self {
@@ -484,131 +359,18 @@ impl ConvModule {
                 d
             ));
         }
-        let debug = _t == 442;  // Debug for dots.wav (442 frames)
-
-        if debug {
-            println!("    ConvModule DEBUG:");
-            let xs_flat = xs.flatten_all()?.to_vec1::<f32>()?;
-            println!("      Input [B,T,D]: mean={:.6}", xs_flat.iter().sum::<f32>() / xs_flat.len() as f32);
-        }
-
         let xs = xs.transpose(1, 2)?;
-        if debug {
-            let xs_flat = xs.flatten_all()?.to_vec1::<f32>()?;
-            println!("      After transpose [B,D,T]: mean={:.6}", xs_flat.iter().sum::<f32>() / xs_flat.len() as f32);
-        }
-
         let xs = self.pw1.forward(&xs)?;
-        if debug {
-            let xs_flat = xs.flatten_all()?.to_vec1::<f32>()?;
-            println!("      After pw1 [B,2D,T]: mean={:.6}", xs_flat.iter().sum::<f32>() / xs_flat.len() as f32);
-        }
-
         let a = xs.narrow(1, 0, d)?;
         let b = xs.narrow(1, d, d)?;
-        if debug {
-            let a_flat = a.flatten_all()?.to_vec1::<f32>()?;
-            let b_flat = b.flatten_all()?.to_vec1::<f32>()?;
-            println!("      a: mean={:.6}, b: mean={:.6}",
-                a_flat.iter().sum::<f32>() / a_flat.len() as f32,
-                b_flat.iter().sum::<f32>() / b_flat.len() as f32);
-        }
-
         let gated = candle_nn::ops::sigmoid(&b)?;
-        if debug {
-            let gated_flat = gated.flatten_all()?.to_vec1::<f32>()?;
-            println!("      sigmoid(b): mean={:.6}", gated_flat.iter().sum::<f32>() / gated_flat.len() as f32);
-        }
-
         let xs = (a * gated)?;
-        if debug {
-            let xs_flat = xs.flatten_all()?.to_vec1::<f32>()?;
-            println!("      After gating (a*sigmoid(b)): mean={:.6}", xs_flat.iter().sum::<f32>() / xs_flat.len() as f32);
-        }
-
         let xs = self.dw.forward(&xs)?;
-        if debug {
-            let xs_flat = xs.flatten_all()?.to_vec1::<f32>()?;
-            println!("      After depthwise conv: mean={:.6}", xs_flat.iter().sum::<f32>() / xs_flat.len() as f32);
-        }
-
-        // Debug BatchNorm - save input for manual computation (only once for layer 0)
-        static BN_SAVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if debug && !BN_SAVED.load(std::sync::atomic::Ordering::SeqCst) {
-            let xs_before_bn = xs.flatten_all()?.to_vec1::<f32>()?;
-            let bn_input_mean = xs_before_bn.iter().sum::<f32>() / xs_before_bn.len() as f32;
-            println!("      ConvModule [LAYER 0] train={}, input to BN: mean={:.6}, min={:.6}, max={:.6}",
-                train,
-                bn_input_mean,
-                xs_before_bn.iter().cloned().fold(f32::INFINITY, f32::min),
-                xs_before_bn.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-
-            // Save input to BatchNorm for Python comparison
-            std::fs::write("rust_bn_input_layer0.bin",
-                unsafe { std::slice::from_raw_parts(xs_before_bn.as_ptr() as *const u8, xs_before_bn.len() * 4) })?;
-            println!("      → Saved BatchNorm input to rust_bn_input_layer0.bin");
-
-            BN_SAVED.store(true, std::sync::atomic::Ordering::SeqCst);
-        } else if debug {
-            let xs_before_bn = xs.flatten_all()?.to_vec1::<f32>()?;
-            let bn_input_mean = xs_before_bn.iter().sum::<f32>() / xs_before_bn.len() as f32;
-            println!("      ConvModule train={}, input to BN: mean={:.6}, min={:.6}, max={:.6}",
-                train,
-                bn_input_mean,
-                xs_before_bn.iter().cloned().fold(f32::INFINITY, f32::min),
-                xs_before_bn.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-        }
-
         let xs = self.bn.forward_t(&xs, train)?;
-
-        static BN_OUTPUT_SAVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if debug && !BN_OUTPUT_SAVED.load(std::sync::atomic::Ordering::SeqCst) {
-            let xs_after_bn = xs.flatten_all()?.to_vec1::<f32>()?;
-            let bn_output_mean = xs_after_bn.iter().sum::<f32>() / xs_after_bn.len() as f32;
-            println!("      After BatchNorm: mean={:.6}, min={:.6}, max={:.6}",
-                bn_output_mean,
-                xs_after_bn.iter().cloned().fold(f32::INFINITY, f32::min),
-                xs_after_bn.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-
-            // Save output from BatchNorm for Python comparison
-            std::fs::write("rust_bn_output_layer0.bin",
-                unsafe { std::slice::from_raw_parts(xs_after_bn.as_ptr() as *const u8, xs_after_bn.len() * 4) })?;
-            println!("      → Saved BatchNorm output to rust_bn_output_layer0.bin");
-
-            BN_OUTPUT_SAVED.store(true, std::sync::atomic::Ordering::SeqCst);
-        } else if debug {
-            let xs_after_bn = xs.flatten_all()?.to_vec1::<f32>()?;
-            let bn_output_mean = xs_after_bn.iter().sum::<f32>() / xs_after_bn.len() as f32;
-            println!("      After BatchNorm: mean={:.6}, min={:.6}, max={:.6}",
-                bn_output_mean,
-                xs_after_bn.iter().cloned().fold(f32::INFINITY, f32::min),
-                xs_after_bn.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-        }
-
         let xs = xs.silu()?;
-        if debug {
-            let xs_flat = xs.flatten_all()?.to_vec1::<f32>()?;
-            println!("      After SiLU: mean={:.6}", xs_flat.iter().sum::<f32>() / xs_flat.len() as f32);
-        }
-
         let xs = self.pw2.forward(&xs)?;
-        if debug {
-            let xs_flat = xs.flatten_all()?.to_vec1::<f32>()?;
-            println!("      After pw2: mean={:.6}", xs_flat.iter().sum::<f32>() / xs_flat.len() as f32);
-        }
-
         let xs = self.dropout.forward(&xs, train)?;
-        if debug {
-            let xs_flat = xs.flatten_all()?.to_vec1::<f32>()?;
-            println!("      After dropout: mean={:.6}", xs_flat.iter().sum::<f32>() / xs_flat.len() as f32);
-        }
-
         let xs = xs.transpose(1, 2)?;
-        if debug {
-            let xs_flat = xs.flatten_all()?.to_vec1::<f32>()?;
-            println!("      After transpose back [B,T,D]: mean={:.6}", xs_flat.iter().sum::<f32>() / xs_flat.len() as f32);
-        }
-
         Ok(xs)
     }
 }
@@ -655,78 +417,6 @@ impl FastConformerBlock {
         unreachable!("FastConformerBlock::forward without position embeddings is not used");
     }
 
-    pub fn forward_with_pos_debug(
-        &self,
-        xs: &Tensor,
-        pos: &Tensor,
-        attn_mask: Option<&Tensor>,
-        train: bool,
-    ) -> Result<Tensor> {
-        println!("\n=== LAYER 0 DETAILED DEBUG ===");
-
-        let ln_ff1_out = self.ln_ff1.forward(xs)?;
-        let ln_ff1_flat = ln_ff1_out.flatten_all()?.to_vec1::<f32>()?;
-        std::fs::write("rust_layer0_ln_ff1.bin",
-            unsafe { std::slice::from_raw_parts(ln_ff1_flat.as_ptr() as *const u8, ln_ff1_flat.len() * 4) })?;
-        println!("  LN_FF1: mean={:.6}, min={:.6}, max={:.6}",
-            ln_ff1_flat.iter().sum::<f32>() / ln_ff1_flat.len() as f32,
-            ln_ff1_flat.iter().cloned().fold(f32::INFINITY, f32::min),
-            ln_ff1_flat.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-
-        let y_ff1 = self.ff1.forward(&ln_ff1_out, train)?;
-        let y_ff1_flat = y_ff1.flatten_all()?.to_vec1::<f32>()?;
-        std::fs::write("rust_layer0_ff1.bin",
-            unsafe { std::slice::from_raw_parts(y_ff1_flat.as_ptr() as *const u8, y_ff1_flat.len() * 4) })?;
-        println!("  FF1: mean={:.6}, min={:.6}, max={:.6}",
-            y_ff1_flat.iter().sum::<f32>() / y_ff1_flat.len() as f32,
-            y_ff1_flat.iter().cloned().fold(f32::INFINITY, f32::min),
-            y_ff1_flat.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-
-        let mut y = (xs + &y_ff1)?;
-        let y_after_ff1_flat = y.flatten_all()?.to_vec1::<f32>()?;
-        std::fs::write("rust_layer0_after_ff1.bin",
-            unsafe { std::slice::from_raw_parts(y_after_ff1_flat.as_ptr() as *const u8, y_after_ff1_flat.len() * 4) })?;
-        println!("  After FF1 residual: mean={:.6}",
-            y_after_ff1_flat.iter().sum::<f32>() / y_after_ff1_flat.len() as f32);
-
-        let ln_mha_out = self.ln_mha.forward(&y)?;
-        let ln_mha_flat = ln_mha_out.flatten_all()?.to_vec1::<f32>()?;
-        std::fs::write("rust_layer0_ln_mha.bin",
-            unsafe { std::slice::from_raw_parts(ln_mha_flat.as_ptr() as *const u8, ln_mha_flat.len() * 4) })?;
-        println!("  LN_MHA: mean={:.6}",
-            ln_mha_flat.iter().sum::<f32>() / ln_mha_flat.len() as f32);
-
-        let y_attn = self.self_attn.forward(&ln_mha_out, pos, attn_mask, train)?;
-        let y_attn_flat = y_attn.flatten_all()?.to_vec1::<f32>()?;
-        std::fs::write("rust_layer0_attn.bin",
-            unsafe { std::slice::from_raw_parts(y_attn_flat.as_ptr() as *const u8, y_attn_flat.len() * 4) })?;
-        println!("  ATTN: mean={:.6}",
-            y_attn_flat.iter().sum::<f32>() / y_attn_flat.len() as f32);
-
-        y = (&y + &y_attn)?;
-        let ln_conv_out = self.ln_conv.forward(&y)?;
-        let ln_conv_flat = ln_conv_out.flatten_all()?.to_vec1::<f32>()?;
-        std::fs::write("rust_layer0_ln_conv.bin",
-            unsafe { std::slice::from_raw_parts(ln_conv_flat.as_ptr() as *const u8, ln_conv_flat.len() * 4) })?;
-        println!("  LN_CONV (input to conv module): mean={:.6}",
-            ln_conv_flat.iter().sum::<f32>() / ln_conv_flat.len() as f32);
-
-        let y_conv = self.conv_module.forward(&ln_conv_out, train)?;
-        let y_conv_flat = y_conv.flatten_all()?.to_vec1::<f32>()?;
-        std::fs::write("rust_layer0_conv.bin",
-            unsafe { std::slice::from_raw_parts(y_conv_flat.as_ptr() as *const u8, y_conv_flat.len() * 4) })?;
-        println!("  CONV (output): mean={:.6}",
-            y_conv_flat.iter().sum::<f32>() / y_conv_flat.len() as f32);
-
-        y = (&y + &y_conv)?;
-        let y_ff2 = self.ff2.forward(&self.ln_ff2.forward(&y)?, train)?;
-        y = (&y + &y_ff2)?;
-        let y_out = self.ln_out.forward(&y)?;
-
-        println!("=== END LAYER 0 DEBUG ===\n");
-        Ok(y_out)
-    }
-
     pub fn forward_with_pos(
         &self,
         xs: &Tensor,
@@ -734,86 +424,17 @@ impl FastConformerBlock {
         attn_mask: Option<&Tensor>,
         train: bool,
     ) -> Result<Tensor> {
-        // Detailed debug for first few values
-        let debug = xs.dims()[1] == 26;  // Only debug when we have 26 frames (silence.wav)
-
         let ln_ff1_out = self.ln_ff1.forward(xs)?;
-        if debug {
-            let ln_vec = ln_ff1_out.flatten_all()?.to_vec1::<f32>()?;
-            println!("    After LN_FF1: mean={:.6}, min={:.6}, max={:.6}",
-                ln_vec.iter().sum::<f32>() / ln_vec.len() as f32,
-                ln_vec.iter().cloned().fold(f32::INFINITY, f32::min),
-                ln_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-
-            // Save for comparison - only save layer 0 by checking if we haven't saved before
-            static SAVED_LAYER0: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !SAVED_LAYER0.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                std::fs::write("rust_ln_ff1_layer0_output.bin",
-                    unsafe { std::slice::from_raw_parts(ln_vec.as_ptr() as *const u8, ln_vec.len() * 4) }).ok();
-                println!("    SAVED layer 0 LN_FF1 output to file");
-            }
-
-            // Print first timestep
-            let first_ts = ln_ff1_out.i((0, 0))?.to_vec1::<f32>()?;
-            println!("    First timestep[0:10]: {:?}", &first_ts[..10]);
-        }
         let y_ff1 = self.ff1.forward(&ln_ff1_out, train)?;
-        if debug {
-            let y_ff1_vec = y_ff1.flatten_all()?.to_vec1::<f32>()?;
-            println!("    After FF1: mean={:.6}, min={:.6}, max={:.6}",
-                y_ff1_vec.iter().sum::<f32>() / y_ff1_vec.len() as f32,
-                y_ff1_vec.iter().cloned().fold(f32::INFINITY, f32::min),
-                y_ff1_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-        }
-
         let mut y = (xs + &y_ff1)?;
-
-        if debug {
-            let y_vec = y.flatten_all()?.to_vec1::<f32>()?;
-            println!("    After add (before LN_MHA): mean={:.6}", y_vec.iter().sum::<f32>() / y_vec.len() as f32);
-        }
-
         let ln_mha_out = self.ln_mha.forward(&y)?;
-
-        if debug {
-            let ln_vec = ln_mha_out.flatten_all()?.to_vec1::<f32>()?;
-            println!("    After LN_MHA: mean={:.6}, min={:.6}, max={:.6}",
-                ln_vec.iter().sum::<f32>() / ln_vec.len() as f32,
-                ln_vec.iter().cloned().fold(f32::INFINITY, f32::min),
-                ln_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-        }
-
         let y_attn = self
             .self_attn
             .forward(&ln_mha_out, pos, attn_mask, train)?;
-        if debug {
-            let y_attn_vec = y_attn.flatten_all()?.to_vec1::<f32>()?;
-            println!("    After Attn: mean={:.6}, min={:.6}, max={:.6}",
-                y_attn_vec.iter().sum::<f32>() / y_attn_vec.len() as f32,
-                y_attn_vec.iter().cloned().fold(f32::INFINITY, f32::min),
-                y_attn_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-        }
-
         y = (&y + &y_attn)?;
         let y_conv = self.conv_module.forward(&self.ln_conv.forward(&y)?, train)?;
-        if debug {
-            let y_conv_vec = y_conv.flatten_all()?.to_vec1::<f32>()?;
-            println!("    After Conv: mean={:.6}, min={:.6}, max={:.6}",
-                y_conv_vec.iter().sum::<f32>() / y_conv_vec.len() as f32,
-                y_conv_vec.iter().cloned().fold(f32::INFINITY, f32::min),
-                y_conv_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-        }
-
         y = (&y + &y_conv)?;
         let y_ff2 = self.ff2.forward(&self.ln_ff2.forward(&y)?, train)?;
-        if debug {
-            let y_ff2_vec = y_ff2.flatten_all()?.to_vec1::<f32>()?;
-            println!("    After FF2: mean={:.6}, min={:.6}, max={:.6}",
-                y_ff2_vec.iter().sum::<f32>() / y_ff2_vec.len() as f32,
-                y_ff2_vec.iter().cloned().fold(f32::INFINITY, f32::min),
-                y_ff2_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-        }
-
         y = (&y + &y_ff2)?;
         let y_out = self.ln_out.forward(&y)?;
         Ok(y_out)
@@ -849,25 +470,12 @@ impl FastConformerEncoder {
 
     pub fn forward(&self, xs: &Tensor, train: bool) -> Result<Tensor> {
         let device = xs.device();
-        println!("  DEBUG: Encoder forward - train={}", train);
-
-        // Check if input is already subsampled (d_model dimension)
         let (_, _, input_dim) = xs.dims3()?;
         let xs = if input_dim == self.cfg.d_model {
-            println!("  DEBUG: Input already has d_model dimensions, skipping subsampling");
             xs.clone()
         } else {
-            println!("  DEBUG: Running subsampling ({} -> {} dims)", input_dim, self.cfg.d_model);
             self.subsampling.forward(xs)?
         };
-
-        // Check subsampling output
-        let xs_flat = xs.flatten_all()?.to_vec1::<f32>()?;
-        let xs_mean = xs_flat.iter().sum::<f32>() / xs_flat.len() as f32;
-        let xs_min = xs_flat.iter().cloned().fold(f32::INFINITY, f32::min);
-        let xs_max = xs_flat.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        println!("  DEBUG: After subsampling - mean={:.6}, min={:.6}, max={:.6}", xs_mean, xs_min, xs_max);
-
         let (b, t, d) = xs.dims3()?;
         if d != self.cfg.d_model {
             return Err(anyhow!(
@@ -876,69 +484,19 @@ impl FastConformerEncoder {
                 d
             ));
         }
-
         let xs = if self.cfg.scale_input {
             let scale = (self.cfg.d_model as f64).sqrt() as f32;
-            println!("  DEBUG: Scaling input by sqrt(d_model) = sqrt({}) = {:.6}", self.cfg.d_model, scale);
             let scale_t = Tensor::from_slice(&[scale], (), device)?;
             let scale_t = scale_t.broadcast_as(xs.shape())?;
-            let xs_scaled = (xs * scale_t)?;
-
-            // Check scaled values
-            let xs_scaled_flat = xs_scaled.flatten_all()?.to_vec1::<f32>()?;
-            let xs_scaled_mean = xs_scaled_flat.iter().sum::<f32>() / xs_scaled_flat.len() as f32;
-            let xs_scaled_min = xs_scaled_flat.iter().cloned().fold(f32::INFINITY, f32::min);
-            let xs_scaled_max = xs_scaled_flat.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            println!("  DEBUG: After scaling - mean={:.6}, min={:.6}, max={:.6}", xs_scaled_mean, xs_scaled_min, xs_scaled_max);
-
-            xs_scaled
+            (xs * scale_t)?
         } else {
-            println!("  DEBUG: NOT scaling input (scale_input=false)");
             xs
         };
-        // Relative positional encodings (2T-1, d_model)
         let pos = relative_positional_encoding(b, t, d, device)?;
         let pos = self.pos_dropout_positions.forward(&pos, train)?;
         let mut h = self.pos_dropout.forward(&xs, train)?;
-
-        // Check if dropout modified the input
-        let xs_after_dropout = h.clone();
-        let diff = ((xs_after_dropout - xs.clone())?.abs()?.sum_all()?).to_scalar::<f32>()?;
-        println!("  DEBUG: Dropout diff (should be 0 if train=false): {:.6}", diff);
-
-        // Debug: check input to first encoder layer
-        let h_first_layer_input = h.flatten_all()?.to_vec1::<f32>()?;
-        println!("  DEBUG: Input to encoder layer 0:");
-        println!("    Stats: min={:.6}, max={:.6}, mean={:.6}",
-            h_first_layer_input.iter().cloned().fold(f32::INFINITY, f32::min),
-            h_first_layer_input.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
-            h_first_layer_input.iter().sum::<f32>() / h_first_layer_input.len() as f32);
-        let h_first_timestep = h.i((0, 0))?.to_vec1::<f32>()?;
-        println!("    First timestep[0:10]: {:?}", &h_first_timestep[..10]);
-
-        // Save Rust encoder input for precise comparison
-        std::fs::write("rust_encoder_input.bin",
-            unsafe { std::slice::from_raw_parts(h_first_layer_input.as_ptr() as *const u8, h_first_layer_input.len() * 4) })?;
-        println!("    Saved encoder input to rust_encoder_input.bin");
-
-        for (i, blk) in self.blocks.iter().enumerate() {
-            // For layer 0, use special debugging version
-            if i == 0 {
-                h = blk.forward_with_pos_debug(&h, &pos, None, train)?;
-            } else {
-                h = blk.forward_with_pos(&h, &pos, None, train)?;
-            }
-
-            // Save all layer outputs for debugging
-            let h_flat = h.flatten_all()?.to_vec1::<f32>()?;
-            std::fs::write(format!("rust_layer{}_output.bin", i),
-                unsafe { std::slice::from_raw_parts(h_flat.as_ptr() as *const u8, h_flat.len() * 4) })?;
-
-            let mean = h_flat.iter().sum::<f32>() / h_flat.len() as f32;
-            let min = h_flat.iter().cloned().fold(f32::INFINITY, f32::min);
-            let max = h_flat.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-
-            println!("  Layer {:2}: mean={:8.6}, min={:8.3}, max={:8.3}", i, mean, min, max);
+        for blk in self.blocks.iter() {
+            h = blk.forward_with_pos(&h, &pos, None, train)?;
         }
         Ok(h)
     }
@@ -990,37 +548,16 @@ impl ParakeetFastConformerCtc {
         tokenizer: Tokenizer,
     ) -> Result<Self> {
         let encoder = FastConformerEncoder::new(cfg.clone(), vb.pp("encoder"))?;
-
-        // Load CTC head - manually load and verify weights
         let ctc_vb = vb.pp("ctc_head");
-
-        // Check what format the weights are in and load manually
         let weight = if let Ok(w) = ctc_vb.get((cfg.vocab_size, cfg.d_model), "weight") {
-            println!("DEBUG: Found Linear format weights [vocab={}, d_model={}]", cfg.vocab_size, cfg.d_model);
             w
         } else if let Ok(w) = ctc_vb.get((cfg.vocab_size, cfg.d_model, 1), "weight") {
-            println!("DEBUG: Found Conv1d format weights [vocab={}, d_model={}, 1], squeezing...", cfg.vocab_size, cfg.d_model);
-            let w_squeezed = w.squeeze(2)?;
-            println!("DEBUG: After squeeze, shape={:?}", w_squeezed.dims());
-            w_squeezed
+            w.squeeze(2)?
         } else {
             return Err(anyhow!("Could not find ctc_head.weight in any expected format"));
         };
-
-        // Verify weight shape
-        println!("DEBUG: Final weight shape={:?}", weight.dims());
-        let weight_vec = weight.flatten_all()?.to_vec1::<f32>()?;
-        println!("DEBUG: Weight stats: mean={:.6}, min={:.6}, max={:.6}",
-            weight_vec.iter().sum::<f32>() / weight_vec.len() as f32,
-            weight_vec.iter().cloned().fold(f32::INFINITY, f32::min),
-            weight_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-
         let bias = ctc_vb.get(cfg.vocab_size, "bias")?;
-
-        // Create Linear layer with the squeezed weights
         let proj = Linear::new(weight, Some(bias));
-        println!("DEBUG: Created Linear layer");
-
         Ok(Self {
             encoder,
             proj,
@@ -1032,94 +569,30 @@ impl ParakeetFastConformerCtc {
 
     pub fn forward(&self, xs: &Tensor, train: bool) -> Result<Tensor> {
         let h = self.encoder.forward(xs, train)?; // [B,T,D]
-        let (b, t, d) = h.dims3()?;
-
-        // Debug: check encoder output
-        let h_flat = h.flatten_all()?;
-        let h_vec = h_flat.to_vec1::<f32>()?;
-        let h_min = h_vec.iter().cloned().fold(f32::INFINITY, f32::min);
-        let h_max = h_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let h_mean = h_vec.iter().sum::<f32>() / h_vec.len() as f32;
-        println!("  Encoder output stats: shape=[{},{},{}], min={:.4}, max={:.4}, mean={:.4}",
-            b, t, d, h_min, h_max, h_mean);
-
-        // Debug: Check first feature value of encoder output
-        let h_first = h.i((0, 0))?;  // First timestep
-        let h_first_vec = h_first.to_vec1::<f32>()?;
-        println!("  Encoder first timestep features[0:10]: {:?}", &h_first_vec[..10]);
-
-        // Save encoder output for Python comparison
-        let h_flat_for_save = h.flatten_all()?.to_vec1::<f32>()?;
-        std::fs::write("rust_encoder_output.bin",
-            unsafe { std::slice::from_raw_parts(h_flat_for_save.as_ptr() as *const u8,
-                h_flat_for_save.len() * 4) })?;
-        println!("  Saved encoder output to rust_encoder_output.bin");
-
-        // Test Linear.forward()
         let logits = self.proj.forward(&h)?;
-        let logits_first = logits.i((0, 0))?.to_vec1::<f32>()?;
-        println!("  Linear.forward result[0,0,0:5]: {:?}", &logits_first[..5]);
-
-        println!("  Python expects logit[0] ≈ 0.309, logit[1] ≈ -1.382");
-        println!("  Rust got:      logit[0] = {:.3}, logit[1] = {:.3}",
-            logits_first[0], logits_first[1]);
-
         Ok(logits)
     }
 
     pub fn greedy_decode(&self, logits: &Tensor) -> Result<Vec<String>> {
-        let (b, t, v) = logits.dims3()?;
-
-        // Debug: check logit statistics
-        let logits_flat = logits.flatten_all()?;
-        let logits_vec = logits_flat.to_vec1::<f32>()?;
-        let min_val = logits_vec.iter().cloned().fold(f32::INFINITY, f32::min);
-        let max_val = logits_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mean_val = logits_vec.iter().sum::<f32>() / logits_vec.len() as f32;
-        println!("  Logit stats: min={:.4}, max={:.4}, mean={:.4}, vocab_size={}", min_val, max_val, mean_val, v);
-
-        // Check first timestep logits
-        let first_logits = logits.i((0, 0))?;
-        let first_vec = first_logits.to_vec1::<f32>()?;
-        let blank_logit = first_vec[self.cfg.blank_id];
-        let non_blank_sample: Vec<f32> = first_vec[..10].to_vec();
-        println!("  First frame - blank_logit[{}]={:.4}, first_10={:?}",
-            self.cfg.blank_id, blank_logit, &non_blank_sample[..10.min(non_blank_sample.len())]);
-
+        let (b, t, _v) = logits.dims3()?;
         let pred_ids = logits.argmax(D::Minus1)?;
         let pred_ids = pred_ids.to_vec2::<u32>()?;
         let mut transcripts = Vec::with_capacity(b);
         for bidx in 0..b {
             let mut prev = self.cfg.blank_id as u32;
             let mut tokens = Vec::new();
-
-            // Debug: count predictions
-            let mut blank_count = 0;
-            let mut non_blank_count = 0;
-            let mut unique_tokens = std::collections::HashSet::new();
-
             for tidx in 0..t {
                 let cur = pred_ids[bidx][tidx];
                 if cur == self.cfg.blank_id as u32 {
-                    blank_count += 1;
                     prev = cur;
                     continue;
                 }
-                non_blank_count += 1;
-                unique_tokens.insert(cur);
                 if cur == prev {
                     continue;
                 }
                 tokens.push(cur);
                 prev = cur;
             }
-
-            println!("  Debug: blank_id={}, blanks={}/{}, non-blanks={}, unique={}, after_dedup={}",
-                self.cfg.blank_id, blank_count, t, non_blank_count, unique_tokens.len(), tokens.len());
-            if tokens.len() > 0 && tokens.len() <= 20 {
-                println!("  First tokens: {:?}", &tokens[..tokens.len().min(20)]);
-            }
-
             let text = self.decode_tokens(&tokens)?;
             transcripts.push(text);
         }
@@ -1172,9 +645,6 @@ pub struct HfParakeetCtcConfig {
 impl FastConformerConfig {
     pub fn from_hf(hf: &HfParakeetCtcConfig) -> Self {
         let enc = &hf.encoder_config;
-        println!("DEBUG: Loading config from HF:");
-        println!("  conv_kernel_size: {}", enc.conv_kernel_size);
-        println!("  d_model: {}", enc.hidden_size);
         Self {
             feat_in: enc.num_mel_bins,
             d_model: enc.hidden_size,
@@ -1402,37 +872,19 @@ pub fn load_python_encoder_input<P: AsRef<Path>>(
     device: &Device,
 ) -> Result<Tensor> {
     let path_str = path.as_ref().to_str().unwrap();
-
-    // Map audio file to pre-computed subsampling output
     let subsamp_file = if path_str.contains("dots.wav") {
         "python_subsamp_dots.bin"
     } else {
         return Err(anyhow!("Pre-computed subsampling not available for this file. Use dots.wav"));
     };
-
-    println!("  Loading pre-computed subsampling output from: {}", subsamp_file);
-    println!("  [Bypassing both Rust mel computation AND subsampling]");
-
     let data = std::fs::read(subsamp_file)?;
     let n_floats = data.len() / 4;
     let mut feats = Vec::with_capacity(n_floats);
-
     for chunk in data.chunks_exact(4) {
         let bytes = [chunk[0], chunk[1], chunk[2], chunk[3]];
         feats.push(f32::from_le_bytes(bytes));
     }
-
-    // Subsampling output is [T, 1024]
     let n_frames = feats.len() / 1024;
-    println!("  Subsampling output (UNSCALED): {} frames x 1024 dims", n_frames);
-    println!("  Stats: mean={:.6}, min={:.6}, max={:.6}",
-        feats.iter().sum::<f32>() / feats.len() as f32,
-        feats.iter().cloned().fold(f32::INFINITY, f32::min),
-        feats.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-
-    // NOTE: Do NOT scale here - encoder.forward() will apply sqrt(d_model) scaling
-    println!("  (Scaling will be applied by encoder.forward())");
-
     let tensor = Tensor::from_slice(&feats, (1, n_frames, 1024), device)?;
     Ok(tensor)
 }
@@ -1444,8 +896,6 @@ pub fn load_python_mel_features<P: AsRef<Path>>(
     device: &Device,
 ) -> Result<Tensor> {
     let path_str = path.as_ref().to_str().unwrap();
-
-    // Map audio file to pre-computed mel features
     let mel_file = if path_str.contains("dots.wav") {
         "python_mel_dots.bin"
     } else if path_str.contains("silence.wav") {
@@ -1453,25 +903,14 @@ pub fn load_python_mel_features<P: AsRef<Path>>(
     } else {
         return Err(anyhow!("Pre-computed mel features not available for this file. Use dots.wav or silence.wav"));
     };
-
-    println!("  Loading pre-computed mel features from: {}", mel_file);
-
     let mel_data = std::fs::read(mel_file)?;
     let n_floats = mel_data.len() / 4;
     let mut feats = Vec::with_capacity(n_floats);
-
     for chunk in mel_data.chunks_exact(4) {
         let bytes = [chunk[0], chunk[1], chunk[2], chunk[3]];
         feats.push(f32::from_le_bytes(bytes));
     }
-
     let n_frames = feats.len() / feat_dim;
-    println!("  Mel features: {} frames x {} dims", n_frames, feat_dim);
-    println!("  Stats: mean={:.6}, min={:.6}, max={:.6}",
-        feats.iter().sum::<f32>() / feats.len() as f32,
-        feats.iter().cloned().fold(f32::INFINITY, f32::min),
-        feats.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
-
     let tensor = Tensor::from_slice(&feats, (1, n_frames, feat_dim), device)?;
     Ok(tensor)
 }
@@ -1515,12 +954,6 @@ pub fn load_wav_as_features<P: AsRef<Path>>(
         return Err(anyhow!("wav contains no samples"));
     }
     let feats = log_mel_spectrogram(&samples, SAMPLE_RATE, feat_dim)?;
-
-    // Debug: save mel features for comparison
-    std::fs::write("rust_mel_features.bin",
-        unsafe { std::slice::from_raw_parts(feats.as_ptr() as *const u8, feats.len() * 4) })?;
-    println!("  Saved mel features to rust_mel_features.bin ({} frames)", feats.len() / feat_dim);
-
     let tensor = Tensor::from_slice(&feats, (1, feats.len() / feat_dim, feat_dim), device)?;
     Ok(tensor)
 }
