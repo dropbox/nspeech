@@ -932,20 +932,6 @@ fn load_gguf_model_common<P: AsRef<Path>>(
 
 // ----------------- Audio / log-mel frontend -----------------
 const SAMPLE_RATE: u32 = 16_000;
-const N_FFT: usize = 512;
-const WIN_LENGTH: usize = 400;
-const HOP_LENGTH: usize = 160;
-const EPS: f32 = 1e-6;
-
-fn hann_window(n: usize) -> Vec<f32> {
-    // Periodic Hann window: w[i] = 0.5 * (1 - cos(2π*i/N))
-    // This matches PyTorch's torch.hann_window() (periodic=True by default)
-    (0..n)
-        .map(|i| {
-            0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos())
-        })
-        .collect()
-}
 
 //const LOG_ZERO_GUARD_VALUE: f32 = 2.0_f32.powi(-24);
 const LOG_ZERO_GUARD_VALUE: f32 = 5.9604645e-08; // 2^-24
@@ -1187,38 +1173,6 @@ fn mel_filterbank_slaney_norm(
     filters
 }
 
-
-fn process_frame_to_mel(
-    frame: &[f32],
-    window: &[f32],
-    fft: &std::sync::Arc<dyn Fft<f32>>,
-    fb: &[f32],
-    num_mels: usize,
-    n_freqs: usize,
-    buffer: &mut [Complex32],
-    out: &mut Vec<f32>,
-) {
-    buffer.iter_mut().for_each(|c| *c = Complex32::new(0.0, 0.0));
-    for (i, sample) in frame.iter().enumerate() {
-        buffer[i] = Complex32::new(sample * window[i], 0.0);
-    }
-    fft.process(buffer);
-    let mut power = vec![0f32; n_freqs];
-    for i in 0..n_freqs {
-        let c = buffer[i];
-        power[i] = c.re * c.re + c.im * c.im;
-    }
-    for m in 0..num_mels {
-        let base = m * n_freqs;
-        let mut acc = 0f32;
-        for k in 0..n_freqs {
-            acc += fb[base + k] * power[k];
-        }
-        // Use log10 to match librosa/Parakeet (not natural log)
-        out.push((acc.max(EPS)).log10());
-    }
-}
-
 /// Load pre-computed encoder input from Python (bypasses mel+subsampling)
 pub fn load_python_encoder_input<P: AsRef<Path>>(
     path: P,
@@ -1244,7 +1198,7 @@ pub fn load_python_encoder_input<P: AsRef<Path>>(
 
 pub fn load_wav_as_features<P: AsRef<Path>>(
     path: P,
-    feat_dim: usize,
+    _feat_dim: usize,
     device: &Device,
 ) -> Result<Tensor> {
     let mut reader = hound::WavReader::open(&path)?;
