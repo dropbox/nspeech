@@ -73,15 +73,25 @@ fn sinusoidal_positional_encoding(length: usize, dim: usize, device: &Device) ->
 
 fn relative_positional_encoding(batch: usize, seq: usize, dim: usize, device: &Device) -> Result<Tensor> {
     // Relative positional encoding needs 2*seq-1 positions for all relative distances
+    // Positions range from -(seq-1) to +(seq-1), centered at 0
+    // Python uses symmetric encoding: sin(abs(pos)) with sign flip for negative positions
     let pos_len = 2 * seq - 1;
     let mut data = vec![0f32; pos_len * dim];
-    for pos in 0..pos_len {
+    for idx in 0..pos_len {
+        // Convert index to relative position: -(seq-1), ..., -1, 0, 1, ..., +(seq-1)
+        let pos = (idx as isize) - (seq as isize - 1);
+        let abs_pos = pos.abs() as f32;
+        // Python uses NEGATIVE sign for positive positions!
+        let sign = if pos > 0 { -1.0f32 } else { 1.0f32 };
+
         for i in 0..(dim / 2) {
-            let idx = 2 * i;
-            let div_term = (pos as f32) / (10000_f32.powf(2.0 * i as f32 / dim as f32));
-            data[pos * dim + idx] = div_term.sin();
-            if idx + 1 < dim {
-                data[pos * dim + idx + 1] = div_term.cos();
+            let col_idx = 2 * i;
+            let div_term = abs_pos / (10000_f32.powf(2.0 * i as f32 / dim as f32));
+            // Sine: use abs(pos) but flip sign for negative positions
+            data[idx * dim + col_idx] = sign * div_term.sin();
+            // Cosine: use abs(pos) directly
+            if col_idx + 1 < dim {
+                data[idx * dim + col_idx + 1] = div_term.cos();
             }
         }
     }
