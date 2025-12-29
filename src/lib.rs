@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use candle_core::{DType, Device, IndexOp, Module, ModuleT, Tensor, D};
+use candle_core::{DType, Device, Module, ModuleT, Tensor, D};
 use candle_nn::{
     batch_norm, conv1d, conv1d_no_bias, conv2d, layer_norm, linear, BatchNorm, BatchNormConfig,
     Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, Dropout, LayerNorm, LayerNormConfig, Linear,
@@ -14,6 +14,41 @@ use tokenizers::Tokenizer;
 
 // Native Rust/Candle implementation of Parakeet CTC
 pub mod parakeet_ctc;
+
+/// Select the best available device for inference
+/// Prefers Metal on macOS if PARAKEET_DEVICE env var is not set to "cpu"
+/// Falls back to CPU with Accelerate framework
+pub fn get_device() -> Result<Device> {
+    // Allow forcing CPU mode via environment variable
+    if std::env::var("PARAKEET_DEVICE").as_deref() == Ok("cpu") {
+        println!("Using CPU (forced by PARAKEET_DEVICE=cpu)");
+        return Ok(Device::Cpu);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // Note: Metal acceleration has some known issues with certain tensor operations
+        // in Candle. If you encounter errors, set PARAKEET_DEVICE=cpu
+        match Device::new_metal(0) {
+            Ok(device) => {
+                println!("Using Metal GPU acceleration");
+                println!("  (If you encounter errors, try: PARAKEET_DEVICE=cpu)");
+                return Ok(device);
+            }
+            Err(e) => {
+                println!("Metal not available ({}), using CPU with Accelerate", e);
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    println!("Using CPU");
+
+    #[cfg(target_os = "macos")]
+    println!("Using CPU with Accelerate framework");
+
+    Ok(Device::Cpu)
+}
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct FastConformerConfig {
@@ -269,18 +304,19 @@ impl MultiHeadSelfAttention {
         let k_rel = pos2
             .matmul(&self.rel_k_weight.transpose(D::Minus2, D::Minus1)?)?
             .reshape((b, pos.dims()[1], d))?;
-        let q = q.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?;
-        let k = k.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?;
-        let v = v.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?;
+        let q = q.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        let k = k.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        let v = v.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
         let k_rel = k_rel
             .reshape((b, pos.dims()[1], self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?
+            .contiguous()?;
         let bu = self.bias_u.unsqueeze(0)?.unsqueeze(2)?; // [1,H,1,Dh]
         let bv = self.bias_v.unsqueeze(0)?.unsqueeze(2)?;
         let q_bias_u = q.broadcast_add(&bu)?;
         let q_bias_v = q.broadcast_add(&bv)?;
-        let attn_scores_c = q_bias_u.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
-        let mut attn_scores_r = q_bias_v.matmul(&k_rel.transpose(D::Minus2, D::Minus1)?)?;
+        let attn_scores_c = q_bias_u.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
+        let mut attn_scores_r = q_bias_v.matmul(&k_rel.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
         attn_scores_r = self.rel_shift(&attn_scores_r)?;
         let last = attn_scores_r.dims4()?.3;
         let take = last.min(t);
