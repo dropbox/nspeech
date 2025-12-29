@@ -170,10 +170,11 @@ impl ConvSubsampling {
         // xs: [B, T, F] -> [B, 1, T, F]
         let (b, t, f) = xs.dims3()?;
         let xs = xs.reshape((b, t, f, 1))?.transpose(1, 3)?.transpose(2, 3)?;
+        // Python applies ReLU after conv0, after (conv2+conv3), after (conv5+conv6)
         let xs = self.layers0.forward(&xs)?.relu()?;
-        let xs = self.layers2.forward(&xs)?.relu()?;
+        let xs = self.layers2.forward(&xs)?;
         let xs = self.layers3.forward(&xs)?.relu()?;
-        let xs = self.layers5.forward(&xs)?.relu()?;
+        let xs = self.layers5.forward(&xs)?;
         let xs = self.layers6.forward(&xs)?.relu()?;
         let (b, c, h, w) = xs.dims4()?;
         let xs = xs.transpose(1, 2)?.reshape((b, h, c * w))?;
@@ -442,7 +443,7 @@ impl FastConformerBlock {
 }
 
 pub struct FastConformerEncoder {
-    subsampling: ConvSubsampling,
+    pub subsampling: ConvSubsampling,
     blocks: Vec<FastConformerBlock>,
     pos_dropout: Dropout,
     pos_dropout_positions: Dropout,
