@@ -435,21 +435,32 @@ impl FastConformerBlock {
         attn_mask: Option<&Tensor>,
         train: bool,
     ) -> Result<Tensor> {
+        // FF1 with 0.5 scaling factor (Conformer architecture)
         let ln_ff1_out = self.ln_ff1.forward(xs)?;
         let y_ff1 = self.ff1.forward(&ln_ff1_out, train)?;
-        let mut y = (xs + &y_ff1)?;
+        let y_ff1_scaled = (y_ff1 * 0.5)?;
+        let mut y = (xs + &y_ff1_scaled)?;
+
+        // Attention (no scaling)
         let ln_mha_out = self.ln_mha.forward(&y)?;
         let y_attn = self
             .self_attn
             .forward(&ln_mha_out, pos, attn_mask, train)?;
         y = (&y + &y_attn)?;
+
+        // Conv (no scaling)
         let y_conv = self.conv_module.forward(&self.ln_conv.forward(&y)?, train)?;
         y = (&y + &y_conv)?;
+
+        // FF2 with 0.5 scaling factor (Conformer architecture)
         let y_ff2 = self.ff2.forward(&self.ln_ff2.forward(&y)?, train)?;
-        y = (&y + &y_ff2)?;
+        let y_ff2_scaled = (y_ff2 * 0.5)?;
+        y = (&y + &y_ff2_scaled)?;
+
         let y_out = self.ln_out.forward(&y)?;
         Ok(y_out)
     }
+
 }
 
 pub struct FastConformerEncoder {
@@ -508,6 +519,55 @@ impl FastConformerEncoder {
         let mut h = self.pos_dropout.forward(&xs, train)?;
         for blk in self.blocks.iter() {
             h = blk.forward_with_pos(&h, &pos, None, train)?;
+        }
+        Ok(h)
+    }
+
+    /// Debug version that saves layer outputs for comparison with Python
+    pub fn forward_debug(&self, xs: &Tensor, train: bool) -> Result<Tensor> {
+        let device = xs.device();
+        let (_, _, input_dim) = xs.dims3()?;
+        let xs = if input_dim == self.cfg.d_model {
+            xs.clone()
+        } else {
+            self.subsampling.forward(xs)?
+        };
+        let (b, t, d) = xs.dims3()?;
+        if d != self.cfg.d_model {
+            return Err(anyhow!(
+                "encoder expected d_model {}, got {}",
+                self.cfg.d_model,
+                d
+            ));
+        }
+        let xs = if self.cfg.scale_input {
+            let scale = (self.cfg.d_model as f64).sqrt() as f32;
+            let scale_t = Tensor::from_slice(&[scale], (), device)?;
+            let scale_t = scale_t.broadcast_as(xs.shape())?;
+            (xs * scale_t)?
+        } else {
+            xs
+        };
+        let pos = relative_positional_encoding(b, t, d, device)?;
+        let pos = self.pos_dropout_positions.forward(&pos, train)?;
+        let mut h = self.pos_dropout.forward(&xs, train)?;
+
+        // Save scaled encoder input (for comparison with Python)
+        let scaled_flat = h.flatten_all()?.to_vec1::<f32>()?;
+        std::fs::write("rust_encoder_input_v2.bin",
+            unsafe { std::slice::from_raw_parts(scaled_flat.as_ptr() as *const u8, scaled_flat.len() * 4) })?;
+
+        // Save layer outputs
+        for (i, blk) in self.blocks.iter().enumerate() {
+            h = blk.forward_with_pos(&h, &pos, None, train)?;
+            let layer_flat = h.flatten_all()?.to_vec1::<f32>()?;
+            let filename = format!("rust_layer{}_output_v2.bin", i);
+            std::fs::write(&filename,
+                unsafe { std::slice::from_raw_parts(layer_flat.as_ptr() as *const u8, layer_flat.len() * 4) })?;
+            let mean = layer_flat.iter().sum::<f32>() / layer_flat.len() as f32;
+            let min = layer_flat.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max = layer_flat.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            println!("  Layer {:2}: mean={:.6}, min={:8.3}, max={:8.3}", i, mean, min, max);
         }
         Ok(h)
     }
