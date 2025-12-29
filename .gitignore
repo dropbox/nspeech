@@ -1,1 +1,30 @@
 target
+
+# Vim swap files
+*.swp
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Debug files
+*.bin
+debug_intermediates.json
+chat.txt
+
+# Test files
+d
+d2
+
+# Audio files (keep small test files if needed, but exclude large ones)
+*.wav
+
+# Model files (too large for git)
+hf_parakeet/
+model.safetensors
+*.gguf
+
+# Silero VAD models
+vad*.config.json
+vad*.safetensors

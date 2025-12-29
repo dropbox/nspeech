@@ -7,6 +7,9 @@ edition = "2024"
 name = "main"
 path = "src/main.rs"
 
+[features]
+default = []
+quantized = []
 
 [dependencies]
 anyhow = "1"
@@ -27,6 +30,10 @@ rustfft = "6.2"
 # For silero
 safetensors = "0.4"
 
-# For loading quantized weights
+# For loading quantized weights (NPZ format)
 npyz = { version = "0.8", features = ["npz", "half"] }
 half = "2.4"
+
+# For GGUF quantization
+tempfile = "3.8"
+zstd = "0.13"

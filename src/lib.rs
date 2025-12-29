@@ -8,6 +8,7 @@ use candle_nn::{
 use hf_hub::api::sync::Api;
 use rustfft::{num_complex::Complex32, Fft, FftPlanner};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use tokenizers::Tokenizer;
@@ -798,6 +799,132 @@ pub fn load_parakeet_ctc_from_local<P: AsRef<Path>>(
     let vb =
         unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, device)? };
     ParakeetFastConformerCtc::new_with_tokenizer(cfg, vb, tokenizer)
+}
+
+/// Load Parakeet CTC model from GGUF quantized weights stored on Hugging Face Hub
+///
+/// # Arguments
+/// * `repo_id` - Hugging Face repository (e.g., "nvidia/parakeet-ctc-0.6b")
+/// * `gguf_filename` - GGUF file name (e.g., "model_q8_0.gguf" or "model_q4k.gguf")
+/// * `device` - Device to load model on
+///
+/// # Example
+/// ```no_run
+/// use parakeet::{load_parakeet_ctc_from_gguf_hf, get_device};
+/// let device = get_device()?;
+/// let model = load_parakeet_ctc_from_gguf_hf("nvidia/parakeet-ctc-0.6b", "model_q8_0.gguf", &device)?;
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub fn load_parakeet_ctc_from_gguf_hf(
+    repo_id: &str,
+    gguf_filename: &str,
+    device: &Device,
+) -> Result<ParakeetFastConformerCtc> {
+    println!("Loading quantized model from Hugging Face Hub");
+    println!("  Repository: {}", repo_id);
+    println!("  GGUF file: {}", gguf_filename);
+
+    let api = Api::new()?;
+    let repo = api.model(repo_id.to_string());
+    let config_path = repo.get("config.json")?;
+    let gguf_path = repo.get(gguf_filename)?;
+    let tokenizer_path = repo.get("tokenizer.json")?;
+
+    load_gguf_model_common(config_path, gguf_path, tokenizer_path, device)
+}
+
+/// Load Parakeet CTC model from GGUF quantized weights stored locally
+///
+/// # Arguments
+/// * `dir` - Directory containing config.json, *.gguf, and tokenizer.json
+/// * `device` - Device to load model on
+///
+/// Expected files in directory:
+/// - `config.json` - Model configuration
+/// - `model_q8_0.gguf` or `model_q4k.gguf` - Quantized weights (tries q8_0 first)
+/// - `tokenizer.json` - Tokenizer
+///
+/// # Example
+/// ```no_run
+/// use parakeet::{load_parakeet_ctc_from_gguf_local, get_device};
+/// let device = get_device()?;
+/// let model = load_parakeet_ctc_from_gguf_local("hf_parakeet", &device)?;
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub fn load_parakeet_ctc_from_gguf_local<P: AsRef<Path>>(
+    dir: P,
+    device: &Device,
+) -> Result<ParakeetFastConformerCtc> {
+    let dir = dir.as_ref();
+    let config_path = dir.join("config.json");
+    let tokenizer_path = dir.join("tokenizer.json");
+
+    // Try Q8_0 first (recommended), then Q4K
+    let gguf_path = if dir.join("model_q8_0.gguf").exists() {
+        println!("Loading Q8_0 quantized model (recommended)");
+        dir.join("model_q8_0.gguf")
+    } else if dir.join("model_q4k.gguf").exists() {
+        println!("Loading Q4K quantized model (high compression)");
+        dir.join("model_q4k.gguf")
+    } else {
+        return Err(anyhow!(
+            "No GGUF file found in {:?}. Expected model_q8_0.gguf or model_q4k.gguf",
+            dir
+        ));
+    };
+
+    if !config_path.exists() || !tokenizer_path.exists() {
+        return Err(anyhow!(
+            "missing files in {:?}, need config.json, *.gguf, tokenizer.json",
+            dir
+        ));
+    }
+
+    load_gguf_model_common(config_path, gguf_path, tokenizer_path, device)
+}
+
+/// Common helper to load GGUF model from paths
+fn load_gguf_model_common<P: AsRef<Path>>(
+    config_path: P,
+    gguf_path: P,
+    tokenizer_path: P,
+    device: &Device,
+) -> Result<ParakeetFastConformerCtc> {
+    use candle_core::quantized::gguf_file;
+
+    // Load config
+    let cfg_json = fs::read_to_string(&config_path)?;
+    let hf_cfg: HfParakeetCtcConfig = serde_json::from_str(&cfg_json)?;
+    let cfg = FastConformerConfig::from_hf(&hf_cfg);
+
+    // Load tokenizer
+    let tokenizer = Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| anyhow!("tokenizer load error: {e}"))?;
+
+    // Load GGUF file
+    println!("  Loading GGUF file...");
+    let mut file = fs::File::open(&gguf_path)?;
+    let gguf_content = gguf_file::Content::read(&mut file)?;
+    println!("  Loaded {} tensors from GGUF", gguf_content.tensor_infos.len());
+
+    // Dequantize all tensors to FP32
+    println!("  Dequantizing tensors to FP32...");
+    let mut tensors = HashMap::new();
+    for (name, _tensor_info) in gguf_content.tensor_infos.iter() {
+        let qtensor = gguf_content.tensor(&mut file, name, device)?;
+        let tensor = qtensor.dequantize(device)?;
+        tensors.insert(name.clone(), tensor);
+    }
+    println!("  ✓ All tensors dequantized");
+
+    // Create VarBuilder from dequantized tensors
+    let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
+
+    println!("  Building model...");
+    let model = ParakeetFastConformerCtc::new_with_tokenizer(cfg, vb, tokenizer)?;
+    println!("✓ Quantized model loaded successfully\n");
+
+    Ok(model)
 }
 
 // ----------------- Audio / log-mel frontend -----------------

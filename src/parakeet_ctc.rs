@@ -2,8 +2,8 @@
 ///
 /// Based on nvidia/parakeet-ctc-0.6b
 /// 608M parameter Conformer-based ASR model with CTC decoder
-use anyhow::Result;
-use candle_core::{Device, Module, Tensor, D};
+use anyhow::{anyhow, Result};
+use candle_core::{Device, DType, Module, Tensor, D};
 use candle_nn::{self as nn, VarBuilder};
 use serde::Deserialize;
 
@@ -280,10 +280,10 @@ impl MultiHeadSelfAttention {
         let k_rel = k_rel.reshape((b, t, d))?;
 
         // Reshape for multi-head attention: [B, T, H] -> [B, num_heads, T, head_dim]
-        let q = q.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?;
-        let k = k.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?;
-        let v = v.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?;
-        let k_rel = k_rel.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?;
+        let q = q.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        let k = k.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        let v = v.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        let k_rel = k_rel.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
 
         // Add biases to queries: [B, H, T, head_dim]
         let bu = self.bias_u.unsqueeze(0)?.unsqueeze(2)?; // [1, H, 1, head_dim]
@@ -292,10 +292,10 @@ impl MultiHeadSelfAttention {
         let q_bias_v = q.broadcast_add(&bv)?;
 
         // Content-based attention scores
-        let attn_scores_c = q_bias_u.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
+        let attn_scores_c = q_bias_u.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
 
         // Position-based attention scores
-        let mut attn_scores_r = q_bias_v.matmul(&k_rel.transpose(D::Minus2, D::Minus1)?)?;
+        let mut attn_scores_r = q_bias_v.matmul(&k_rel.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
         attn_scores_r = self.rel_shift(&attn_scores_r)?;
 
         // Truncate position scores to match sequence length
@@ -646,7 +646,7 @@ impl CTCHead {
 
 /// Complete Parakeet CTC model
 pub struct ParakeetCTC {
-    cfg: ParakeetConfig,
+    pub cfg: ParakeetConfig,
     encoder: ParakeetEncoder,
     ctc_head: CTCHead,
 }
@@ -661,6 +661,66 @@ impl ParakeetCTC {
         )?;
 
         Ok(Self { cfg, encoder, ctc_head })
+    }
+
+    /// Load Parakeet CTC model from GGUF quantized weights (local directory)
+    ///
+    /// Automatically tries Q8_0 first (recommended), then Q4K
+    pub fn from_gguf_local<P: AsRef<std::path::Path>>(
+        dir: P,
+        device: &candle_core::Device,
+    ) -> Result<Self> {
+        use candle_core::quantized::gguf_file;
+        use std::collections::HashMap;
+
+        let dir = dir.as_ref();
+        let config_path = dir.join("config.json");
+
+        // Try Q8_0 first (recommended), then Q4K
+        let gguf_path = if dir.join("model_q8_0.gguf").exists() {
+            println!("Loading Q8_0 quantized model (recommended)");
+            dir.join("model_q8_0.gguf")
+        } else if dir.join("model_q4k.gguf").exists() {
+            println!("Loading Q4K quantized model (high compression)");
+            dir.join("model_q4k.gguf")
+        } else {
+            return Err(anyhow!(
+                "No GGUF file found in {:?}. Expected model_q8_0.gguf or model_q4k.gguf",
+                dir
+            ));
+        };
+
+        if !config_path.exists() {
+            return Err(anyhow!("config.json not found in {:?}", dir));
+        }
+
+        // Load config
+        let cfg = ParakeetConfig::from_file(config_path.to_str().unwrap())?;
+
+        // Load GGUF file
+        println!("  Loading GGUF file...");
+        let mut file = std::fs::File::open(&gguf_path)?;
+        let gguf_content = gguf_file::Content::read(&mut file)?;
+        println!("  Loaded {} tensors from GGUF", gguf_content.tensor_infos.len());
+
+        // Dequantize all tensors to FP32
+        println!("  Dequantizing tensors to FP32...");
+        let mut tensors = HashMap::new();
+        for (name, _tensor_info) in gguf_content.tensor_infos.iter() {
+            let qtensor = gguf_content.tensor(&mut file, name, device)?;
+            let tensor = qtensor.dequantize(device)?;
+            tensors.insert(name.clone(), tensor);
+        }
+        println!("  ✓ All tensors dequantized");
+
+        // Create VarBuilder from dequantized tensors
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
+
+        println!("  Building model...");
+        let model = ParakeetCTC::new(cfg, vb)?;
+        println!("✓ Quantized model loaded successfully\n");
+
+        Ok(model)
     }
 
     /// Forward pass
