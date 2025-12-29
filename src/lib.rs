@@ -12,6 +12,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use tokenizers::Tokenizer;
+use std::f32::consts::PI;
+use std::sync::Arc;
+
 
 // Native Rust/Candle implementation of Parakeet CTC
 pub mod parakeet_ctc;
@@ -935,47 +938,286 @@ const HOP_LENGTH: usize = 160;
 const EPS: f32 = 1e-6;
 
 fn hann_window(n: usize) -> Vec<f32> {
+    // Periodic Hann window: w[i] = 0.5 * (1 - cos(2π*i/N))
+    // This matches PyTorch's torch.hann_window() (periodic=True by default)
     (0..n)
         .map(|i| {
-            let phase = std::f32::consts::PI * i as f32 / (n as f32);
-            (phase.sin()).powi(2)
+            0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos())
         })
         .collect()
 }
 
-fn hz_to_mel(hz: f32) -> f32 {
-    2595.0 * (1.0 + hz / 700.0).log10()
-}
-fn mel_to_hz(mel: f32) -> f32 {
-    700.0 * (10f32.powf(mel / 2595.0) - 1.0)
-}
-
+/// Build mel filterbank using Slaney normalization (librosa-style)
+/// This matches the preprocessing used by Parakeet's feature extractor
 fn build_mel_filterbank(num_mels: usize, n_fft: usize, sample_rate: u32) -> Vec<f32> {
+    use mel_spec::mel::mel;
+
     let n_freqs = n_fft / 2 + 1;
-    let mel_min = hz_to_mel(0.0);
-    let mel_max = hz_to_mel(sample_rate as f32 / 2.0);
-    let mel_points: Vec<f32> = (0..(num_mels + 2))
-        .map(|i| mel_min + (mel_max - mel_min) * i as f32 / (num_mels + 1) as f32)
-        .collect();
-    let hz_points: Vec<f32> = mel_points.iter().map(|m| mel_to_hz(*m)).collect();
-    let mut fb = vec![0f32; num_mels * n_freqs];
+
+    // Use mel-spec crate with Slaney normalization (htk=false, norm=true)
+    // This matches librosa.filters.mel with norm='slaney'
+    let mel_basis = mel(
+        sample_rate as f64,
+        n_fft,
+        num_mels,
+        Some(0.0),                      // f_min
+        Some(sample_rate as f64 / 2.0), // f_max (Nyquist)
+        false,                          // htk=false (use Slaney mel scale)
+        true,                           // norm=true (Slaney normalization)
+    );
+
+    // Convert ndarray Array2<f64> to Vec<f32> in row-major order
+    // mel_basis shape is (n_mels, n_freqs)
+    let mut fb = Vec::with_capacity(num_mels * n_freqs);
     for m in 0..num_mels {
-        let f_m_left = hz_points[m];
-        let f_m_center = hz_points[m + 1];
-        let f_m_right = hz_points[m + 2];
-        for (k, f) in (0..n_freqs).map(|k| (k, k as f32 * sample_rate as f32 / n_fft as f32)) {
-            let weight = if f < f_m_left || f > f_m_right {
-                0.0
-            } else if f <= f_m_center {
-                (f - f_m_left) / (f_m_center - f_m_left + EPS)
-            } else {
-                (f_m_right - f) / (f_m_right - f_m_center + EPS)
-            };
-            fb[m * n_freqs + k] = weight.max(0.0);
+        for k in 0..n_freqs {
+            fb.push(mel_basis[[m, k]] as f32);
         }
     }
+
     fb
 }
+
+//const LOG_ZERO_GUARD_VALUE: f32 = 2.0_f32.powi(-24);
+const LOG_ZERO_GUARD_VALUE: f32 = 5.9604645e-08; // 2^-24
+
+pub struct ParakeetFeatureExtractor {
+    pub feature_size: usize,  // 80
+    pub sampling_rate: usize, // 16000
+    pub hop_length: usize,    // 160
+    pub n_fft: usize,         // 512
+    pub win_length: usize,    // 400
+    pub preemphasis: f32,     // 0.97
+    pub padding_value: f32,   // 0.0 (only for later padding if batching)
+
+    window: Vec<f32>,
+    mel_filters: Vec<Vec<f32>>, // [feature_size][n_fft/2+1]
+    fft: Arc<dyn Fft<f32>>,
+}
+
+impl ParakeetFeatureExtractor {
+    pub fn new(feature_size: usize) -> Self {
+        let sampling_rate = 16_000usize;
+        let hop_length = 160usize;
+        let n_fft = 512usize;
+        let win_length = 400usize;
+        let preemphasis = 0.97f32;
+        let padding_value = 0.0f32;
+
+        let window = hann_window2(win_length);
+        let mel_filters =
+            mel_filterbank_slaney_norm(feature_size, sampling_rate, n_fft, 0.0, sampling_rate as f32 / 2.0);
+
+        let mut planner = FftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(n_fft);
+
+        Self {
+            feature_size,
+            sampling_rate,
+            hop_length,
+            n_fft,
+            win_length,
+            preemphasis,
+            padding_value,
+            window,
+            mel_filters,
+            fft,
+        }
+    }
+
+    /// Input: 16kHz mono f32 PCM
+    /// Output: Candle tensor [1, T, feature_size]
+    pub fn extract_to_tensor(&self, pcm16k: &[f32], device: &Device) -> Result<Tensor> {
+        let (frames, feats) = self.extract_flat(pcm16k);
+        Ok(Tensor::from_vec(feats, (1, frames, self.feature_size), device)?)
+    }
+
+    /// Output flattened row-major [T, F]
+    pub fn extract_flat(&self, x: &[f32]) -> (usize, Vec<f32>) {
+        // 1) preemphasis
+        let x = if self.preemphasis != 0.0 {
+            preemphasis(x, self.preemphasis)
+        } else {
+            x.to_vec()
+        };
+
+        // 2) torch.stft center padding: reflection padding, pad = n_fft/2 on both sides
+        let pad = self.n_fft / 2;
+        let mut padded = Vec::with_capacity(x.len() + 2 * pad);
+
+        // Reflect left side
+        for i in 0..pad {
+            let idx = (i + 1).min(x.len() - 1);
+            padded.push(x[idx]);
+        }
+        padded.extend_from_slice(&x);
+        // Reflect right side
+        for i in 0..pad {
+            let idx = x.len().saturating_sub(2 + i);
+            padded.push(x[idx]);
+        }
+
+        // 3) number of frames
+        let frames = if padded.len() >= self.n_fft {
+            1 + (padded.len() - self.n_fft) / self.hop_length
+        } else {
+            0
+        };
+
+        let n_freq = self.n_fft / 2 + 1;
+        let mut feats = Vec::with_capacity(frames * self.feature_size);
+
+        let mut fft_in = vec![Complex32::new(0.0, 0.0); self.n_fft];
+
+        for t in 0..frames {
+            let start = t * self.hop_length;
+
+            // zero buffer
+            for v in fft_in.iter_mut() {
+                *v = Complex32::new(0.0, 0.0);
+            }
+
+            // windowed frame in first win_length, then zero pad to n_fft
+            for i in 0..self.win_length {
+                fft_in[i].re = padded[start + i] * self.window[i];
+            }
+
+            // FFT
+            self.fft.process(&mut fft_in);
+
+            // power spectrum
+            let mut power = vec![0.0f32; n_freq];
+            for k in 0..n_freq {
+                let c = fft_in[k];
+                power[k] = c.re * c.re + c.im * c.im;
+            }
+
+            // mel filterbank + log10
+            for m in 0..self.feature_size {
+                let filt = &self.mel_filters[m];
+                let mut acc = 0.0f32;
+                for k in 0..n_freq {
+                    acc += filt[k] * power[k];
+                }
+                feats.push((acc + LOG_ZERO_GUARD_VALUE).log10());
+            }
+        }
+
+        // Apply per-utterance mean normalization (required by Parakeet)
+        let mean = feats.iter().sum::<f32>() / feats.len() as f32;
+        for val in feats.iter_mut() {
+            *val -= mean;
+        }
+
+        (frames, feats)
+    }
+}
+
+/* ------------------------- helpers ------------------------- */
+
+fn preemphasis(x: &[f32], coef: f32) -> Vec<f32> {
+    if x.is_empty() {
+        return vec![];
+    }
+    let mut y = Vec::with_capacity(x.len());
+    y.push(x[0]);
+    for i in 1..x.len() {
+        y.push(x[i] - coef * x[i - 1]);
+    }
+    y
+}
+
+/// Hann window, periodic=true: w[n]=0.5-0.5*cos(2*pi*n/N)
+/// This matches PyTorch's torch.hann_window() default (periodic=True)
+fn hann_window2(n: usize) -> Vec<f32> {
+    if n == 0 {
+        return vec![];
+    }
+    if n == 1 {
+        return vec![1.0];
+    }
+    let denom = n as f32;
+    (0..n)
+        .map(|i| 0.5 - 0.5 * (2.0 * PI * (i as f32) / denom).cos())
+        .collect()
+}
+
+/// Slaney mel scale
+fn hz_to_mel_slaney(f: f32) -> f32 {
+    let f_sp = 200.0 / 3.0;
+    let min_log_hz = 1000.0;
+    let min_log_mel = min_log_hz / f_sp; // 15
+    let logstep = (6.4_f32).ln() / 27.0;
+    if f < min_log_hz {
+        f / f_sp
+    } else {
+        min_log_mel + (f / min_log_hz).ln() / logstep
+    }
+}
+
+fn mel_to_hz_slaney(m: f32) -> f32 {
+    let f_sp = 200.0 / 3.0;
+    let min_log_hz = 1000.0;
+    let min_log_mel = min_log_hz / f_sp; // 15
+    let logstep = (6.4_f32).ln() / 27.0;
+    if m < min_log_mel {
+        f_sp * m
+    } else {
+        min_log_hz * ((m - min_log_mel) * logstep).exp()
+    }
+}
+
+/// librosa mel with norm="slaney" (area norm), fmin=0, fmax=sr/2
+fn mel_filterbank_slaney_norm(
+    n_mels: usize,
+    sr: usize,
+    n_fft: usize,
+    fmin: f32,
+    fmax: f32,
+) -> Vec<Vec<f32>> {
+    let n_freq = n_fft / 2 + 1;
+
+    let fft_freqs: Vec<f32> = (0..n_freq)
+        .map(|k| (k as f32) * (sr as f32) / (n_fft as f32))
+        .collect();
+
+    let mel_min = hz_to_mel_slaney(fmin);
+    let mel_max = hz_to_mel_slaney(fmax);
+
+    // n_mels + 2 points
+    let mut mel_points = Vec::with_capacity(n_mels + 2);
+    for i in 0..(n_mels + 2) {
+        let t = i as f32 / (n_mels + 1) as f32;
+        mel_points.push(mel_min + t * (mel_max - mel_min));
+    }
+    let hz_points: Vec<f32> = mel_points.into_iter().map(mel_to_hz_slaney).collect();
+
+    let mut filters = vec![vec![0.0f32; n_freq]; n_mels];
+
+    for m in 0..n_mels {
+        let f_left = hz_points[m];
+        let f_center = hz_points[m + 1];
+        let f_right = hz_points[m + 2];
+
+        // Slaney area normalization
+        let denom = (f_right - f_left).max(1e-12);
+        let enorm = 2.0 / denom;
+
+        for (k, &f) in fft_freqs.iter().enumerate() {
+            let w = if f < f_left || f > f_right {
+                0.0
+            } else if f <= f_center {
+                (f - f_left) / (f_center - f_left).max(1e-12)
+            } else {
+                (f_right - f) / (f_right - f_center).max(1e-12)
+            };
+            filters[m][k] = w * enorm;
+        }
+    }
+
+    filters
+}
+
 
 fn process_frame_to_mel(
     frame: &[f32],
@@ -1003,7 +1245,8 @@ fn process_frame_to_mel(
         for k in 0..n_freqs {
             acc += fb[base + k] * power[k];
         }
-        out.push((acc.max(EPS)).ln());
+        // Use log10 to match librosa/Parakeet (not natural log)
+        out.push((acc.max(EPS)).log10());
     }
 }
 
@@ -1171,8 +1414,12 @@ pub fn load_wav_as_features<P: AsRef<Path>>(
     if samples.is_empty() {
         return Err(anyhow!("wav contains no samples"));
     }
-    let feats = log_mel_spectrogram(&samples, SAMPLE_RATE, feat_dim)?;
-    let tensor = Tensor::from_slice(&feats, (1, feats.len() / feat_dim, feat_dim), device)?;
+
+    let fe = ParakeetFeatureExtractor::new(80);
+    let tensor: Tensor = fe.extract_to_tensor(&samples, device)?;
+
+    //let feats = log_mel_spectrogram(&samples, SAMPLE_RATE, feat_dim)?;
+    //let tensor = Tensor::from_slice(&feats, (1, feats.len() / feat_dim, feat_dim), device)?;
     Ok(tensor)
 }
 

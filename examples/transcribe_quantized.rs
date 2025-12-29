@@ -39,8 +39,7 @@ fn main() -> Result<()> {
 
     // Load audio and extract features
     println!("Processing audio...");
-    println!("  [Using pre-computed Python mel features to bypass broken Rust mel computation]");
-    let features = parakeet::load_python_mel_features(
+    let features = parakeet::load_wav_as_features(
         audio_path,
         model.cfg.feat_in,
         &device
