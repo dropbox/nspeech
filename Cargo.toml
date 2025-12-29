@@ -26,8 +26,6 @@ hf-hub = "0.4"
 tokenizers = { version = "0.20", features = ["http"] }
 hound = "3.5"
 rustfft = "6.2"
-mel_spec = "0.3"
-ndarray = "0.16"
 num-complex = "0.4"
 
 # For silero

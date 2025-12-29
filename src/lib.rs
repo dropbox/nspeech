@@ -947,37 +947,6 @@ fn hann_window(n: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Build mel filterbank using Slaney normalization (librosa-style)
-/// This matches the preprocessing used by Parakeet's feature extractor
-fn build_mel_filterbank(num_mels: usize, n_fft: usize, sample_rate: u32) -> Vec<f32> {
-    use mel_spec::mel::mel;
-
-    let n_freqs = n_fft / 2 + 1;
-
-    // Use mel-spec crate with Slaney normalization (htk=false, norm=true)
-    // This matches librosa.filters.mel with norm='slaney'
-    let mel_basis = mel(
-        sample_rate as f64,
-        n_fft,
-        num_mels,
-        Some(0.0),                      // f_min
-        Some(sample_rate as f64 / 2.0), // f_max (Nyquist)
-        false,                          // htk=false (use Slaney mel scale)
-        true,                           // norm=true (Slaney normalization)
-    );
-
-    // Convert ndarray Array2<f64> to Vec<f32> in row-major order
-    // mel_basis shape is (n_mels, n_freqs)
-    let mut fb = Vec::with_capacity(num_mels * n_freqs);
-    for m in 0..num_mels {
-        for k in 0..n_freqs {
-            fb.push(mel_basis[[m, k]] as f32);
-        }
-    }
-
-    fb
-}
-
 //const LOG_ZERO_GUARD_VALUE: f32 = 2.0_f32.powi(-24);
 const LOG_ZERO_GUARD_VALUE: f32 = 5.9604645e-08; // 2^-24
 
@@ -1250,83 +1219,6 @@ fn process_frame_to_mel(
     }
 }
 
-pub fn log_mel_spectrogram(samples: &[f32], sample_rate: u32, num_mels: usize) -> Result<Vec<f32>> {
-    if sample_rate != SAMPLE_RATE {
-        return Err(anyhow!(
-            "expected sample_rate {} got {}",
-            SAMPLE_RATE,
-            sample_rate
-        ));
-    }
-    // Apply pre-emphasis BEFORE padding (as per preprocessor_config.json: preemphasis=0.97)
-    let preemph = 0.97f32;
-    let mut preemph_samples = Vec::with_capacity(samples.len());
-    for (i, &s) in samples.iter().enumerate() {
-        if i == 0 {
-            preemph_samples.push(s);
-        } else {
-            preemph_samples.push(s - preemph * samples[i - 1]);
-        }
-    }
-
-    // Apply reflection padding to match torchaudio center=True behavior
-    // Pad by N_FFT/2 on each side
-    let pad_len = N_FFT / 2;
-    let mut padded = vec![0f32; preemph_samples.len() + 2 * pad_len];
-    // Reflect left side
-    for i in 0..pad_len {
-        padded[pad_len - 1 - i] = preemph_samples[i + 1];
-    }
-    // Copy center
-    padded[pad_len..pad_len + preemph_samples.len()].copy_from_slice(&preemph_samples);
-    // Reflect right side
-    let last_idx = preemph_samples.len() - 1;
-    for i in 0..pad_len {
-        padded[pad_len + preemph_samples.len() + i] = preemph_samples[last_idx - 1 - i];
-    }
-
-    let window = hann_window(WIN_LENGTH);
-    let mut planner = FftPlanner::new();
-    let fft = planner.plan_fft_forward(N_FFT);
-    let fb = build_mel_filterbank(num_mels, N_FFT, sample_rate);
-    let n_freqs = N_FFT / 2 + 1;
-
-    // Calculate frames with center padding
-    let num_frames = (samples.len() + HOP_LENGTH - 1) / HOP_LENGTH;
-    let mut mel_out = Vec::with_capacity(num_frames * num_mels);
-    let mut buffer = vec![Complex32::default(); N_FFT];
-    let mut frame_buffer = vec![0f32; WIN_LENGTH];
-
-    for frame_idx in 0..num_frames {
-        let center = frame_idx * HOP_LENGTH + pad_len;
-        let start = center.saturating_sub(WIN_LENGTH / 2);
-        let end = (start + WIN_LENGTH).min(padded.len());
-
-        frame_buffer.fill(0.0);
-        let copy_len = end - start;
-        frame_buffer[..copy_len].copy_from_slice(&padded[start..end]);
-
-        process_frame_to_mel(
-            &frame_buffer,
-            &window,
-            &fft,
-            &fb,
-            num_mels,
-            n_freqs,
-            &mut buffer,
-            &mut mel_out,
-        );
-    }
-
-    // Apply per-utterance mean normalization (required by Parakeet)
-    // Python's ParakeetFeatureExtractor normalizes features to zero mean
-    let mean = mel_out.iter().sum::<f32>() / mel_out.len() as f32;
-    for val in mel_out.iter_mut() {
-        *val -= mean;
-    }
-    Ok(mel_out)
-}
-
 /// Load pre-computed encoder input from Python (bypasses mel+subsampling)
 pub fn load_python_encoder_input<P: AsRef<Path>>(
     path: P,
@@ -1347,32 +1239,6 @@ pub fn load_python_encoder_input<P: AsRef<Path>>(
     }
     let n_frames = feats.len() / 1024;
     let tensor = Tensor::from_slice(&feats, (1, n_frames, 1024), device)?;
-    Ok(tensor)
-}
-
-/// Load pre-computed mel features from Python (temporary workaround)
-pub fn load_python_mel_features<P: AsRef<Path>>(
-    path: P,
-    feat_dim: usize,
-    device: &Device,
-) -> Result<Tensor> {
-    let path_str = path.as_ref().to_str().unwrap();
-    let mel_file = if path_str.contains("dots.wav") {
-        "python_mel_dots.bin"
-    } else if path_str.contains("silence.wav") {
-        "python_mel_silence.bin"
-    } else {
-        return Err(anyhow!("Pre-computed mel features not available for this file. Use dots.wav or silence.wav"));
-    };
-    let mel_data = std::fs::read(mel_file)?;
-    let n_floats = mel_data.len() / 4;
-    let mut feats = Vec::with_capacity(n_floats);
-    for chunk in mel_data.chunks_exact(4) {
-        let bytes = [chunk[0], chunk[1], chunk[2], chunk[3]];
-        feats.push(f32::from_le_bytes(bytes));
-    }
-    let n_frames = feats.len() / feat_dim;
-    let tensor = Tensor::from_slice(&feats, (1, n_frames, feat_dim), device)?;
     Ok(tensor)
 }
 
@@ -1421,104 +1287,4 @@ pub fn load_wav_as_features<P: AsRef<Path>>(
     //let feats = log_mel_spectrogram(&samples, SAMPLE_RATE, feat_dim)?;
     //let tensor = Tensor::from_slice(&feats, (1, feats.len() / feat_dim, feat_dim), device)?;
     Ok(tensor)
-}
-
-pub fn stream_wav_as_feature_chunks<P: AsRef<Path>>(
-    path: P,
-    feat_dim: usize,
-    chunk_frames: usize,
-    device: &Device,
-) -> Result<Vec<Tensor>> {
-    let mut reader = hound::WavReader::open(&path)?;
-    let spec = reader.spec();
-    if spec.channels != 1 {
-        return Err(anyhow!("expected mono wav, got {} channels", spec.channels));
-    }
-    if spec.sample_rate != SAMPLE_RATE {
-        return Err(anyhow!(
-            "expected {} Hz audio, got {} Hz",
-            SAMPLE_RATE,
-            spec.sample_rate
-        ));
-    }
-    let samples: Vec<f32> = match (spec.sample_format, spec.bits_per_sample) {
-        (hound::SampleFormat::Int, 16) => reader
-            .samples::<i16>()
-            .map(|s| s.map(|v| v as f32 / i16::MAX as f32))
-            .collect::<Result<_, _>>()?,
-        (hound::SampleFormat::Int, 24) => reader
-            .samples::<i32>()
-            .map(|s| s.map(|v| v as f32 / 8_388_608.0))
-            .collect::<Result<_, _>>()?,
-        (hound::SampleFormat::Int, 32) => reader
-            .samples::<i32>()
-            .map(|s| s.map(|v| v as f32 / i32::MAX as f32))
-            .collect::<Result<_, _>>()?,
-        (hound::SampleFormat::Float, 32) => reader
-            .samples::<f32>()
-            .collect::<Result<_, _>>()?,
-        _ => return Err(anyhow!("unsupported WAV format")),
-    };
-    if samples.is_empty() {
-        return Err(anyhow!("wav contains no samples"));
-    }
-    // pre-emphasis
-    let preemph = 0.97f32;
-    let mut preemph_samples = Vec::with_capacity(samples.len());
-    for (i, &s) in samples.iter().enumerate() {
-        if i == 0 {
-            preemph_samples.push(s);
-        } else {
-            preemph_samples.push(s - preemph * samples[i - 1]);
-        }
-    }
-    let window = hann_window(WIN_LENGTH);
-    let mut planner = FftPlanner::new();
-    let fft = planner.plan_fft_forward(N_FFT);
-    let fb = build_mel_filterbank(feat_dim, N_FFT, SAMPLE_RATE);
-    let n_freqs = N_FFT / 2 + 1;
-    let mut chunks = Vec::new();
-    let mut chunk_buf: Vec<f32> = Vec::with_capacity(chunk_frames * feat_dim);
-    let mut buffer = vec![Complex32::default(); N_FFT];
-    let mut offset = 0usize;
-    while offset + WIN_LENGTH <= samples.len() {
-        process_frame_to_mel(
-            &preemph_samples[offset..offset + WIN_LENGTH],
-            &window,
-            &fft,
-            &fb,
-            feat_dim,
-            n_freqs,
-            &mut buffer,
-            &mut chunk_buf,
-        );
-        if chunk_buf.len() >= chunk_frames * feat_dim {
-            let frames = chunk_buf.len() / feat_dim;
-            let t = Tensor::from_slice(&chunk_buf, (1, frames, feat_dim), device)?;
-            chunks.push(t);
-            chunk_buf.clear();
-        }
-        offset += HOP_LENGTH;
-    }
-    if offset < samples.len() {
-        let mut last = vec![0f32; WIN_LENGTH];
-        let rem = samples.len() - offset;
-        last[..rem].copy_from_slice(&preemph_samples[offset..]);
-        process_frame_to_mel(
-            &last,
-            &window,
-            &fft,
-            &fb,
-            feat_dim,
-            n_freqs,
-            &mut buffer,
-            &mut chunk_buf,
-        );
-    }
-    if !chunk_buf.is_empty() {
-        let frames = chunk_buf.len() / feat_dim;
-        let t = Tensor::from_slice(&chunk_buf, (1, frames, feat_dim), device)?;
-        chunks.push(t);
-    }
-    Ok(chunks)
 }

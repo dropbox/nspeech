@@ -7,7 +7,7 @@ mod silero;
 use silero::{SileroVad, VadStream };
 
 use parakeet::{
-    load_parakeet_ctc_from_hf, load_parakeet_ctc_from_local, stream_wav_as_feature_chunks,
+    load_parakeet_ctc_from_hf, load_parakeet_ctc_from_local,
     FastConformerConfig, ParakeetFastConformerCtc,
 };
 
