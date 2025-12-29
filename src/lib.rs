@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use candle_core::{DType, Device, Module, ModuleT, Tensor, D};
 use candle_nn::{
-    batch_norm, conv1d, conv1d_no_bias, conv2d, layer_norm, linear, BatchNorm, BatchNormConfig,
+    batch_norm, conv1d, conv2d, layer_norm, linear, BatchNorm, BatchNormConfig,
     Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, Dropout, LayerNorm, LayerNormConfig, Linear,
     VarBuilder,
 };
@@ -87,23 +87,6 @@ impl Default for FastConformerConfig {
             blank_id: 0,
         }
     }
-}
-
-// Sinusoidal positional encoding (kept for reference; not used in HF path).
-#[allow(dead_code)]
-fn sinusoidal_positional_encoding(length: usize, dim: usize, device: &Device) -> Result<Tensor> {
-    let mut data = vec![0f32; length * dim];
-    for pos in 0..length {
-        for i in 0..(dim / 2) {
-            let idx = 2 * i;
-            let div_term = (pos as f32) / (10000_f32.powf(2.0 * i as f32 / dim as f32));
-            data[pos * dim + idx] = div_term.sin();
-            if idx + 1 < dim {
-                data[pos * dim + idx + 1] = div_term.cos();
-            }
-        }
-    }
-    Ok(Tensor::from_slice(&data, (1, length, dim), device)?)
 }
 
 fn relative_positional_encoding(batch: usize, seq: usize, dim: usize, device: &Device) -> Result<Tensor> {
@@ -262,7 +245,6 @@ pub struct MultiHeadSelfAttention {
     num_heads: usize,
     head_dim: usize,
     dropout: Dropout,
-    scaling: f64,
 }
 
 impl MultiHeadSelfAttention {
@@ -291,7 +273,6 @@ impl MultiHeadSelfAttention {
             num_heads,
             head_dim,
             dropout: Dropout::new(drop as f32),
-            scaling: (head_dim as f64).powf(-0.5),
         })
     }
 
