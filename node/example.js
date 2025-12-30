@@ -69,11 +69,11 @@ async function main() {
   for (let i = 0; i < samples.length; i += chunkSize) {
     const end = Math.min(i + chunkSize, samples.length);
     const chunk = samples.slice(i, end);
-    await stream.input(chunk);
+    stream.input(chunk);
   }
 
   // Flush any remaining audio
-  const final = await stream.flush();
+  const final = stream.flush();
   if (final) {
     console.log('Final segment flushed');
   }

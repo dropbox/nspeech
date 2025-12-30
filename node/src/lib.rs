@@ -250,7 +250,7 @@ impl TranscriptionStream {
     ///
     /// @param samples - Audio samples (16kHz mono, normalized to [-1, 1])
     #[napi]
-    pub async fn input(&self, samples: Float64Array) -> Result<()> {
+    pub fn input(&self, samples: Float64Array) -> Result<()> {
         // Convert f64 to f32
         let samples_f32: Vec<f32> = samples.to_vec()
             .iter()
@@ -274,7 +274,7 @@ impl TranscriptionStream {
 
     /// Flush any remaining audio and get final transcription
     #[napi]
-    pub async fn flush(&self) -> Result<Option<Transcription>> {
+    pub fn flush(&self) -> Result<Option<Transcription>> {
         let mut inner = self.inner.lock()
             .map_err(|e| napi::Error::from_reason(format!("Lock error: {}", e)))?;
 

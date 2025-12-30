@@ -13,9 +13,6 @@ parakeet = { path = ".." }
 napi = "2"
 napi-derive = "2"
 
-# Async support
-tokio = { version = "1", features = ["rt", "sync"] }
-
 # Logging
 log = "0.4"
 env_logger = "0.11"

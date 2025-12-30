@@ -36,10 +36,10 @@ const stream = new TranscriptionStream('./assets', (transcription) => {
 
 // Stream audio samples (16kHz mono, normalized to [-1, 1])
 const samples = new Float64Array([...]); // Your audio data
-await stream.input(samples);
+stream.input(samples);
 
 // Flush any remaining audio
-await stream.flush();
+stream.flush();
 ```
 
 ### Complete Example
@@ -82,15 +82,15 @@ assets/
 
 #### Methods
 
-##### `async input(samples: Float64Array): Promise<void>`
+##### `input(samples: Float64Array): void`
 
 Process audio samples and emit transcriptions via callback.
 
 - `samples`: Audio samples (16kHz mono, normalized to [-1, 1])
-- Returns: Promise that resolves when processing is complete
+- Returns: void (synchronous)
 - Side effect: Calls callback for each detected speech segment
 
-##### `async flush(): Promise<Transcription | null>`
+##### `flush(): Transcription | null`
 
 Flush any remaining audio and get final transcription.
 
@@ -175,7 +175,7 @@ All methods return Promises. Errors are thrown for:
 
 ```javascript
 try {
-  await stream.input(samples);
+  stream.input(samples);
 } catch (err) {
   console.error('Transcription error:', err);
 }
