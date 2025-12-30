@@ -1196,6 +1196,21 @@ pub fn load_python_encoder_input<P: AsRef<Path>>(
     Ok(tensor)
 }
 
+/// Extract features from raw PCM samples (16kHz mono, normalized [-1, 1])
+pub fn extract_features_from_samples(
+    samples: &[f32],
+    _feat_dim: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    if samples.is_empty() {
+        return Err(anyhow!("empty audio samples"));
+    }
+
+    let fe = ParakeetFeatureExtractor::new(80);
+    let tensor: Tensor = fe.extract_to_tensor(samples, device)?;
+    Ok(tensor)
+}
+
 pub fn load_wav_as_features<P: AsRef<Path>>(
     path: P,
     _feat_dim: usize,
@@ -1231,14 +1246,6 @@ pub fn load_wav_as_features<P: AsRef<Path>>(
             .collect::<Result<_, _>>()?,
         _ => return Err(anyhow!("unsupported WAV format")),
     };
-    if samples.is_empty() {
-        return Err(anyhow!("wav contains no samples"));
-    }
 
-    let fe = ParakeetFeatureExtractor::new(80);
-    let tensor: Tensor = fe.extract_to_tensor(&samples, device)?;
-
-    //let feats = log_mel_spectrogram(&samples, SAMPLE_RATE, feat_dim)?;
-    //let tensor = Tensor::from_slice(&feats, (1, feats.len() / feat_dim, feat_dim), device)?;
-    Ok(tensor)
+    extract_features_from_samples(&samples, 80, device)
 }

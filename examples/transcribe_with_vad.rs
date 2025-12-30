@@ -178,30 +178,16 @@ fn main() -> Result<()> {
         println!("[Segment {}] {:.2}s - {:.2}s (duration: {:.2}s)",
                  seg_idx + 1, start_time, end_time, duration);
 
-        // Save segment to temporary WAV file for Parakeet processing
-        let temp_path = format!("temp_segment_{}.wav", seg_idx);
-        {
-            let spec = hound::WavSpec {
-                channels: 1,
-                sample_rate: 16000,
-                bits_per_sample: 16,
-                sample_format: hound::SampleFormat::Int,
-            };
-            let mut writer = hound::WavWriter::create(&temp_path, spec)?;
-            for &sample in segment_samples {
-                let sample_i16 = (sample * i16::MAX as f32) as i16;
-                writer.write_sample(sample_i16)?;
-            }
-            writer.finalize()?;
-        }
+        // Extract features directly from in-memory samples (no temp files!)
+        let features = parakeet::extract_features_from_samples(
+            segment_samples,
+            model.cfg.feat_in,
+            &device
+        )?;
 
-        // Extract features and transcribe
-        let features = parakeet::load_wav_as_features(&temp_path, model.cfg.feat_in, &device)?;
+        // Transcribe
         let logits = model.forward(&features, false)?;
         let transcriptions = model.greedy_decode(&logits)?;
-
-        // Clean up temporary file
-        std::fs::remove_file(&temp_path)?;
 
         if !transcriptions.is_empty() {
             println!("  \"{}\"", transcriptions[0]);
