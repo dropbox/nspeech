@@ -72,13 +72,16 @@ async function main() {
     stream.input(chunk);
   }
 
-  // Flush any remaining audio
-  const final = stream.flush();
-  if (final) {
-    console.log('Final segment flushed');
-  }
+  // For WAV file processing, feed silence to transcribe any remaining speech
+  // (In true streaming, you'd just keep feeding live audio indefinitely)
+  console.log('Feeding silence to trigger final transcription...');
+  const silence = new Float64Array(8000); // 500ms silence
+  stream.input(silence);
 
-  console.log('✓ Transcription complete!');
+  // Wait a bit for final callback to fire
+  setTimeout(() => {
+    console.log('\n✓ Transcription complete!');
+  }, 100);
 }
 
 main().catch(err => {

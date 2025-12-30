@@ -4,9 +4,9 @@ Native Node.js bindings for streaming speech transcription using Silero VAD + Pa
 
 ## Features
 
-- **Streaming transcription**: Process audio in real-time with async `input()` method
+- **True streaming**: Process audio indefinitely with `input()` method
 - **Voice Activity Detection**: Only transcribes actual speech (using Silero VAD)
-- **Automatic pause detection**: Emits transcriptions at natural speech boundaries
+- **Automatic pause detection**: Emits transcriptions at natural speech boundaries (no flush needed)
 - **Quantized models**: Uses Q8_0 GGUF quantization for efficient inference
 - **Pure Rust/Native**: No Python dependencies, fast native performance
 
@@ -35,11 +35,14 @@ const stream = new TranscriptionStream('./assets', (transcription) => {
 });
 
 // Stream audio samples (16kHz mono, normalized to [-1, 1])
+// Transcriptions automatically emit when VAD detects pauses
 const samples = new Float64Array([...]); // Your audio data
 stream.input(samples);
 
-// Flush any remaining audio
-stream.flush();
+// Keep feeding audio - no flush needed!
+// To force transcription of final speech, feed ~500ms of silence
+const silence = new Float64Array(8000); // 500ms of silence at 16kHz
+stream.input(silence);
 ```
 
 ### Complete Example
@@ -86,15 +89,17 @@ assets/
 
 Process audio samples and emit transcriptions via callback.
 
+Transcriptions are automatically emitted when VAD detects speech pauses (300ms silence by default). No explicit flushing needed - the stream can run indefinitely.
+
 - `samples`: Audio samples (16kHz mono, normalized to [-1, 1])
 - Returns: void (synchronous)
 - Side effect: Calls callback for each detected speech segment
 
-##### `flush(): Transcription | null`
-
-Flush any remaining audio and get final transcription.
-
-- Returns: Final transcription if any speech remains, or null
+**Forcing transcription:** To transcribe remaining speech without waiting for natural pauses, feed silence:
+```javascript
+const silence = new Float64Array(8000); // 500ms silence at 16kHz
+stream.input(silence);
+```
 
 ### `Transcription`
 
@@ -181,12 +186,30 @@ try {
 }
 ```
 
+## Streaming Behavior
+
+The transcription stream is designed for **continuous, indefinite audio processing**:
+
+- Feed audio continuously via `input()`
+- Transcriptions emit automatically when VAD detects speech pauses
+- No explicit flush or finalization needed
+- Can run for hours/days without issues
+
+**For file processing:** If you need to transcribe the final utterance that hasn't been followed by silence, feed ~500ms of silence at the end:
+
+```javascript
+const silence = new Float64Array(8000); // 500ms silence at 16kHz
+stream.input(silence);
+```
+
+This triggers the pause detection and emits the final transcription.
+
 ## Limitations
 
-- Single-threaded processing (no concurrent streams)
-- No streaming audio output (only completed segments)
+- Single-threaded processing (one stream per instance)
 - English language only (Parakeet model limitation)
 - No beam search (greedy decoding only)
+- Callback executes on Node.js event loop (don't block it)
 
 ## License
 

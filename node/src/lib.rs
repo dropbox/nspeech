@@ -248,6 +248,9 @@ impl TranscriptionStream {
 
     /// Process audio samples and emit transcriptions via callback
     ///
+    /// Transcriptions are automatically emitted when VAD detects pauses in speech.
+    /// No explicit flushing needed - just keep feeding audio samples.
+    ///
     /// @param samples - Audio samples (16kHz mono, normalized to [-1, 1])
     #[napi]
     pub fn input(&self, samples: Float64Array) -> Result<()> {
@@ -270,36 +273,6 @@ impl TranscriptionStream {
         }
 
         Ok(())
-    }
-
-    /// Flush any remaining audio and get final transcription
-    #[napi]
-    pub fn flush(&self) -> Result<Option<Transcription>> {
-        let mut inner = self.inner.lock()
-            .map_err(|e| napi::Error::from_reason(format!("Lock error: {}", e)))?;
-
-        // Transcribe any remaining segment
-        if inner.current_segment_start.is_some() && !inner.current_segment.is_empty() {
-            let start_time = inner.current_segment_start.unwrap();
-            let end_time = inner.total_samples_processed as f64 / 16000.0;
-
-            if let Ok(text) = inner.transcribe_segment() {
-                if !text.is_empty() {
-                    let transcription = Transcription {
-                        text,
-                        start_time,
-                        end_time,
-                    };
-
-                    // Emit via callback
-                    self.callback.call(transcription.clone(), ThreadsafeFunctionCallMode::NonBlocking);
-
-                    return Ok(Some(transcription));
-                }
-            }
-        }
-
-        Ok(None)
     }
 }
 
