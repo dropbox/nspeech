@@ -959,7 +959,7 @@ impl ParakeetFeatureExtractor {
         let preemphasis = 0.97f32;
         let padding_value = 0.0f32;
 
-        let window = hann_window2(win_length);
+        let window = hann_window(win_length);
         let mel_filters =
             mel_filterbank_slaney_norm(feature_size, sampling_rate, n_fft, 0.0, sampling_rate as f32 / 2.0);
 
@@ -1084,7 +1084,7 @@ fn preemphasis(x: &[f32], coef: f32) -> Vec<f32> {
 
 /// Hann window, periodic=true: w[n]=0.5-0.5*cos(2*pi*n/N)
 /// This matches PyTorch's torch.hann_window() default (periodic=True)
-fn hann_window2(n: usize) -> Vec<f32> {
+fn hann_window(n: usize) -> Vec<f32> {
     if n == 0 {
         return vec![];
     }
