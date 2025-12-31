@@ -7,7 +7,7 @@ use std::path::Path;
 mod silero;
 use silero::{SileroVad, VadStream};
 
-use parakeet::{
+use parakeet::parakeet::{
     load_parakeet_ctc_from_hf, load_parakeet_ctc_from_local,
     FastConformerConfig, ParakeetFastConformerCtc,
 };

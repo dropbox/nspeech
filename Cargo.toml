@@ -5,6 +5,7 @@ edition = "2024"
 
 [lib]
 crate-type = ["lib", "cdylib"]
+path = "src/lib.rs"
 
 [[bin]]
 name = "main"
@@ -13,7 +14,6 @@ path = "src/main.rs"
 [features]
 default = []
 quantized = []
-napi = ["dep:napi", "dep:napi-derive", "dep:log", "dep:env_logger"]
 
 [dependencies]
 anyhow = "1"
@@ -43,11 +43,12 @@ half = "2.4"
 tempfile = "3.8"
 zstd = "0.13"
 
-# Optional NAPI bindings for Node.js
-napi = { version = "2", optional = true }
-napi-derive = { version = "2", optional = true }
-log = { version = "0.4", optional = true }
-env_logger = { version = "0.11", optional = true }
+# NAPI bindings for Node.js
+napi = "=3.2.2"
+napi-derive = "=3.2.2"
+log = "0.4"
+env_logger = "0.11"
+once_cell = "=1.21.3"
 
 [build-dependencies]
-napi-build = "2"
+napi-build = "=2.2.3"
