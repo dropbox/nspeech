@@ -8,9 +8,15 @@
 use anyhow::Result;
 use candle_core::DType;
 use candle_nn::VarBuilder;
-use parakeet::parakeet_ctc::ParakeetConfig;
-use parakeet::quantized_loader::QuantizedLoader;
 use std::path::Path;
+
+// NOTE: This example uses old code from src/old/
+#[path = "../src/old/parakeet_ctc.rs"]
+mod parakeet_ctc;
+#[path = "../src/old/quantized_loader.rs"]
+mod quantized_loader;
+use parakeet_ctc::ParakeetConfig;
+use quantized_loader::QuantizedLoader;
 
 fn compute_stats(data: &[f32]) -> (f32, f32, f32, f32) {
     let mean = data.iter().sum::<f32>() / data.len() as f32;

@@ -14,10 +14,16 @@
 use anyhow::{anyhow, Result};
 use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::VarBuilder;
-use parakeet::parakeet_ctc::{ParakeetConfig, ParakeetFastConformerCtc};
-use parakeet::quantized_loader::QuantizedLoader;
 use parakeet::{get_device, load_wav_as_features};
 use std::path::Path;
+
+// NOTE: This example uses old code from src/old/
+#[path = "../src/old/parakeet_ctc.rs"]
+mod parakeet_ctc;
+#[path = "../src/old/quantized_loader.rs"]
+mod quantized_loader;
+use parakeet_ctc::{ParakeetConfig, ParakeetCTC};
+use quantized_loader::QuantizedLoader;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();

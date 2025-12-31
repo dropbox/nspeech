@@ -3,8 +3,9 @@ use candle_core::{DType, Device, Tensor, D};
 use candle_nn::{VarBuilder, VarMap};
 use std::env;
 use std::path::Path;
+#[path = "old/silero.rs"]
 mod silero;
-use silero::{SileroVad, VadStream };
+use silero::{SileroVad, VadStream};
 
 use parakeet::{
     load_parakeet_ctc_from_hf, load_parakeet_ctc_from_local,

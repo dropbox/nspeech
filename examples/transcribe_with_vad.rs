@@ -13,9 +13,9 @@
 use anyhow::Result;
 use std::path::Path;
 
-// Import Silero VAD (module is in src/)
+// Import Silero VAD (module is in src/old/)
 mod silero {
-    include!("../src/silero.rs");
+    include!("../src/old/silero.rs");
 }
 use silero::{SileroVad, VadStream};
 

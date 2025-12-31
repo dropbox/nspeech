@@ -8,8 +8,12 @@
 use anyhow::Result;
 use candle_core::{quantized::gguf_file, DType, Tensor};
 use candle_nn::VarBuilder;
-use parakeet::parakeet_ctc::{ParakeetConfig, ParakeetCTC};
 use std::collections::HashMap;
+
+// NOTE: This example uses old code from src/old/
+#[path = "../src/old/parakeet_ctc.rs"]
+mod parakeet_ctc;
+use parakeet_ctc::{ParakeetConfig, ParakeetCTC};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();

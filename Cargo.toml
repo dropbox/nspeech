@@ -3,6 +3,9 @@ name = "parakeet"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["lib", "cdylib"]
+
 [[bin]]
 name = "main"
 path = "src/main.rs"
@@ -10,6 +13,7 @@ path = "src/main.rs"
 [features]
 default = []
 quantized = []
+napi = ["dep:napi", "dep:napi-derive", "dep:log", "dep:env_logger"]
 
 [dependencies]
 anyhow = "1"
@@ -38,3 +42,12 @@ half = "2.4"
 # For GGUF quantization
 tempfile = "3.8"
 zstd = "0.13"
+
+# Optional NAPI bindings for Node.js
+napi = { version = "2", optional = true }
+napi-derive = { version = "2", optional = true }
+log = { version = "0.4", optional = true }
+env_logger = { version = "0.11", optional = true }
+
+[build-dependencies]
+napi-build = "2"

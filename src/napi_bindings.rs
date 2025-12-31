@@ -2,7 +2,7 @@
 ///
 /// Usage from Node.js:
 /// ```js
-/// const { TranscriptionStream } = require('./parakeet-node');
+/// const { TranscriptionStream } = require('./parakeet');
 ///
 /// const stream = new TranscriptionStream('./assets', (transcription) => {
 ///   console.log('Transcription:', transcription);
@@ -14,7 +14,6 @@
 
 use napi::{Env, JsFunction, Result, Status};
 use napi_derive::napi;
-use once_cell::sync::OnceCell;
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -23,12 +22,12 @@ use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use log::{info, warn};
 
-mod assets;
-mod silero {
-    include!("../../src/silero.rs");
-}
-
+// Import Silero VAD from old/ directory
+#[path = "old/silero.rs"]
+mod silero;
 use silero::{SileroVad, VadStream};
+
+use crate::{ParakeetFastConformerCtc, extract_features_from_samples, get_device, load_parakeet_ctc_from_gguf_local};
 
 /// Transcription result with timestamp
 #[napi(object)]
@@ -41,7 +40,7 @@ pub struct Transcription {
 /// Inner state for transcription stream
 struct StreamInner {
     vad_stream: VadStream,
-    parakeet_model: parakeet::ParakeetFastConformerCtc,
+    parakeet_model: ParakeetFastConformerCtc,
     device: candle_core::Device,
 
     // Accumulated samples for current speech segment
@@ -61,7 +60,7 @@ struct StreamInner {
 impl StreamInner {
     fn new(
         vad: SileroVad,
-        parakeet_model: parakeet::ParakeetFastConformerCtc,
+        parakeet_model: ParakeetFastConformerCtc,
         device: candle_core::Device,
     ) -> Result<Self> {
         let vad_stream = VadStream::new(vad, &device)
@@ -163,7 +162,7 @@ impl StreamInner {
         }
 
         // Extract features from segment
-        let features = parakeet::extract_features_from_samples(
+        let features = extract_features_from_samples(
             &self.current_segment,
             self.parakeet_model.cfg.feat_in,
             &self.device,
@@ -206,7 +205,7 @@ impl TranscriptionStream {
         let assets = PathBuf::from(&assets_path);
 
         // Get device
-        let device = parakeet::get_device()
+        let device = get_device()
             .map_err(|e| napi::Error::from_reason(format!("Device error: {}", e)))?;
 
         info!("Loading Silero VAD...");
@@ -224,7 +223,7 @@ impl TranscriptionStream {
         info!("Loading Parakeet model...");
         // Load Parakeet model (expect hf_parakeet directory in assets)
         let parakeet_dir = assets.join("hf_parakeet");
-        let parakeet_model = parakeet::load_parakeet_ctc_from_gguf_local(
+        let parakeet_model = load_parakeet_ctc_from_gguf_local(
             parakeet_dir.to_str().unwrap(),
             &device,
         )
