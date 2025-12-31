@@ -131,8 +131,7 @@ pub fn stats(name: &str, number: f64) {
     }
 }
 
-// Import Silero VAD from old/ directory
-#[path = "old/silero.rs"]
+// Import Silero VAD
 mod silero;
 use silero::{SileroVad, VadStream};
 

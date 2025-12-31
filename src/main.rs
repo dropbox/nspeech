@@ -3,7 +3,6 @@ use candle_core::{DType, Device, Tensor, D};
 use candle_nn::{VarBuilder, VarMap};
 use std::env;
 use std::path::Path;
-#[path = "old/silero.rs"]
 mod silero;
 use silero::{SileroVad, VadStream};
 
