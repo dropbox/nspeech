@@ -327,10 +327,9 @@ impl TranscriptionStream {
         .map_err(|e| napi::Error::from_reason(format!("Failed to load VAD: {}", e)))?;
 
         info!("Loading Parakeet model...");
-        // Load Parakeet model (expect hf_parakeet directory in assets)
-        let parakeet_dir = assets.join("hf_parakeet");
+        // Load Parakeet model from assets directory
         let parakeet_model = parakeet::load_parakeet_ctc_from_gguf_local(
-            parakeet_dir.to_str().unwrap(),
+            assets.to_str().unwrap(),
             &device,
         )
         .map_err(|e| napi::Error::from_reason(format!("Failed to load Parakeet: {}", e)))?;

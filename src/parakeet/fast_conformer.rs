@@ -806,7 +806,7 @@ pub fn load_parakeet_ctc_from_gguf_hf(
 /// ```no_run
 /// use parakeet::{load_parakeet_ctc_from_gguf_local, get_device};
 /// let device = get_device()?;
-/// let model = load_parakeet_ctc_from_gguf_local("hf_parakeet", &device)?;
+/// let model = load_parakeet_ctc_from_gguf_local("assets", &device)?;
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 pub fn load_parakeet_ctc_from_gguf_local<P: AsRef<Path>>(
