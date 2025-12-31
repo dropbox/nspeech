@@ -15,7 +15,7 @@ fn main() -> Result<()> {
     let device = Device::Cpu;
 
 
-    let vad = SileroVad::load(&device, "vad16.safetensors", "vad16.config.json")?;
+    let vad = SileroVad::load(&device, "assets/vad16.safetensors", "assets/vad16.config.json")?;
 
 
 
