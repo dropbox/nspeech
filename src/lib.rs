@@ -1,6 +1,6 @@
 /* Node module API for Parakeet Speech Recognition */
 
-use napi::{Env, Result};
+use napi::{Env, Result, Task};
 use napi_derive::napi;
 
 use std::{
@@ -290,10 +290,37 @@ impl SpeechInner {
     }
 }
 
+/// Async task for processing audio samples in the background
+struct TranscribeTask {
+    inner: Arc<Mutex<SpeechInner>>,
+    samples: Vec<f32>,
+    callback: Arc<Box<dyn Fn(Transcription) + Send + Sync>>,
+}
+
+impl Task for TranscribeTask {
+    type Output = Vec<Transcription>;
+    type JsValue = ();
+
+    /// Runs on background thread - does the heavy processing
+    fn compute(&mut self) -> Result<Self::Output> {
+        let mut inner = self.inner.lock()
+            .map_err(|e| napi::Error::from_reason(format!("Lock error: {}", e)))?;
+        inner.process_samples(&self.samples)
+    }
+
+    /// Runs on main JS thread - emits results via callback
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        for transcription in output {
+            (self.callback)(transcription);
+        }
+        Ok(())
+    }
+}
+
 #[napi(js_name = "Speech")]
 pub struct Speech {
     inner: Arc<Mutex<SpeechInner>>,
-    callback: Box<dyn Fn(Transcription) + Send + Sync>,
+    callback: Arc<Box<dyn Fn(Transcription) + Send + Sync>>,
 }
 
 #[napi]
@@ -331,15 +358,15 @@ impl Speech {
         // Create inner state
         let inner = SpeechInner::new(vad, parakeet_model, device).unwrap();
 
-        // Create threadsafe callback and wrap in a closure
+        // Create threadsafe callback and wrap in Arc so it can be cloned for async tasks
         // Safety: We're intentionally leaking the callback reference to make it 'static
         // This is okay because the callback lives for the duration of the Speech
         let callback_static: Function<'static, Transcription, Unknown> =
             unsafe { std::mem::transmute(callback) };
         let tsfn = callback_static.build_threadsafe_function().build().unwrap();
-        let callback_fn = Box::new(move |t: Transcription| {
+        let callback_fn = Arc::new(Box::new(move |t: Transcription| {
             let _ = tsfn.call(t, ThreadsafeFunctionCallMode::NonBlocking);
-        });
+        }) as Box<dyn Fn(Transcription) + Send + Sync>);
 
         Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -348,25 +375,23 @@ impl Speech {
     }
 
     #[napi]
-    pub fn input(&self, samples: Vec<f64>) {
-        info!("input {} samples", samples.len());
-        // Convert f64 to f32
-        let samples_f32: Vec<f32> = samples.to_vec()
-            .iter()
-            .map(|&x| x as f32)
-            .collect();
+    pub fn input(&self, env: Env, samples: Vec<f64>) -> Result<()> {
+        info!("input {} samples (async)", samples.len());
 
-        // Process samples
-        let transcriptions = {
-            let mut inner = self.inner.lock()
-                .map_err(|e| napi::Error::from_reason(format!("Lock error: {}", e))).unwrap();
-            inner.process_samples(&samples_f32).unwrap()
+        // Convert f64 to f32
+        let samples_f32: Vec<f32> = samples.iter().map(|&x| x as f32).collect();
+
+        // Create async task with cloned Arc references
+        let task = TranscribeTask {
+            inner: Arc::clone(&self.inner),
+            samples: samples_f32,
+            callback: Arc::clone(&self.callback),
         };
 
-        // Emit transcriptions via callback
-        for transcription in transcriptions {
-            (self.callback)(transcription);
-        }
+        // Spawn task on background thread - returns immediately
+        env.spawn(task)?;
+
+        Ok(())
     }
 
     #[napi]
