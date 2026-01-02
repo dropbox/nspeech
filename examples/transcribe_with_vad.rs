@@ -11,7 +11,7 @@
 ///   PARAKEET_DEVICE=cpu cargo run --example transcribe_with_vad --release -- audio.wav
 
 use anyhow::Result;
-use std::path::Path;
+use speech::parakeet;
 
 // Import Silero VAD (module is in src/)
 mod silero {
