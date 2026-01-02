@@ -1,18 +1,17 @@
-/// Quantize Parakeet model to GGUF format for fast inference
+/// Quantize Parakeet model to GGUF format with zstd compression
 ///
-/// This tool quantizes a safetensors model to GGUF format using Candle's built-in
-/// quantization support. GGUF provides optimized kernels for Metal (Apple Silicon)
-/// and CPU inference.
+/// This tool quantizes a safetensors model to GGUF format and compresses with zstd.
+/// Output files are automatically named with .zst extension.
 ///
 /// Usage:
 ///   cargo run --example quantize_gguf --release -- \
-///     hf_parakeet/model.safetensors \
-///     hf_parakeet/model_q8_0.gguf \
+///     assets/model.safetensors \
+///     assets/model_q8_0.gguf.zst \
 ///     --format q8_0
 ///
 ///   cargo run --example quantize_gguf --release -- \
-///     hf_parakeet/model.safetensors \
-///     hf_parakeet/model_q4k.gguf \
+///     assets/model.safetensors \
+///     assets/model_q4k.gguf.zst \
 ///     --format q4k
 
 use anyhow::{anyhow, Result};
@@ -75,16 +74,23 @@ fn parse_quant_format(format: &str) -> Result<GgmlDType> {
 
 fn quantize_model(
     in_file: PathBuf,
-    out_file: PathBuf,
+    mut out_file: PathBuf,
     quant_format: GgmlDType,
-    compress: bool,
 ) -> Result<()> {
-    println!("Quantizing Parakeet Model to GGUF");
-    println!("=====================================");
+    // Ensure output filename ends with .zst
+    if out_file.extension().and_then(|s| s.to_str()) != Some("zst") {
+        let mut new_name = out_file.clone();
+        if let Some(name) = out_file.file_name().and_then(|s| s.to_str()) {
+            new_name.set_file_name(format!("{}.zst", name));
+            out_file = new_name;
+        }
+    }
+
+    println!("Quantizing Parakeet Model to GGUF with zstd compression");
+    println!("=========================================================");
     println!("Input:  {:?}", in_file);
     println!("Output: {:?}", out_file);
-    println!("Format: {:?}", quant_format);
-    println!("Compress: {}\n", compress);
+    println!("Format: {:?}\n", quant_format);
 
     // Load safetensors on CPU (quantization happens on CPU)
     println!("Loading model from safetensors...");
@@ -142,15 +148,9 @@ fn quantize_model(
         quantized_count, skipped_count, excluded_count
     );
 
-    // Write to GGUF
-    println!("Writing GGUF file...");
-    let mut file = if compress {
-        // Write to temporary file first for compression
-        tempfile::tempfile()?
-    } else {
-        // Write directly to output file
-        std::fs::File::create(&out_file)?
-    };
+    // Write to GGUF in tempfile, then compress to output
+    println!("Writing GGUF to tempfile...");
+    let mut tmp = tempfile::tempfile()?;
 
     let qtensor_refs: Vec<(&str, &QTensor)> = qtensors
         .iter()
@@ -159,19 +159,16 @@ fn quantize_model(
 
     // Write GGUF (no metadata for now)
     let metadata: Vec<(&str, &gguf_file::Value)> = vec![];
-    gguf_file::write(&mut file, &metadata, &qtensor_refs)?;
-    file.flush()?;
+    gguf_file::write(&mut tmp, &metadata, &qtensor_refs)?;
+    tmp.flush()?;
+    tmp.seek(SeekFrom::Start(0))?;
 
-    if compress {
-        println!("Compressing with zstd...");
-        file.seek(SeekFrom::Start(0))?;
-        let out = std::fs::File::create(&out_file)?;
-        let mut encoder = zstd::Encoder::new(out, 19)?; // Max compression level
-        std::io::copy(&mut file, &mut encoder)?;
-        encoder.finish()?.sync_all()?;
-    } else {
-        file.sync_all()?;
-    }
+    // Compress to output file
+    println!("Compressing with zstd (level 19)...");
+    let raw_out = std::fs::File::create(&out_file)?;
+    let mut encoder = zstd::Encoder::new(raw_out, 19)?;
+    std::io::copy(&mut tmp, &mut encoder)?;
+    encoder.finish()?.sync_all()?;
 
     // Report file size
     let file_size = std::fs::metadata(&out_file)?.len();
@@ -186,11 +183,14 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 3 {
-        eprintln!("Usage: {} <input.safetensors> <output.gguf> [--format FORMAT] [--compress]", args[0]);
+        eprintln!("Usage: {} <input.safetensors> <output.gguf.zst> [--format FORMAT]", args[0]);
         eprintln!("\nFormats: f32, f16, q4_0, q4_1, q5_0, q5_1, q8_0, q8_1, q2k, q3k, q4k, q5k, q6k, q8k");
+        eprintln!("         (default: q8_0)");
+        eprintln!("\nOutput files are automatically compressed with zstd level 19.");
+        eprintln!("If output filename doesn't end with .zst, it will be added automatically.");
         eprintln!("\nExamples:");
-        eprintln!("  {} model.safetensors model_q8_0.gguf --format q8_0", args[0]);
-        eprintln!("  {} model.safetensors model_q4k.gguf --format q4k --compress", args[0]);
+        eprintln!("  {} model.safetensors model_q8_0.gguf.zst --format q8_0", args[0]);
+        eprintln!("  {} model.safetensors model_q4k.gguf.zst --format q4k", args[0]);
         return Err(anyhow!("Invalid arguments"));
     }
 
@@ -199,7 +199,6 @@ fn main() -> Result<()> {
 
     // Parse optional arguments
     let mut quant_format = GgmlDType::Q8_0; // Default
-    let mut compress = false;
 
     let mut i = 3;
     while i < args.len() {
@@ -208,10 +207,6 @@ fn main() -> Result<()> {
                 quant_format = parse_quant_format(&args[i + 1])?;
                 i += 2;
             }
-            "--compress" => {
-                compress = true;
-                i += 1;
-            }
             _ => {
                 eprintln!("Warning: Unknown argument: {}", args[i]);
                 i += 1;
@@ -219,5 +214,5 @@ fn main() -> Result<()> {
         }
     }
 
-    quantize_model(in_file, out_file, quant_format, compress)
+    quantize_model(in_file, out_file, quant_format)
 }

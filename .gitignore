@@ -20,11 +20,27 @@ d2
 # Audio files (keep small test files if needed, but exclude large ones)
 *.wav
 
-# Model files (too large for git)
+# Cache directory for downloaded models
+.cache/
+
+# Assets directory (all model files - too large for git)
+assets/*
+!assets/README.md
+
+# Model files anywhere in the project
 hf_parakeet/
 model.safetensors
 *.gguf
+*.gguf.zst
+*.safetensors
+*.safetensors.zst
 
-# Silero VAD models
+# Config files for models
 vad*.config.json
-vad*.safetensors
+vad*.config.json.zst
+config.json
+config.json.zst
+tokenizer*.json
+tokenizer*.json.zst
+special_tokens_map.json
+special_tokens_map.json.zst

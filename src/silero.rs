@@ -2,6 +2,10 @@ use anyhow::{bail, Result};
 use candle_core::{DType, Device, Module, Tensor};
 use candle_nn as nn;
 use serde::Deserialize;
+use std::path::Path;
+
+// Import VAD assets
+use crate::parakeet::{VAD_CONFIG, VAD_MODEL};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct VadConfig {
@@ -191,11 +195,20 @@ pub struct SileroVad {
 }
 
 impl SileroVad {
-    pub fn load<P: AsRef<std::path::Path>>(device: &Device, st_path: P, cfg_path: P) -> Result<Self> {
-        let cfg: VadConfig = serde_json::from_slice(&std::fs::read(cfg_path)?)?;
+    pub fn load<P: AsRef<Path>>(assets: P, device: &Device) -> Result<Self> {
+        let assets = assets.as_ref().to_path_buf();
 
-        let buffer = std::fs::read(st_path)?;
-        let st = safetensors::SafeTensors::deserialize(&buffer)?;
+        // Load config from embedded asset (decompresses automatically)
+        let cfg_bytes = VAD_CONFIG.bytes(&assets).map_err(|_| {
+            anyhow::anyhow!("failed to load VAD config from assets")
+        })?;
+        let cfg: VadConfig = serde_json::from_slice(cfg_bytes)?;
+
+        // Load model from embedded asset (decompresses automatically)
+        let model_bytes = VAD_MODEL.bytes(&assets).map_err(|_| {
+            anyhow::anyhow!("failed to load VAD model from assets")
+        })?;
+        let st = safetensors::SafeTensors::deserialize(model_bytes)?;
 
         let (basis, enc, rnn, head) = Self::load_tensors(device, &st, &cfg)?;
 

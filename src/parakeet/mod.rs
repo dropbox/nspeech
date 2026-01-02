@@ -11,6 +11,7 @@ pub use fast_conformer::{
     FastConformerConfig, ParakeetFastConformerCtc,
     load_parakeet_ctc_from_hf, load_parakeet_ctc_from_local,
     load_parakeet_ctc_from_gguf_hf, load_parakeet_ctc_from_gguf_local,
+    VAD_CONFIG, VAD_MODEL, // Re-export VAD assets for use in silero module
 };
 pub use features::{
     ParakeetFeatureExtractor, extract_features_from_samples, load_wav_as_features,

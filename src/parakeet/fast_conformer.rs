@@ -9,16 +9,18 @@ use hf_hub::api::sync::Api;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::io::Seek;
+use std::path::Path;
 use tokenizers::Tokenizer;
 
-// Embedded Parakeet assets (configs/tokenizer - small files only)
+// Embedded assets (configs/tokenizer - small files only)
 use crate::embed_zst_asset;
 embed_zst_asset!(pub PARAKEET_CONFIG,                "config.json.zst");
 embed_zst_asset!(pub PARAKEET_TOKENIZER,             "tokenizer.json.zst");
 embed_zst_asset!(pub PARAKEET_SPECIAL_TOKENS_MAP,    "special_tokens_map.json.zst");
 embed_zst_asset!(pub PARAKEET_TOKENIZER_CONFIG,      "tokenizer_config.json.zst");
 embed_zst_asset!(pub VAD_CONFIG,                     "vad16.config.json.zst");
+embed_zst_asset!(pub VAD_MODEL,                      "vad16.safetensors.zst");
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct FastConformerConfig {
@@ -851,31 +853,50 @@ pub fn load_parakeet_ctc_from_gguf_local<P: AsRef<Path>>(
     let tokenizer = Tokenizer::from_bytes(tok_bytes)
         .map_err(|e| Error::new(ErrorKind::Other, format!("failed to parse PARAKEET_TOKENIZER: {e}")))?;
 
-    // Try Q8_0 first (recommended), then Q4K - load from disk (large file)
-    let gguf_path = if assets.join("model_q8_0.gguf").exists() {
+    // Try Q8_0 first (recommended), then Q4K - try compressed (.zst) first, then uncompressed
+    let (gguf_path, is_compressed) = if assets.join("model_q8_0.gguf.zst").exists() {
+        println!("Loading Q8_0 quantized model (recommended, compressed)");
+        (assets.join("model_q8_0.gguf.zst"), true)
+    } else if assets.join("model_q8_0.gguf").exists() {
         println!("Loading Q8_0 quantized model (recommended)");
-        assets.join("model_q8_0.gguf")
+        (assets.join("model_q8_0.gguf"), false)
+    } else if assets.join("model_q4k.gguf.zst").exists() {
+        println!("Loading Q4K quantized model (high compression, compressed)");
+        (assets.join("model_q4k.gguf.zst"), true)
     } else if assets.join("model_q4k.gguf").exists() {
         println!("Loading Q4K quantized model (high compression)");
-        assets.join("model_q4k.gguf")
+        (assets.join("model_q4k.gguf"), false)
     } else {
         return Err(anyhow!(
-            "No GGUF file found in {:?}. Expected model_q8_0.gguf or model_q4k.gguf",
+            "No GGUF file found in {:?}. Expected model_q8_0.gguf.zst, model_q8_0.gguf, model_q4k.gguf.zst, or model_q4k.gguf",
             assets
         ));
     };
 
-    // Load GGUF file from disk (too large to embed)
+    // Load GGUF file from disk (too large to embed), decompress if needed
     println!("  Loading GGUF file...");
-    let mut file = fs::File::open(&gguf_path)?;
-    let gguf_content = gguf_file::Content::read(&mut file)?;
+    let mut gguf_file = if is_compressed {
+        // Decompress .zst file to tempfile (GGUF reader needs seekable stream)
+        println!("  Decompressing zstd...");
+        let compressed = fs::File::open(&gguf_path)?;
+        let mut decoder = zstd::Decoder::new(compressed)?;
+        let mut tmp = tempfile::tempfile()?;
+        std::io::copy(&mut decoder, &mut tmp)?;
+        tmp.seek(std::io::SeekFrom::Start(0))?;
+        tmp
+    } else {
+        // Read uncompressed file directly
+        fs::File::open(&gguf_path)?
+    };
+
+    let gguf_content = gguf_file::Content::read(&mut gguf_file)?;
     println!("  Loaded {} tensors from GGUF", gguf_content.tensor_infos.len());
 
     // Dequantize all tensors to FP32
     println!("  Dequantizing tensors to FP32...");
     let mut tensors = HashMap::new();
     for (name, _tensor_info) in gguf_content.tensor_infos.iter() {
-        let qtensor = gguf_content.tensor(&mut file, name, device)?;
+        let qtensor = gguf_content.tensor(&mut gguf_file, name, device)?;
         let tensor = qtensor.dequantize(device)?;
         tensors.insert(name.clone(), tensor);
     }

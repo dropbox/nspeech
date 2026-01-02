@@ -9,7 +9,7 @@ use std::{
 };
 
 use log::{info, LevelFilter, Log, Metadata, Record};
-use napi::bindgen_prelude::{Function, Unknown, Float64Array};
+use napi::bindgen_prelude::{Function, Unknown};
 use napi::threadsafe_function::{ThreadsafeFunctionCallMode, ThreadsafeCallContext};
 use once_cell::sync::OnceCell;
 
@@ -131,8 +131,11 @@ pub fn stats(name: &str, number: f64) {
     }
 }
 
-// Import Silero VAD
-mod silero;
+// Parakeet speech recognition library (must be declared before silero, which imports VAD assets from it)
+pub mod parakeet;
+
+// Silero VAD module
+pub mod silero;
 use silero::{SileroVad, VadStream};
 
 /// Transcription result with timestamp
@@ -144,7 +147,7 @@ pub struct Transcription {
 }
 
 /// Inner state for transcription stream
-struct StreamInner {
+struct SpeechInner {
     vad_stream: VadStream,
     parakeet_model: parakeet::ParakeetFastConformerCtc,
     device: candle_core::Device,
@@ -163,7 +166,7 @@ struct StreamInner {
     min_silence_duration_ms: f32,
 }
 
-impl StreamInner {
+impl SpeechInner {
     fn new(
         vad: SileroVad,
         parakeet_model: parakeet::ParakeetFastConformerCtc,
@@ -289,47 +292,31 @@ impl StreamInner {
 
 #[napi(js_name = "Speech")]
 pub struct Speech {
-    inner: Arc<Mutex<StreamInner>>,
+    inner: Arc<Mutex<SpeechInner>>,
     callback: Box<dyn Fn(Transcription) + Send + Sync>,
 }
 
 #[napi]
 impl Speech {
-    /// Create a new transcription stream
-    ///
-    /// @param assets - Path to directory containing model files
-    /// @param callback - Function called with each transcription result
     #[napi(constructor)]
     pub fn new(
-        _env: Env,
         assets: String,
-        #[napi(ts_arg_type = "(transcription: Transcription) => void")]
         callback: Function<Transcription, Unknown>,
-    ) -> Result<Self> {
-        let cwd = std::env::current_dir().unwrap();
+    ) -> Self {
         info!(
-            "speech running assets=`{}' cwd=`{}'",
-            assets,
-            cwd.display()
+            "speech running assets=`{assets}"
         );
 
         let assets = PathBuf::from(assets);
 
         // Get device
         let device = parakeet::get_device()
-            .map_err(|e| napi::Error::from_reason(format!("Device error: {}", e)))?;
+            .map_err(|e| napi::Error::from_reason(format!("Device error: {}", e))).unwrap();
 
         info!("Loading Silero VAD...");
-        // Load VAD model (expect files in assets directory)
-        let vad_path = assets.join("vad16.safetensors");
-        let vad_config_path = assets.join("vad16.config.json");
-
-        let vad = SileroVad::load(
-            &device,
-            &vad_path,
-            &vad_config_path,
-        )
-        .map_err(|e| napi::Error::from_reason(format!("Failed to load VAD: {}", e)))?;
+        // Load VAD model using embed_zst_asset (with optional binary embedding)
+        let vad = SileroVad::load(&assets, &device)
+            .map_err(|e| napi::Error::from_reason(format!("Failed to load VAD: {}", e))).unwrap();
 
         info!("Loading Parakeet model...");
         // Load Parakeet model from assets directory
@@ -337,37 +324,32 @@ impl Speech {
             &assets,
             &device,
         )
-        .map_err(|e| napi::Error::from_reason(format!("Failed to load Parakeet: {}", e)))?;
+        .map_err(|e| napi::Error::from_reason(format!("Failed to load Parakeet: {}", e))).unwrap();
 
         info!("Models loaded successfully");
 
         // Create inner state
-        let inner = StreamInner::new(vad, parakeet_model, device)?;
+        let inner = SpeechInner::new(vad, parakeet_model, device).unwrap();
 
         // Create threadsafe callback and wrap in a closure
         // Safety: We're intentionally leaking the callback reference to make it 'static
         // This is okay because the callback lives for the duration of the Speech
         let callback_static: Function<'static, Transcription, Unknown> =
             unsafe { std::mem::transmute(callback) };
-        let tsfn = callback_static.build_threadsafe_function().build()?;
+        let tsfn = callback_static.build_threadsafe_function().build().unwrap();
         let callback_fn = Box::new(move |t: Transcription| {
             let _ = tsfn.call(t, ThreadsafeFunctionCallMode::NonBlocking);
         });
 
-        Ok(Self {
+        Self {
             inner: Arc::new(Mutex::new(inner)),
             callback: callback_fn,
-        })
+        }
     }
 
-    /// Process audio samples and emit transcriptions via callback
-    ///
-    /// Transcriptions are automatically emitted when VAD detects pauses in speech.
-    /// No explicit flushing needed - just keep feeding audio samples.
-    ///
-    /// @param samples - Audio samples (16kHz mono, normalized to [-1, 1])
     #[napi]
-    pub fn input(&self, samples: Float64Array) -> Result<()> {
+    pub fn input(&self, samples: Vec<f64>) {
+        info!("input {} samples", samples.len());
         // Convert f64 to f32
         let samples_f32: Vec<f32> = samples.to_vec()
             .iter()
@@ -377,18 +359,17 @@ impl Speech {
         // Process samples
         let transcriptions = {
             let mut inner = self.inner.lock()
-                .map_err(|e| napi::Error::from_reason(format!("Lock error: {}", e)))?;
-            inner.process_samples(&samples_f32)?
+                .map_err(|e| napi::Error::from_reason(format!("Lock error: {}", e))).unwrap();
+            inner.process_samples(&samples_f32).unwrap()
         };
 
         // Emit transcriptions via callback
         for transcription in transcriptions {
             (self.callback)(transcription);
         }
+    }
 
-        Ok(())
+    #[napi]
+    pub fn shutdown(&self) {
     }
 }
-
-// Parakeet speech recognition library
-pub mod parakeet;
