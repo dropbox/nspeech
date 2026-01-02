@@ -12,6 +12,7 @@
 
 use anyhow::Result;
 use speech::parakeet;
+use std::path::PathBuf;
 
 // Import Silero VAD (module is in src/)
 mod silero {
@@ -41,15 +42,17 @@ fn main() -> Result<()> {
     // Get device
     let device = parakeet::get_device()?;
 
+    let assets = PathBuf::from("assets");
+
     // Load Silero VAD
     println!("Loading Silero VAD...");
-    let vad = SileroVad::load(&device, "assets/vad16.safetensors", "assets/vad16.config.json")?;
+    let vad = SileroVad::load(&device, assets.join("vad16.safetensors"), assets.join("vad16.config.json"))?;
     let mut vad_stream = VadStream::new(vad, &device)?;
     println!("✓ VAD loaded\n");
 
     // Load Parakeet model
     println!("Loading Parakeet model...");
-    let model = parakeet::load_parakeet_ctc_from_gguf_local("assets", &device)?;
+    let model = parakeet::load_parakeet_ctc_from_gguf_local(&assets, &device)?;
     println!("✓ Parakeet loaded\n");
 
     // Load audio

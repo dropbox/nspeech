@@ -191,7 +191,7 @@ pub struct SileroVad {
 }
 
 impl SileroVad {
-    pub fn load(device: &Device, st_path: &str, cfg_path: &str) -> Result<Self> {
+    pub fn load<P: AsRef<std::path::Path>>(device: &Device, st_path: P, cfg_path: P) -> Result<Self> {
         let cfg: VadConfig = serde_json::from_slice(&std::fs::read(cfg_path)?)?;
 
         let buffer = std::fs::read(st_path)?;

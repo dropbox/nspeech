@@ -1,14 +1,15 @@
 use anyhow::Result;
 use candle_core::Device;
 use std::env;
+use std::path::PathBuf;
 mod silero;
 use silero::{SileroVad, VadStream};
 
 fn main() -> Result<()> {
     let device = Device::Cpu;
 
-
-    let vad = SileroVad::load(&device, "assets/vad16.safetensors", "assets/vad16.config.json")?;
+    let assets = PathBuf::from("assets");
+    let vad = SileroVad::load(&device, assets.join("vad16.safetensors"), assets.join("vad16.config.json"))?;
 
 
 

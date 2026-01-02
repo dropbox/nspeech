@@ -308,7 +308,7 @@ impl TranscriptionStream {
     ) -> Result<Self> {
         info!("Initializing TranscriptionStream with assets: {}", assets_path);
 
-        let assets = PathBuf::from(&assets_path);
+        let assets = PathBuf::from(assets_path);
 
         // Get device
         let device = parakeet::get_device()
@@ -321,15 +321,15 @@ impl TranscriptionStream {
 
         let vad = SileroVad::load(
             &device,
-            vad_path.to_str().unwrap(),
-            vad_config_path.to_str().unwrap(),
+            &vad_path,
+            &vad_config_path,
         )
         .map_err(|e| napi::Error::from_reason(format!("Failed to load VAD: {}", e)))?;
 
         info!("Loading Parakeet model...");
         // Load Parakeet model from assets directory
         let parakeet_model = parakeet::load_parakeet_ctc_from_gguf_local(
-            assets.to_str().unwrap(),
+            &assets,
             &device,
         )
         .map_err(|e| napi::Error::from_reason(format!("Failed to load Parakeet: {}", e)))?;
