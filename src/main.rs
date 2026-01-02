@@ -1,15 +1,8 @@
 use anyhow::Result;
-use candle_core::{DType, Device, Tensor, D};
-use candle_nn::{VarBuilder, VarMap};
+use candle_core::Device;
 use std::env;
-use std::path::Path;
 mod silero;
 use silero::{SileroVad, VadStream};
-
-use parakeet::parakeet::{
-    load_parakeet_ctc_from_hf, load_parakeet_ctc_from_local,
-    FastConformerConfig, ParakeetFastConformerCtc,
-};
 
 fn main() -> Result<()> {
     let device = Device::Cpu;

@@ -13,9 +13,9 @@
 use anyhow::Result;
 use std::path::Path;
 
-// Import Silero VAD (module is in src/old/)
+// Import Silero VAD (module is in src/)
 mod silero {
-    include!("../src/old/silero.rs");
+    include!("../src/silero.rs");
 }
 use silero::{SileroVad, VadStream};
 
@@ -27,8 +27,8 @@ fn main() -> Result<()> {
         eprintln!("\nThis example uses Silero VAD to detect speech segments,");
         eprintln!("then transcribes only the speech portions with Parakeet.");
         eprintln!("\nRequired files:");
-        eprintln!("  VAD: vad16.safetensors, vad16.config.json");
-        eprintln!("  Parakeet: hf_parakeet/config.json, hf_parakeet/model_q8_0.gguf, hf_parakeet/tokenizer.json");
+        eprintln!("  assets/vad16.safetensors, assets/vad16.config.json");
+        eprintln!("  assets/config.json, assets/model_q8_0.gguf, assets/tokenizer.json");
         return Ok(());
     }
 
@@ -43,13 +43,13 @@ fn main() -> Result<()> {
 
     // Load Silero VAD
     println!("Loading Silero VAD...");
-    let vad = SileroVad::load(&device, "vad16.safetensors", "vad16.config.json")?;
+    let vad = SileroVad::load(&device, "assets/vad16.safetensors", "assets/vad16.config.json")?;
     let mut vad_stream = VadStream::new(vad, &device)?;
     println!("✓ VAD loaded\n");
 
     // Load Parakeet model
     println!("Loading Parakeet model...");
-    let model = parakeet::load_parakeet_ctc_from_gguf_local("hf_parakeet", &device)?;
+    let model = parakeet::load_parakeet_ctc_from_gguf_local("assets", &device)?;
     println!("✓ Parakeet loaded\n");
 
     // Load audio
