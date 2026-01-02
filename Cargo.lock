@@ -2460,7 +2460,6 @@ dependencies = [
  "anyhow",
  "candle-core",
  "candle-nn",
- "half",
  "hf-hub 0.4.3",
  "hound",
  "log",

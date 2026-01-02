@@ -287,28 +287,33 @@ impl StreamInner {
     }
 }
 
-#[napi]
-pub struct TranscriptionStream {
+#[napi(js_name = "Speech")]
+pub struct Speech {
     inner: Arc<Mutex<StreamInner>>,
     callback: Box<dyn Fn(Transcription) + Send + Sync>,
 }
 
 #[napi]
-impl TranscriptionStream {
+impl Speech {
     /// Create a new transcription stream
     ///
-    /// @param assets_path - Path to directory containing model files
+    /// @param assets - Path to directory containing model files
     /// @param callback - Function called with each transcription result
     #[napi(constructor)]
     pub fn new(
-        env: Env,
-        assets_path: String,
+        _env: Env,
+        assets: String,
         #[napi(ts_arg_type = "(transcription: Transcription) => void")]
         callback: Function<Transcription, Unknown>,
     ) -> Result<Self> {
-        info!("Initializing TranscriptionStream with assets: {}", assets_path);
+        let cwd = std::env::current_dir().unwrap();
+        info!(
+            "speech running assets=`{}' cwd=`{}'",
+            assets,
+            cwd.display()
+        );
 
-        let assets = PathBuf::from(assets_path);
+        let assets = PathBuf::from(assets);
 
         // Get device
         let device = parakeet::get_device()
@@ -341,7 +346,7 @@ impl TranscriptionStream {
 
         // Create threadsafe callback and wrap in a closure
         // Safety: We're intentionally leaking the callback reference to make it 'static
-        // This is okay because the callback lives for the duration of the TranscriptionStream
+        // This is okay because the callback lives for the duration of the Speech
         let callback_static: Function<'static, Transcription, Unknown> =
             unsafe { std::mem::transmute(callback) };
         let tsfn = callback_static.build_threadsafe_function().build()?;
