@@ -14,6 +14,7 @@ path = "src/main.rs"    # !Dash
 [features]
 default = []
 quantized = []
+embed-assets = []
 
 [dependencies]
 anyhow = "1"
@@ -35,9 +36,9 @@ num-complex = "0.4"
 # For silero
 safetensors = "0.4"
 
-# For GGUF quantization
+# For GGUF quantization and asset compression
 tempfile = "3.8"
-zstd = "0.13"
+zstd = "0.13.3"
 
 # NAPI bindings for Node.js
 napi = "3.2.2"

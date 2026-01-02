@@ -2,6 +2,7 @@ use anyhow::Result;
 use candle_core::Device;
 
 // Submodules
+pub mod assets;
 pub mod fast_conformer;
 pub mod features;
 
