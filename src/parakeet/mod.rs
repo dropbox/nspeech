@@ -8,7 +8,7 @@ pub mod features;
 
 // Re-export commonly used types and functions
 pub use fast_conformer::{
-    FastConformerConfig, ParakeetFastConformerCtc,
+    FastConformerConfig, ParakeetFastConformerCtc, QParakeetFastConformerCtc,
     load_parakeet_ctc_from_hf, load_parakeet_ctc_from_local,
     load_parakeet_ctc_from_gguf_hf, load_parakeet_ctc_from_gguf_local,
     VAD_CONFIG, VAD_MODEL, // Re-export VAD assets for use in silero module
@@ -17,6 +17,39 @@ pub use features::{
     ParakeetFeatureExtractor, extract_features_from_samples, load_wav_as_features,
     load_python_encoder_input,
 };
+
+/// Trait for Parakeet CTC models (both quantized and regular)
+pub trait ParakeetCtcModel {
+    fn forward(&self, xs: &candle_core::Tensor, train: bool) -> Result<candle_core::Tensor>;
+    fn greedy_decode(&self, logits: &candle_core::Tensor) -> Result<Vec<String>>;
+    fn config(&self) -> &FastConformerConfig;
+}
+
+// Implement trait for regular model
+impl ParakeetCtcModel for ParakeetFastConformerCtc {
+    fn forward(&self, xs: &candle_core::Tensor, train: bool) -> Result<candle_core::Tensor> {
+        self.forward(xs, train)
+    }
+    fn greedy_decode(&self, logits: &candle_core::Tensor) -> Result<Vec<String>> {
+        self.greedy_decode(logits)
+    }
+    fn config(&self) -> &FastConformerConfig {
+        &self.cfg
+    }
+}
+
+// Implement trait for quantized model
+impl ParakeetCtcModel for QParakeetFastConformerCtc {
+    fn forward(&self, xs: &candle_core::Tensor, train: bool) -> Result<candle_core::Tensor> {
+        self.forward(xs, train)
+    }
+    fn greedy_decode(&self, logits: &candle_core::Tensor) -> Result<Vec<String>> {
+        self.greedy_decode(logits)
+    }
+    fn config(&self) -> &FastConformerConfig {
+        &self.cfg
+    }
+}
 
 /// Transcribe audio with optional left/right context for streaming
 ///
@@ -33,11 +66,11 @@ pub use features::{
 ///
 /// # Returns
 /// The transcription text for the chunk (not including context portions)
-pub fn transcribe_streaming_chunk(
+pub fn transcribe_streaming_chunk<M: ParakeetCtcModel>(
     chunk_samples: &[f32],
     left_context: Option<&[f32]>,
     right_context: Option<&[f32]>,
-    model: &ParakeetFastConformerCtc,
+    model: &M,
     device: &Device,
 ) -> Result<String> {
     // Build full input with context
@@ -52,7 +85,7 @@ pub fn transcribe_streaming_chunk(
     // Extract features from full input (with context)
     let features = extract_features_from_samples(
         &full_input,
-        model.cfg.feat_in,
+        model.config().feat_in,
         device,
     )?;
 

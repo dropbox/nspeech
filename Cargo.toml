@@ -23,6 +23,7 @@ serde_json = "1"
 
 candle-core = { version = "0.9", package = "candle-core", features = ["metal", "accelerate"] }
 candle-nn   = { version = "0.9", package = "candle-nn", features = ["metal", "accelerate"] }
+candle-transformers = { version = "0.9", package = "candle-transformers" }
 
 # Hugging Face Hub client (sync API is fine)
 hf-hub = "0.4"

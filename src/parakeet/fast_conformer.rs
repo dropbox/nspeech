@@ -5,11 +5,12 @@ use candle_nn::{
     Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, Dropout, LayerNorm, LayerNormConfig, Linear,
     VarBuilder,
 };
+use candle_transformers::models::with_tracing::QMatMul;
 use hf_hub::api::sync::Api;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
-use std::io::Seek;
+use std::io::{Read, Seek};
 use std::path::Path;
 use tokenizers::Tokenizer;
 
@@ -375,6 +376,363 @@ impl ConvModule {
     }
 }
 
+// ============================================================================
+// Quantized versions using QMatMul for faster inference with GGUF models
+// ============================================================================
+
+pub struct QFeedForward {
+    w1: QMatMul,
+    w2: QMatMul,
+    dropout: Dropout,
+}
+
+impl QFeedForward {
+    pub fn new(
+        d_model: usize,
+        ff_mult: usize,
+        drop: f64,
+        vb: candle_transformers::quantized_var_builder::VarBuilder,
+    ) -> Result<Self> {
+        let hidden = d_model * ff_mult;
+        let w1 = QMatMul::new(d_model, hidden, vb.pp("linear1"))?;
+        let w2 = QMatMul::new(hidden, d_model, vb.pp("linear2"))?;
+        let dropout = Dropout::new(drop as f32);
+        Ok(Self { w1, w2, dropout })
+    }
+
+    pub fn forward(&self, xs: &Tensor, train: bool) -> Result<Tensor> {
+        let xs = self.w1.forward(xs)?.silu()?;
+        let xs = self.dropout.forward(&xs, train)?;
+        let xs = self.w2.forward(&xs)?;
+        Ok(xs)
+    }
+}
+
+pub struct QMultiHeadSelfAttention {
+    q_proj: QMatMul,
+    k_proj: QMatMul,
+    v_proj: QMatMul,
+    o_proj: QMatMul,
+    rel_k_weight: Tensor,
+    bias_u: Tensor,
+    bias_v: Tensor,
+    num_heads: usize,
+    head_dim: usize,
+    dropout: Dropout,
+}
+
+impl QMultiHeadSelfAttention {
+    pub fn new(
+        d_model: usize,
+        num_heads: usize,
+        drop: f64,
+        vb: candle_transformers::quantized_var_builder::VarBuilder,
+    ) -> Result<Self> {
+        if d_model % num_heads != 0 {
+            return Err(anyhow!(
+                "d_model ({d_model}) must be divisible by num_heads ({num_heads})"
+            ));
+        }
+        let head_dim = d_model / num_heads;
+        let q_proj = QMatMul::new(d_model, d_model, vb.pp("q_proj"))?;
+        let k_proj = QMatMul::new(d_model, d_model, vb.pp("k_proj"))?;
+        let v_proj = QMatMul::new(d_model, d_model, vb.pp("v_proj"))?;
+        let o_proj = QMatMul::new(d_model, d_model, vb.pp("o_proj"))?;
+
+        // These tensors are used in regular matmul ops, so dequantize them
+        let rel_k_weight_q = vb.get((d_model, d_model), "relative_k_proj.weight")?;
+        let rel_k_weight = rel_k_weight_q.dequantize(vb.device())?;
+        let bias_u_q = vb.get((num_heads, head_dim), "bias_u")?;
+        let bias_u = bias_u_q.dequantize(vb.device())?;
+        let bias_v_q = vb.get((num_heads, head_dim), "bias_v")?;
+        let bias_v = bias_v_q.dequantize(vb.device())?;
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            rel_k_weight,
+            bias_u,
+            bias_v,
+            num_heads,
+            head_dim,
+            dropout: Dropout::new(drop as f32),
+        })
+    }
+
+    pub fn forward(&self, xs: &Tensor, pos: &Tensor, attn_mask: Option<&Tensor>, train: bool) -> Result<Tensor> {
+        let (b, t, d) = xs.dims3()?;
+        let q = self.q_proj.forward(xs)?;
+        let k = self.k_proj.forward(xs)?;
+        let v = self.v_proj.forward(xs)?;
+        let pos2 = pos.reshape((b * pos.dims()[1], d))?;
+        let k_rel = pos2
+            .matmul(&self.rel_k_weight.transpose(D::Minus2, D::Minus1)?)?
+            .reshape((b, pos.dims()[1], d))?;
+        let q = q.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        let k = k.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        let v = v.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        let k_rel = k_rel
+            .reshape((b, pos.dims()[1], self.num_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let bu = self.bias_u.unsqueeze(0)?.unsqueeze(2)?;
+        let bv = self.bias_v.unsqueeze(0)?.unsqueeze(2)?;
+        let q_bias_u = q.broadcast_add(&bu)?;
+        let q_bias_v = q.broadcast_add(&bv)?;
+        let attn_scores_c = q_bias_u.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
+        let mut attn_scores_r = q_bias_v.matmul(&k_rel.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
+        attn_scores_r = self.rel_shift(&attn_scores_r)?;
+        let last = attn_scores_r.dims4()?.3;
+        let take = last.min(t);
+        attn_scores_r = attn_scores_r.narrow(D::Minus1, 0, take)?;
+        let mut attn_scores = (attn_scores_c + attn_scores_r)?;
+        if let Some(mask) = attn_mask {
+            attn_scores = (attn_scores + mask)?;
+        }
+        let scale = (self.head_dim as f64).sqrt() as f32;
+        let scale_t = Tensor::from_slice(&[scale], (), xs.device())?;
+        let scale_t = scale_t.broadcast_as(attn_scores.shape())?;
+        attn_scores = (attn_scores / scale_t)?;
+        let attn_weights = candle_nn::ops::softmax(&attn_scores, D::Minus1)?;
+        let attn_weights = self.dropout.forward(&attn_weights, train)?;
+        let context = attn_weights.matmul(&v)?;
+        let context = context.transpose(1, 2)?.reshape((b, t, d))?;
+        let out = self.o_proj.forward(&context)?;
+        Ok(out)
+    }
+
+    fn rel_shift(&self, x: &Tensor) -> Result<Tensor> {
+        let (b, h, t, p) = x.dims4()?;
+        let zeros = Tensor::zeros((b, h, t, 1), x.dtype(), x.device())?;
+        let x = Tensor::cat(&[zeros, x.clone()], 3)?;
+        let x = x.reshape((b, h, p + 1, t))?;
+        let x = x.narrow(D::Minus2, 1, p)?;
+        let x = x.reshape((b, h, t, p))?;
+        let x = x.narrow(D::Minus1, 0, t)?;
+        Ok(x)
+    }
+}
+
+pub struct QFastConformerBlock {
+    ff1: QFeedForward,
+    ff2: QFeedForward,
+    self_attn: QMultiHeadSelfAttention,
+    conv_module: ConvModule,
+    ln_ff1: LayerNorm,
+    ln_mha: LayerNorm,
+    ln_conv: LayerNorm,
+    ln_ff2: LayerNorm,
+    ln_out: LayerNorm,
+}
+
+impl QFastConformerBlock {
+    pub fn new(
+        cfg: &FastConformerConfig,
+        vb: candle_transformers::quantized_var_builder::VarBuilder,
+    ) -> Result<Self> {
+        let d_model = cfg.d_model;
+        let ln_cfg = LayerNormConfig {
+            eps: 1e-5,
+            affine: true,
+            remove_mean: true,
+        };
+
+        // LayerNorm weights need to be dequantized since LayerNorm doesn't support quantized ops
+        let ln_ff1_weight = vb.get(d_model, "norm_feed_forward1.weight")?.dequantize(vb.device())?;
+        let ln_ff1_bias = vb.get(d_model, "norm_feed_forward1.bias")?.dequantize(vb.device())?;
+        let ln_mha_weight = vb.get(d_model, "norm_self_att.weight")?.dequantize(vb.device())?;
+        let ln_mha_bias = vb.get(d_model, "norm_self_att.bias")?.dequantize(vb.device())?;
+        let ln_conv_weight = vb.get(d_model, "norm_conv.weight")?.dequantize(vb.device())?;
+        let ln_conv_bias = vb.get(d_model, "norm_conv.bias")?.dequantize(vb.device())?;
+        let ln_ff2_weight = vb.get(d_model, "norm_feed_forward2.weight")?.dequantize(vb.device())?;
+        let ln_ff2_bias = vb.get(d_model, "norm_feed_forward2.bias")?.dequantize(vb.device())?;
+        let ln_out_weight = vb.get(d_model, "norm_out.weight")?.dequantize(vb.device())?;
+        let ln_out_bias = vb.get(d_model, "norm_out.bias")?.dequantize(vb.device())?;
+
+        // Conv module weights need to be dequantized and loaded into a regular VarBuilder
+        let kernel_size = cfg.conv_kernel_size;
+        let device = vb.device();
+        let mut conv_weights = HashMap::new();
+
+        // Helper to load and dequantize a weight tensor
+        macro_rules! load_weight {
+            ($name:expr, $shape:expr) => {{
+                let full_name = format!("conv.{}", $name);
+                let qtensor = vb.get($shape, &full_name)?;
+                let tensor = qtensor.dequantize(&device)?;
+                conv_weights.insert($name.to_string(), tensor);
+            }};
+        }
+
+        load_weight!("pointwise_conv1.weight", (2 * d_model, d_model, 1));
+        load_weight!("pointwise_conv1.bias", 2 * d_model);
+        load_weight!("depthwise_conv.weight", (d_model, 1, kernel_size));
+        load_weight!("depthwise_conv.bias", d_model);
+        load_weight!("norm.weight", d_model);
+        load_weight!("norm.bias", d_model);
+        load_weight!("norm.running_mean", d_model);
+        load_weight!("norm.running_var", d_model);
+        // num_batches_tracked is optional and might not be in GGUF
+        if let Ok(qtensor) = vb.get((), "conv.norm.num_batches_tracked") {
+            if let Ok(tensor) = qtensor.dequantize(&device) {
+                conv_weights.insert("norm.num_batches_tracked".to_string(), tensor);
+            }
+        }
+        load_weight!("pointwise_conv2.weight", (d_model, d_model, 1));
+        load_weight!("pointwise_conv2.bias", d_model);
+
+        let conv_vb = VarBuilder::from_tensors(conv_weights, DType::F32, vb.device());
+
+        Ok(Self {
+            ff1: QFeedForward::new(d_model, cfg.ff_mult, cfg.dropout, vb.pp("feed_forward1"))?,
+            ff2: QFeedForward::new(d_model, cfg.ff_mult, cfg.dropout, vb.pp("feed_forward2"))?,
+            self_attn: QMultiHeadSelfAttention::new(d_model, cfg.num_heads, cfg.dropout, vb.pp("self_attn"))?,
+            conv_module: ConvModule::new(d_model, cfg.conv_kernel_size, cfg.dropout, conv_vb)?,
+            ln_ff1: LayerNorm::new(ln_ff1_weight, ln_ff1_bias, ln_cfg.eps),
+            ln_mha: LayerNorm::new(ln_mha_weight, ln_mha_bias, ln_cfg.eps),
+            ln_conv: LayerNorm::new(ln_conv_weight, ln_conv_bias, ln_cfg.eps),
+            ln_ff2: LayerNorm::new(ln_ff2_weight, ln_ff2_bias, ln_cfg.eps),
+            ln_out: LayerNorm::new(ln_out_weight, ln_out_bias, ln_cfg.eps),
+        })
+    }
+
+    pub fn forward_with_pos(
+        &self,
+        xs: &Tensor,
+        pos: &Tensor,
+        attn_mask: Option<&Tensor>,
+        train: bool,
+    ) -> Result<Tensor> {
+        let ln_ff1_out = self.ln_ff1.forward(xs)?;
+        let y_ff1 = self.ff1.forward(&ln_ff1_out, train)?;
+        let y_ff1_scaled = (y_ff1 * 0.5)?;
+        let mut y = (xs + &y_ff1_scaled)?;
+
+        let ln_mha_out = self.ln_mha.forward(&y)?;
+        let y_attn = self
+            .self_attn
+            .forward(&ln_mha_out, pos, attn_mask, train)?;
+        y = (&y + &y_attn)?;
+
+        let y_conv = self.conv_module.forward(&self.ln_conv.forward(&y)?, train)?;
+        y = (&y + &y_conv)?;
+
+        let y_ff2 = self.ff2.forward(&self.ln_ff2.forward(&y)?, train)?;
+        let y_ff2_scaled = (y_ff2 * 0.5)?;
+        y = (&y + &y_ff2_scaled)?;
+
+        let y_out = self.ln_out.forward(&y)?;
+        Ok(y_out)
+    }
+}
+
+pub struct QFastConformerEncoder {
+    pub subsampling: ConvSubsampling,
+    blocks: Vec<QFastConformerBlock>,
+    pos_dropout: Dropout,
+    pos_dropout_positions: Dropout,
+    cfg: FastConformerConfig,
+}
+
+impl QFastConformerEncoder {
+    pub fn new(
+        cfg: FastConformerConfig,
+        vb: candle_transformers::quantized_var_builder::VarBuilder,
+    ) -> Result<Self> {
+        // Subsampling uses Conv2D, need to dequantize weights
+        let feat_in = cfg.feat_in;
+        let sub_channels = cfg.subsampling_channels;
+        let sub_factor = cfg.subsampling_factor;
+        let flatten_dim = sub_channels * (feat_in / sub_factor);
+        let device = vb.device();
+        let mut subsampling_weights = HashMap::new();
+
+        // Helper to load and dequantize subsampling weights
+        macro_rules! load_sub_weight {
+            ($name:expr, $shape:expr) => {{
+                let path = format!("subsampling.{}", $name);
+                let qtensor = vb.get($shape, &path)?;
+                let tensor = qtensor.dequantize(&device)?;
+                subsampling_weights.insert($name.to_string(), tensor);
+            }};
+        }
+
+        load_sub_weight!("layers.0.weight", (sub_channels, 1, 3, 3));
+        load_sub_weight!("layers.0.bias", sub_channels);
+        load_sub_weight!("layers.2.weight", (sub_channels, 1, 3, 3));
+        load_sub_weight!("layers.2.bias", sub_channels);
+        load_sub_weight!("layers.3.weight", (sub_channels, sub_channels, 1, 1));
+        load_sub_weight!("layers.3.bias", sub_channels);
+        load_sub_weight!("layers.5.weight", (sub_channels, 1, 3, 3));
+        load_sub_weight!("layers.5.bias", sub_channels);
+        load_sub_weight!("layers.6.weight", (sub_channels, sub_channels, 1, 1));
+        load_sub_weight!("layers.6.bias", sub_channels);
+        load_sub_weight!("linear.weight", (cfg.d_model, flatten_dim));
+        load_sub_weight!("linear.bias", cfg.d_model);
+
+        let subsampling_vb = VarBuilder::from_tensors(
+            subsampling_weights,
+            DType::F32,
+            vb.device(),
+        );
+        let subsampling = ConvSubsampling::new(&cfg, subsampling_vb)?;
+
+        let mut blocks = Vec::with_capacity(cfg.num_layers);
+        for i in 0..cfg.num_layers {
+            blocks.push(QFastConformerBlock::new(
+                &cfg,
+                vb.pp(&format!("layers.{i}")),
+            )?);
+        }
+
+        Ok(Self {
+            subsampling,
+            blocks,
+            pos_dropout: Dropout::new(cfg.dropout as f32),
+            pos_dropout_positions: Dropout::new(cfg.dropout_positions as f32),
+            cfg,
+        })
+    }
+
+    pub fn forward(&self, xs: &Tensor, train: bool) -> Result<Tensor> {
+        let device = xs.device();
+        let (_, _, input_dim) = xs.dims3()?;
+        let xs = if input_dim == self.cfg.d_model {
+            xs.clone()
+        } else {
+            self.subsampling.forward(xs)?
+        };
+        let (b, t, d) = xs.dims3()?;
+        if d != self.cfg.d_model {
+            return Err(anyhow!(
+                "encoder expected d_model {}, got {}",
+                self.cfg.d_model,
+                d
+            ));
+        }
+        let xs = if self.cfg.scale_input {
+            let scale = (self.cfg.d_model as f64).sqrt() as f32;
+            let scale_t = Tensor::from_slice(&[scale], (), device)?;
+            let scale_t = scale_t.broadcast_as(xs.shape())?;
+            (xs * scale_t)?
+        } else {
+            xs
+        };
+        let pos = relative_positional_encoding(b, t, d, device)?;
+        let pos = self.pos_dropout_positions.forward(&pos, train)?;
+        let mut h = self.pos_dropout.forward(&xs, train)?;
+        for blk in self.blocks.iter() {
+            h = blk.forward_with_pos(&h, &pos, None, train)?;
+        }
+        Ok(h)
+    }
+}
+
+// ============================================================================
+// End of quantized versions
+// ============================================================================
+
 pub struct FastConformerBlock {
     ff1: FeedForward,
     ff2: FeedForward,
@@ -561,6 +919,108 @@ impl FastConformerEncoder {
         Ok(h)
     }
 }
+
+// ============================================================================
+// Quantized Parakeet model using QMatMul for faster inference
+// ============================================================================
+
+pub struct QParakeetFastConformerCtc {
+    pub encoder: QFastConformerEncoder,
+    pub proj: Linear,  // Keep CTC head as regular Linear (small, so dequantizing is fine)
+    pub cfg: FastConformerConfig,
+    tokenizer: Option<Tokenizer>,
+    id2token: Option<Vec<String>>,
+}
+
+impl QParakeetFastConformerCtc {
+    pub fn new_with_tokenizer(
+        cfg: FastConformerConfig,
+        vb: candle_transformers::quantized_var_builder::VarBuilder,
+        tokenizer: Tokenizer,
+    ) -> Result<Self> {
+        let encoder = QFastConformerEncoder::new(cfg.clone(), vb.pp("encoder"))?;
+
+        // CTC head is small, so we dequantize it for compatibility
+        // The bulk of the speed improvement comes from the quantized encoder anyway
+        let device = vb.device();
+        let weight_q = vb.get((cfg.vocab_size, cfg.d_model), "ctc_head.weight")
+            .or_else(|_| {
+                // Try Conv1d format [V, D, 1] and squeeze
+                vb.get((cfg.vocab_size, cfg.d_model, 1), "ctc_head.weight")
+            })?;
+        let weight = weight_q.dequantize(&device)?;
+        // Squeeze if it's 3D
+        let weight = if weight.dims().len() == 3 {
+            weight.squeeze(2)?
+        } else {
+            weight
+        };
+        let bias_q = vb.get(cfg.vocab_size, "ctc_head.bias")?;
+        let bias = bias_q.dequantize(&device)?;
+        let proj = Linear::new(weight, Some(bias));
+
+        Ok(Self {
+            encoder,
+            proj,
+            cfg,
+            tokenizer: Some(tokenizer),
+            id2token: None,
+        })
+    }
+
+    pub fn forward(&self, xs: &Tensor, train: bool) -> Result<Tensor> {
+        let h = self.encoder.forward(xs, train)?;
+        let logits = self.proj.forward(&h)?;
+        Ok(logits)
+    }
+
+    pub fn greedy_decode(&self, logits: &Tensor) -> Result<Vec<String>> {
+        let (b, t, _v) = logits.dims3()?;
+        let pred_ids = logits.argmax(D::Minus1)?;
+        let pred_ids = pred_ids.to_vec2::<u32>()?;
+        let mut transcripts = Vec::with_capacity(b);
+        for bidx in 0..b {
+            let mut prev = self.cfg.blank_id as u32;
+            let mut tokens = Vec::new();
+            for tidx in 0..t {
+                let cur = pred_ids[bidx][tidx];
+                if cur == self.cfg.blank_id as u32 {
+                    prev = cur;
+                    continue;
+                }
+                if cur == prev {
+                    continue;
+                }
+                tokens.push(cur);
+                prev = cur;
+            }
+            let text = self.decode_tokens(&tokens)?;
+            transcripts.push(text);
+        }
+        Ok(transcripts)
+    }
+
+    pub fn decode_tokens(&self, ids: &[u32]) -> Result<String> {
+        if let Some(ref tok) = self.tokenizer {
+            return tok.decode(ids, true).map_err(|e| anyhow!("decode error: {e}"));
+        }
+        if let Some(ref vocab) = self.id2token {
+            let mut pieces = Vec::with_capacity(ids.len());
+            for &id in ids {
+                let idx = id as usize;
+                if idx < vocab.len() {
+                    pieces.push(vocab[idx].clone());
+                }
+            }
+            return Ok(pieces.join(""));
+        }
+        Err(anyhow!("no tokenizer or id2token available for decoding"))
+    }
+}
+
+// ============================================================================
+// End of quantized model
+// ============================================================================
 
 pub struct ParakeetFastConformerCtc {
     pub encoder: FastConformerEncoder,
@@ -787,7 +1247,7 @@ pub fn load_parakeet_ctc_from_gguf_hf(
     repo_id: &str,
     gguf_filename: &str,
     device: &Device,
-) -> Result<ParakeetFastConformerCtc> {
+) -> Result<QParakeetFastConformerCtc> {
     println!("Loading quantized model from Hugging Face Hub");
     println!("  Repository: {}", repo_id);
     println!("  GGUF file: {}", gguf_filename);
@@ -822,8 +1282,7 @@ pub fn load_parakeet_ctc_from_gguf_hf(
 pub fn load_parakeet_ctc_from_gguf_local<P: AsRef<Path>>(
     dir: P,
     device: &Device,
-) -> Result<ParakeetFastConformerCtc> {
-    use candle_core::quantized::gguf_file;
+) -> Result<QParakeetFastConformerCtc> {
     use std::io::{Error, ErrorKind};
 
     let assets = dir.as_ref().to_path_buf();
@@ -889,38 +1348,34 @@ pub fn load_parakeet_ctc_from_gguf_local<P: AsRef<Path>>(
         fs::File::open(&gguf_path)?
     };
 
-    let gguf_content = gguf_file::Content::read(&mut gguf_file)?;
-    println!("  Loaded {} tensors from GGUF", gguf_content.tensor_infos.len());
+    // Use quantized VarBuilder to keep weights quantized for faster inference
+    println!("  Creating quantized VarBuilder (keeps weights in Q8_0/Q4K format)...");
 
-    // Dequantize all tensors to FP32
-    println!("  Dequantizing tensors to FP32...");
-    let mut tensors = HashMap::new();
-    for (name, _tensor_info) in gguf_content.tensor_infos.iter() {
-        let qtensor = gguf_content.tensor(&mut gguf_file, name, device)?;
-        let tensor = qtensor.dequantize(device)?;
-        tensors.insert(name.clone(), tensor);
-    }
-    println!("  ✓ All tensors dequantized");
+    // Read GGUF content into memory for quantized_var_builder
+    gguf_file.seek(std::io::SeekFrom::Start(0))?;
+    let mut gguf_bytes = Vec::new();
+    std::io::Read::read_to_end(&mut gguf_file, &mut gguf_bytes)?;
 
-    // Create VarBuilder from dequantized tensors
-    let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
+    let vb = candle_transformers::quantized_var_builder::VarBuilder::from_gguf_buffer(
+        &gguf_bytes,
+        device,
+    )?;
+    println!("  ✓ Quantized VarBuilder created (weights stay quantized for speed)");
 
     println!("  Building model...");
-    let model = ParakeetFastConformerCtc::new_with_tokenizer(cfg, vb, tokenizer)?;
+    let model = QParakeetFastConformerCtc::new_with_tokenizer(cfg, vb, tokenizer)?;
     println!("✓ Quantized model loaded successfully\n");
 
     Ok(model)
 }
 
-/// Common helper to load GGUF model from paths
+/// Common helper to load GGUF model from paths (using quantized inference)
 fn load_gguf_model_common<P: AsRef<Path>>(
     config_path: P,
     gguf_path: P,
     tokenizer_path: P,
     device: &Device,
-) -> Result<ParakeetFastConformerCtc> {
-    use candle_core::quantized::gguf_file;
-
+) -> Result<QParakeetFastConformerCtc> {
     // Load config
     let cfg_json = fs::read_to_string(&config_path)?;
     let hf_cfg: HfParakeetCtcConfig = serde_json::from_str(&cfg_json)?;
@@ -930,27 +1385,25 @@ fn load_gguf_model_common<P: AsRef<Path>>(
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow!("tokenizer load error: {e}"))?;
 
-    // Load GGUF file
+    // Load GGUF file and keep quantized
     println!("  Loading GGUF file...");
-    let mut file = fs::File::open(&gguf_path)?;
-    let gguf_content = gguf_file::Content::read(&mut file)?;
-    println!("  Loaded {} tensors from GGUF", gguf_content.tensor_infos.len());
+    let mut gguf_file = fs::File::open(&gguf_path)?;
 
-    // Dequantize all tensors to FP32
-    println!("  Dequantizing tensors to FP32...");
-    let mut tensors = HashMap::new();
-    for (name, _tensor_info) in gguf_content.tensor_infos.iter() {
-        let qtensor = gguf_content.tensor(&mut file, name, device)?;
-        let tensor = qtensor.dequantize(device)?;
-        tensors.insert(name.clone(), tensor);
-    }
-    println!("  ✓ All tensors dequantized");
+    // Read GGUF content into memory for quantized_var_builder
+    gguf_file.seek(std::io::SeekFrom::Start(0))?;
+    let mut gguf_bytes = Vec::new();
+    std::io::Read::read_to_end(&mut gguf_file, &mut gguf_bytes)?;
 
-    // Create VarBuilder from dequantized tensors
-    let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
+    // Use quantized VarBuilder to keep weights quantized for faster inference
+    println!("  Creating quantized VarBuilder (keeps weights in Q8_0/Q4K format)...");
+    let vb = candle_transformers::quantized_var_builder::VarBuilder::from_gguf_buffer(
+        &gguf_bytes,
+        device,
+    )?;
+    println!("  ✓ Quantized VarBuilder created (weights stay quantized for speed)");
 
     println!("  Building model...");
-    let model = ParakeetFastConformerCtc::new_with_tokenizer(cfg, vb, tokenizer)?;
+    let model = QParakeetFastConformerCtc::new_with_tokenizer(cfg, vb, tokenizer)?;
     println!("✓ Quantized model loaded successfully\n");
 
     Ok(model)

@@ -150,7 +150,7 @@ pub struct Transcription {
 /// Inner state for transcription stream
 struct SpeechInner {
     vad_stream: VadStream,
-    parakeet_model: parakeet::ParakeetFastConformerCtc,
+    parakeet_model: parakeet::QParakeetFastConformerCtc,
     device: candle_core::Device,
 
     // Accumulated samples for current speech segment
@@ -178,7 +178,7 @@ struct SpeechInner {
 impl SpeechInner {
     fn new(
         vad: SileroVad,
-        parakeet_model: parakeet::ParakeetFastConformerCtc,
+        parakeet_model: parakeet::QParakeetFastConformerCtc,
         device: candle_core::Device,
     ) -> Result<Self> {
         let vad_stream = VadStream::new(vad, &device)
