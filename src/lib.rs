@@ -230,6 +230,8 @@ impl SpeechInner {
         let mut transcriptions = Vec::new();
 
         // Process through VAD in 160-sample chunks (10ms at 16kHz)
+        // Key: VAD probabilities indicate speech state, but we accumulate samples
+        // independently based on that state to avoid duplication
         const CHUNK_SIZE: usize = 160;
         let mut idx = 0;
 
@@ -253,13 +255,6 @@ impl SpeechInner {
                         self.current_segment_start = Some(start_time);
                         self.current_segment.clear();
                         info!("VAD: Speech started at {:.3}s (prob={:.3})", start_time, prob);
-                    }
-
-                    // Add samples to current segment
-                    // Note: We accumulate the full chunk even though VAD probs correspond to ~512 samples
-                    // This ensures we capture all speech audio
-                    if self.current_segment_start.is_some() {
-                        self.current_segment.extend_from_slice(chunk);
                     }
                 } else {
                     // Silence detected
@@ -309,6 +304,12 @@ impl SpeechInner {
                 }
 
                 self.total_samples_processed += 512;
+            }
+
+            // Accumulate chunk samples if we're in an active speech segment
+            // This happens outside the probability loop to avoid duplication
+            if self.current_segment_start.is_some() {
+                self.current_segment.extend_from_slice(chunk);
             }
 
             idx = end;
