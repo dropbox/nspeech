@@ -157,6 +157,10 @@ struct SpeechInner {
     current_segment: Vec<f32>,
     current_segment_start: Option<f64>, // Start time in seconds
 
+    // Sub-segments (phrases) for comma insertion
+    // Tracks sample positions where pauses occurred (comma boundaries)
+    phrase_boundaries: Vec<usize>, // Sample indices where commas should go
+
     // Tracking
     total_samples_processed: usize,
     silence_frames: usize,
@@ -164,7 +168,8 @@ struct SpeechInner {
     // Configuration (VAD mode)
     speech_threshold: f32,
     min_speech_duration_ms: f32,
-    min_silence_duration_ms: f32,
+    comma_pause_duration_ms: f32, // Short pause → comma (150ms)
+    period_pause_duration_ms: f32, // Long pause → period (300ms)
 
     // Debug WAV writer
     debug_wav_writer: Option<WavWriter<std::io::BufWriter<std::fs::File>>>,
@@ -191,18 +196,20 @@ impl SpeechInner {
             }
         };
 
-        info!("VAD mode: enabled (speech detection)");
+        info!("VAD mode: enabled (speech detection with pause-based punctuation)");
         Ok(Self {
             vad_stream,
             parakeet_model,
             device,
             current_segment: Vec::new(),
             current_segment_start: None,
+            phrase_boundaries: Vec::new(),
             total_samples_processed: 0,
             silence_frames: 0,
             speech_threshold: 0.5,
             min_speech_duration_ms: 250.0,
-            min_silence_duration_ms: 300.0,
+            comma_pause_duration_ms: 150.0,  // Short pause → comma
+            period_pause_duration_ms: 300.0, // Long pause → period/end segment
             debug_wav_writer,
         })
     }
@@ -262,17 +269,31 @@ impl SpeechInner {
                         self.silence_frames += 1;
                         let silence_duration_ms = self.silence_frames as f32 * 32.0; // 32ms per frame
 
-                        if silence_duration_ms >= self.min_silence_duration_ms {
+                        // Check for comma pause (short pause)
+                        if silence_duration_ms >= self.comma_pause_duration_ms
+                            && silence_duration_ms < self.period_pause_duration_ms
+                            && self.silence_frames == (self.comma_pause_duration_ms / 32.0).ceil() as usize {
+                            // Mark phrase boundary for comma insertion
+                            let boundary_pos = self.current_segment.len();
+                            if boundary_pos > 0 {
+                                self.phrase_boundaries.push(boundary_pos);
+                                info!("VAD: Comma pause detected at sample {} ({}ms pause)",
+                                      boundary_pos, silence_duration_ms);
+                            }
+                        }
+
+                        // Check for period pause (long pause - end segment)
+                        if silence_duration_ms >= self.period_pause_duration_ms {
                             // End current segment and transcribe
                             let start_time = self.current_segment_start.unwrap();
                             let end_time = self.total_samples_processed as f64 / 16000.0;
                             let duration_ms = (end_time - start_time) * 1000.0;
 
-                            info!("VAD: Speech ended at {:.3}s (duration={:.0}ms, samples={})",
-                                  end_time, duration_ms, self.current_segment.len());
+                            info!("VAD: Period pause - speech ended at {:.3}s (duration={:.0}ms, samples={}, phrases={})",
+                                  end_time, duration_ms, self.current_segment.len(), self.phrase_boundaries.len() + 1);
 
                             if duration_ms >= self.min_speech_duration_ms as f64 {
-                                // Transcribe the accumulated segment
+                                // Transcribe the accumulated segment with phrase boundaries
                                 info!("VAD: Transcribing segment {:.3}s-{:.3}s", start_time, end_time);
                                 match self.transcribe_segment() {
                                     Ok(text) => {
@@ -298,6 +319,7 @@ impl SpeechInner {
 
                             self.current_segment.clear();
                             self.current_segment_start = None;
+                            self.phrase_boundaries.clear();
                             self.silence_frames = 0;
                         }
                     }
@@ -324,24 +346,87 @@ impl SpeechInner {
             return Ok(String::new());
         }
 
-        info!("Transcribe: Processing {} samples", self.current_segment.len());
+        info!("Transcribe: Processing {} samples with {} phrase boundaries",
+              self.current_segment.len(), self.phrase_boundaries.len());
 
-        // Use streaming transcription helper (no context for VAD segments)
-        let text = parakeet::transcribe_streaming_chunk(
-            &self.current_segment,
-            None, // No left context
-            None, // No right context
-            &self.parakeet_model,
-            &self.device,
-        )
-        .map_err(|e| {
-            let err = format!("Transcription error: {}", e);
-            info!("Transcribe: ERROR - {}", err);
-            napi::Error::from_reason(err)
-        })?;
+        // If we have phrase boundaries (comma pauses), split and transcribe each phrase
+        if !self.phrase_boundaries.is_empty() {
+            let mut phrases = Vec::new();
+            let mut start_idx = 0;
 
-        info!("Transcribe: Result length: {} chars", text.len());
-        Ok(text)
+            // Transcribe each phrase between boundaries
+            for &boundary_pos in &self.phrase_boundaries {
+                if boundary_pos > start_idx && boundary_pos <= self.current_segment.len() {
+                    let phrase_samples = &self.current_segment[start_idx..boundary_pos];
+                    let raw_phrase = parakeet::transcribe_streaming_chunk(
+                        phrase_samples,
+                        None,
+                        None,
+                        &self.parakeet_model,
+                        &self.device,
+                    )
+                    .map_err(|e| {
+                        let err = format!("Phrase transcription error: {}", e);
+                        info!("Transcribe: ERROR - {}", err);
+                        napi::Error::from_reason(err)
+                    })?;
+
+                    if !raw_phrase.is_empty() {
+                        phrases.push(raw_phrase);
+                    }
+                    start_idx = boundary_pos;
+                }
+            }
+
+            // Transcribe final phrase
+            if start_idx < self.current_segment.len() {
+                let final_phrase_samples = &self.current_segment[start_idx..];
+                let raw_phrase = parakeet::transcribe_streaming_chunk(
+                    final_phrase_samples,
+                    None,
+                    None,
+                    &self.parakeet_model,
+                    &self.device,
+                )
+                .map_err(|e| {
+                    let err = format!("Final phrase transcription error: {}", e);
+                    info!("Transcribe: ERROR - {}", err);
+                    napi::Error::from_reason(err)
+                })?;
+
+                if !raw_phrase.is_empty() {
+                    phrases.push(raw_phrase);
+                }
+            }
+
+            // Join phrases with comma marker
+            let raw_text = phrases.join(" , ");
+            let text = parakeet::add_punctuation_internal(&raw_text, true);
+
+            info!("Transcribe: Raw phrases: {} -> \"{}\"", phrases.len(), raw_text);
+            info!("Transcribe: With punctuation: \"{}\"", text);
+            Ok(text)
+        } else {
+            // No phrase boundaries - single phrase
+            let raw_text = parakeet::transcribe_streaming_chunk(
+                &self.current_segment,
+                None,
+                None,
+                &self.parakeet_model,
+                &self.device,
+            )
+            .map_err(|e| {
+                let err = format!("Transcription error: {}", e);
+                info!("Transcribe: ERROR - {}", err);
+                napi::Error::from_reason(err)
+            })?;
+
+            let text = parakeet::add_punctuation(&raw_text);
+
+            info!("Transcribe: Raw: \"{}\"", raw_text);
+            info!("Transcribe: With punctuation: \"{}\"", text);
+            Ok(text)
+        }
     }
 }
 

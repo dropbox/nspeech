@@ -89,6 +89,134 @@ pub fn transcribe_streaming_chunk(
     Ok(transcriptions.first().cloned().unwrap_or_default())
 }
 
+/// Add punctuation and capitalization to raw CTC output with comma support
+///
+/// Parakeet CTC outputs lowercase text without punctuation. This function
+/// applies basic rule-based punctuation restoration:
+/// - Capitalizes first word and after periods
+/// - Capitalizes common proper nouns (I, Americans, etc.)
+/// - Adds commas between phrases (if comma_separated is true)
+/// - Adds periods at sentence boundaries
+///
+/// When comma_separated=true, expects input like ["phrase one", "phrase two"]
+/// joined with " , " to insert commas between natural pauses.
+///
+/// For production use, consider using a dedicated punctuation restoration model
+/// like oliverguhr/fullstop-punctuation-multilang-large
+pub fn add_punctuation_internal(text: &str, comma_separated: bool) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+
+    // Common proper nouns to capitalize (expandable)
+    let proper_nouns = [
+        "i", "americans", "america", "american", "god", "jesus", "christ",
+        "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+        "january", "february", "march", "april", "may", "june", "july",
+        "august", "september", "october", "november", "december",
+    ];
+
+    // If comma_separated, split on " , " marker and process phrases
+    if comma_separated {
+        let phrases: Vec<&str> = text.split(" , ").collect();
+        let mut result = String::new();
+        let mut capitalize_next = true;
+
+        for (phrase_idx, phrase) in phrases.iter().enumerate() {
+            let words: Vec<&str> = phrase.split_whitespace().collect();
+
+            for (i, word) in words.iter().enumerate() {
+                if !result.is_empty() && (i > 0 || phrase_idx > 0) {
+                    result.push(' ');
+                }
+
+                let processed_word = if capitalize_next || proper_nouns.contains(&word.to_lowercase().as_str()) {
+                    // Capitalize first letter
+                    let mut chars = word.chars();
+                    match chars.next() {
+                        None => String::new(),
+                        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    }
+                } else {
+                    word.to_string()
+                };
+
+                result.push_str(&processed_word);
+                capitalize_next = false;
+            }
+
+            // Add comma after phrase (except last one)
+            if phrase_idx < phrases.len() - 1 {
+                result.push(',');
+            }
+        }
+
+        // Ensure final period
+        if !result.ends_with('.') && !result.ends_with('?') && !result.ends_with('!') {
+            result.push('.');
+        }
+
+        return result;
+    }
+
+    // Original single-phrase logic
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut result = String::new();
+    let mut capitalize_next = true;
+
+    for (i, word) in words.iter().enumerate() {
+        if i > 0 {
+            result.push(' ');
+        }
+
+        let mut processed_word = if capitalize_next || proper_nouns.contains(&word.to_lowercase().as_str()) {
+            // Capitalize first letter
+            let mut chars = word.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+            }
+        } else {
+            word.to_string()
+        };
+
+        // Check if this word should end a sentence
+        // Look for sentence-ending patterns (simple heuristics)
+        let next_word = words.get(i + 1).map(|s| *s);
+        let should_add_period = match next_word {
+            None => true, // End of text
+            Some(next) => {
+                // Add period before transition words that typically start new sentences
+                matches!(
+                    next.to_lowercase().as_str(),
+                    "but" | "and" | "so" | "because" | "again" | "however" | "therefore"
+                ) && processed_word.len() > 3 // Avoid short words
+            }
+        };
+
+        if should_add_period && !processed_word.ends_with('.') {
+            processed_word.push('.');
+            capitalize_next = true;
+        } else {
+            capitalize_next = false;
+        }
+
+        result.push_str(&processed_word);
+    }
+
+    // Ensure final period
+    if !result.ends_with('.') && !result.ends_with('?') && !result.ends_with('!') {
+        result.push('.');
+    }
+
+    result
+}
+
+/// Add punctuation and capitalization to raw CTC output (backward compatibility)
+pub fn add_punctuation(text: &str) -> String {
+    add_punctuation_internal(text, false)
+}
+
 /// Select the best available device for inference
 /// Prefers Metal on macOS if PARAKEET_DEVICE env var is not set to "cpu"
 /// Falls back to CPU with Accelerate framework

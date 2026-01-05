@@ -71,24 +71,25 @@ fn main() -> Result<()> {
     println!("  Duration: {:.2}s ({} samples)", total_duration_sec, total_samples);
     println!();
 
-    // Streaming configuration
-    const STREAM_CHUNK_SIZE: usize = 8000; // 500ms chunks for streaming (simulates network packets)
+    // Streaming configuration with pause-based punctuation
     const VAD_CHUNK_SIZE: usize = 160; // 10ms at 16kHz for VAD processing
     const SPEECH_THRESHOLD: f32 = 0.5;
     const MIN_SPEECH_DURATION_MS: f32 = 250.0;
-    const MIN_SILENCE_DURATION_MS: f32 = 300.0; // Target ~300ms for low latency
+    const COMMA_PAUSE_DURATION_MS: f32 = 150.0; // Short pause → comma
+    const PERIOD_PAUSE_DURATION_MS: f32 = 300.0; // Long pause → period
 
     println!("Configuration:");
-    println!("  Stream chunk: {}ms", STREAM_CHUNK_SIZE as f32 / 16.0);
     println!("  Speech threshold: {}", SPEECH_THRESHOLD);
     println!("  Min speech: {}ms", MIN_SPEECH_DURATION_MS);
-    println!("  Silence threshold: {}ms (triggers transcription)\n", MIN_SILENCE_DURATION_MS);
+    println!("  Comma pause: {}ms (short pause)", COMMA_PAUSE_DURATION_MS);
+    println!("  Period pause: {}ms (long pause - triggers transcription)\n", PERIOD_PAUSE_DURATION_MS);
 
     println!("=== STREAMING TRANSCRIPTION ===\n");
 
-    // State for streaming processing
+    // State for streaming processing with pause-based punctuation
     let mut current_segment: Vec<f32> = Vec::new();
     let mut current_segment_start: Option<usize> = None;
+    let mut phrase_boundaries: Vec<usize> = Vec::new(); // Sample positions for comma insertion
     let mut silence_frames = 0;
     let mut total_samples_processed: usize = 0;
     let mut segment_count = 0;
@@ -147,7 +148,19 @@ fn main() -> Result<()> {
                     silence_frames += 1;
                     let silence_duration_ms = silence_frames as f32 * 32.0;
 
-                    if silence_duration_ms >= MIN_SILENCE_DURATION_MS {
+                    // Check for comma pause (short pause)
+                    if silence_duration_ms >= COMMA_PAUSE_DURATION_MS
+                        && silence_duration_ms < PERIOD_PAUSE_DURATION_MS
+                        && silence_frames == (COMMA_PAUSE_DURATION_MS / 32.0).ceil() as usize {
+                        // Mark phrase boundary for comma insertion
+                        let boundary_pos = current_segment.len();
+                        if boundary_pos > 0 {
+                            phrase_boundaries.push(boundary_pos);
+                        }
+                    }
+
+                    // Check for period pause (long pause - end segment)
+                    if silence_duration_ms >= PERIOD_PAUSE_DURATION_MS {
                         // End current segment and transcribe immediately
                         let start_sample = current_segment_start.unwrap();
                         let end_sample = total_samples_processed;
@@ -160,17 +173,48 @@ fn main() -> Result<()> {
                             let duration = end_time - start_time;
                             total_speech_duration += duration;
 
-                            // Transcribe immediately (streaming!)
-                            print!("[Segment {}] {:.2}s - {:.2}s ({:.2}s) - ",
-                                   segment_count, start_time, end_time, duration);
+                            // Transcribe with comma support
+                            print!("[Segment {}] {:.2}s - {:.2}s ({:.2}s, {} phrases) - ",
+                                   segment_count, start_time, end_time, duration, phrase_boundaries.len() + 1);
 
-                            let text = parakeet::transcribe_streaming_chunk(
-                                &current_segment,
-                                None,
-                                None,
-                                &model,
-                                &device,
-                            )?;
+                            // If we have phrase boundaries, split and transcribe each phrase
+                            let text = if !phrase_boundaries.is_empty() {
+                                let mut phrases = Vec::new();
+                                let mut start_idx = 0;
+
+                                for &boundary_pos in &phrase_boundaries {
+                                    if boundary_pos > start_idx && boundary_pos <= current_segment.len() {
+                                        let phrase_samples = &current_segment[start_idx..boundary_pos];
+                                        let raw_phrase = parakeet::transcribe_streaming_chunk(
+                                            phrase_samples, None, None, &model, &device
+                                        )?;
+                                        if !raw_phrase.is_empty() {
+                                            phrases.push(raw_phrase);
+                                        }
+                                        start_idx = boundary_pos;
+                                    }
+                                }
+
+                                // Final phrase
+                                if start_idx < current_segment.len() {
+                                    let final_phrase_samples = &current_segment[start_idx..];
+                                    let raw_phrase = parakeet::transcribe_streaming_chunk(
+                                        final_phrase_samples, None, None, &model, &device
+                                    )?;
+                                    if !raw_phrase.is_empty() {
+                                        phrases.push(raw_phrase);
+                                    }
+                                }
+
+                                let raw_text = phrases.join(" , ");
+                                parakeet::add_punctuation_internal(&raw_text, true)
+                            } else {
+                                // Single phrase
+                                let raw_text = parakeet::transcribe_streaming_chunk(
+                                    &current_segment, None, None, &model, &device
+                                )?;
+                                parakeet::add_punctuation(&raw_text)
+                            };
 
                             if !text.is_empty() {
                                 println!("\"{}\"", text);
@@ -181,6 +225,7 @@ fn main() -> Result<()> {
 
                         current_segment.clear();
                         current_segment_start = None;
+                        phrase_boundaries.clear();
                         silence_frames = 0;
                     }
                 }
@@ -209,16 +254,47 @@ fn main() -> Result<()> {
             let duration = end_time - start_time;
             total_speech_duration += duration;
 
-            print!("[Segment {}] {:.2}s - {:.2}s ({:.2}s) - ",
-                   segment_count, start_time, end_time, duration);
+            print!("[Segment {}] {:.2}s - {:.2}s ({:.2}s, {} phrases) - ",
+                   segment_count, start_time, end_time, duration, phrase_boundaries.len() + 1);
 
-            let text = parakeet::transcribe_streaming_chunk(
-                &current_segment,
-                None,
-                None,
-                &model,
-                &device,
-            )?;
+            // Transcribe with comma support
+            let text = if !phrase_boundaries.is_empty() {
+                let mut phrases = Vec::new();
+                let mut start_idx = 0;
+
+                for &boundary_pos in &phrase_boundaries {
+                    if boundary_pos > start_idx && boundary_pos <= current_segment.len() {
+                        let phrase_samples = &current_segment[start_idx..boundary_pos];
+                        let raw_phrase = parakeet::transcribe_streaming_chunk(
+                            phrase_samples, None, None, &model, &device
+                        )?;
+                        if !raw_phrase.is_empty() {
+                            phrases.push(raw_phrase);
+                        }
+                        start_idx = boundary_pos;
+                    }
+                }
+
+                // Final phrase
+                if start_idx < current_segment.len() {
+                    let final_phrase_samples = &current_segment[start_idx..];
+                    let raw_phrase = parakeet::transcribe_streaming_chunk(
+                        final_phrase_samples, None, None, &model, &device
+                    )?;
+                    if !raw_phrase.is_empty() {
+                        phrases.push(raw_phrase);
+                    }
+                }
+
+                let raw_text = phrases.join(" , ");
+                parakeet::add_punctuation_internal(&raw_text, true)
+            } else {
+                // Single phrase
+                let raw_text = parakeet::transcribe_streaming_chunk(
+                    &current_segment, None, None, &model, &device
+                )?;
+                parakeet::add_punctuation(&raw_text)
+            };
 
             if !text.is_empty() {
                 println!("\"{}\"", text);
@@ -236,8 +312,8 @@ fn main() -> Result<()> {
     println!("  Total audio: {:.2}s", total_duration_sec);
     println!("  Speech detected: {:.2}s ({:.1}%)", total_speech_duration, speech_percentage);
     println!("  Number of segments: {}", segment_count);
-    println!("  Average latency: ~{}ms (silence threshold)\n", MIN_SILENCE_DURATION_MS);
-    println!("✓ Streaming transcription complete!");
+    println!("  Average latency: ~{}ms (period pause threshold)\n", PERIOD_PAUSE_DURATION_MS);
+    println!("✓ Streaming transcription complete with pause-based punctuation!");
 
     Ok(())
 }
