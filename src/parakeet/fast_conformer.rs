@@ -10,11 +10,12 @@ use hf_hub::api::sync::Api;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
+#[cfg(feature = "quantized")]
 use std::io::{Read, Seek};
 use std::path::Path;
 use tokenizers::Tokenizer;
 
-// Embedded assets (configs/tokenizer - small files only)
+// Embedded assets (configs/tokenizer/models)
 use crate::embed_zst_asset;
 embed_zst_asset!(pub PARAKEET_CONFIG,                "config.json.zst");
 embed_zst_asset!(pub PARAKEET_TOKENIZER,             "tokenizer.json.zst");
@@ -22,6 +23,11 @@ embed_zst_asset!(pub PARAKEET_SPECIAL_TOKENS_MAP,    "special_tokens_map.json.zs
 embed_zst_asset!(pub PARAKEET_TOKENIZER_CONFIG,      "tokenizer_config.json.zst");
 embed_zst_asset!(pub VAD_CONFIG,                     "vad16.config.json.zst");
 embed_zst_asset!(pub VAD_MODEL,                      "vad16.safetensors.zst");
+
+// Model weights (large files)
+embed_zst_asset!(pub PARAKEET_MODEL_SAFETENSORS,     "model.safetensors.zst");
+embed_zst_asset!(pub PARAKEET_MODEL_Q8_0_GGUF,       "model_q8_0.gguf.zst");
+embed_zst_asset!(pub PARAKEET_MODEL_Q4K_GGUF,        "model_q4k.gguf.zst");
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct FastConformerConfig {
@@ -1243,6 +1249,7 @@ pub fn load_parakeet_ctc_from_local<P: AsRef<Path>>(
 /// let model = load_parakeet_ctc_from_gguf_hf("nvidia/parakeet-ctc-0.6b", "model_q8_0.gguf", &device)?;
 /// # Ok::<(), anyhow::Error>(())
 /// ```
+#[cfg(feature = "quantized")]
 pub fn load_parakeet_ctc_from_gguf_hf(
     repo_id: &str,
     gguf_filename: &str,
@@ -1259,6 +1266,20 @@ pub fn load_parakeet_ctc_from_gguf_hf(
     let tokenizer_path = repo.get("tokenizer.json")?;
 
     load_gguf_model_common(config_path, gguf_path, tokenizer_path, device)
+}
+
+/// Load Parakeet CTC model from safetensors (FP32 full-precision inference)
+#[cfg(not(feature = "quantized"))]
+pub fn load_parakeet_ctc_from_gguf_hf(
+    repo_id: &str,
+    _gguf_filename: &str,  // Ignored in FP32 mode
+    device: &Device,
+) -> Result<ParakeetFastConformerCtc> {
+    println!("Loading model from Hugging Face Hub (FP32 full-precision from safetensors)");
+    println!("  Repository: {}", repo_id);
+
+    // Use the existing safetensors loader for true FP32 weights
+    load_parakeet_ctc_from_hf(repo_id, device)
 }
 
 /// Load Parakeet CTC model from GGUF quantized weights stored locally
@@ -1279,6 +1300,7 @@ pub fn load_parakeet_ctc_from_gguf_hf(
 /// let model = load_parakeet_ctc_from_gguf_local("assets", &device)?;
 /// # Ok::<(), anyhow::Error>(())
 /// ```
+#[cfg(feature = "quantized")]
 pub fn load_parakeet_ctc_from_gguf_local<P: AsRef<Path>>(
     dir: P,
     device: &Device,
@@ -1312,52 +1334,21 @@ pub fn load_parakeet_ctc_from_gguf_local<P: AsRef<Path>>(
     let tokenizer = Tokenizer::from_bytes(tok_bytes)
         .map_err(|e| Error::new(ErrorKind::Other, format!("failed to parse PARAKEET_TOKENIZER: {e}")))?;
 
-    // Try Q8_0 first (recommended), then Q4K - try compressed (.zst) first, then uncompressed
-    let (gguf_path, is_compressed) = if assets.join("model_q8_0.gguf.zst").exists() {
-        println!("Loading Q8_0 quantized model (recommended, compressed)");
-        (assets.join("model_q8_0.gguf.zst"), true)
-    } else if assets.join("model_q8_0.gguf").exists() {
-        println!("Loading Q8_0 quantized model (recommended)");
-        (assets.join("model_q8_0.gguf"), false)
-    } else if assets.join("model_q4k.gguf.zst").exists() {
-        println!("Loading Q4K quantized model (high compression, compressed)");
-        (assets.join("model_q4k.gguf.zst"), true)
-    } else if assets.join("model_q4k.gguf").exists() {
-        println!("Loading Q4K quantized model (high compression)");
-        (assets.join("model_q4k.gguf"), false)
-    } else {
-        return Err(anyhow!(
-            "No GGUF file found in {:?}. Expected model_q8_0.gguf.zst, model_q8_0.gguf, model_q4k.gguf.zst, or model_q4k.gguf",
-            assets
-        ));
-    };
-
-    // Load GGUF file from disk (too large to embed), decompress if needed
-    println!("  Loading GGUF file...");
-    let mut gguf_file = if is_compressed {
-        // Decompress .zst file to tempfile (GGUF reader needs seekable stream)
-        println!("  Decompressing zstd...");
-        let compressed = fs::File::open(&gguf_path)?;
-        let mut decoder = zstd::Decoder::new(compressed)?;
-        let mut tmp = tempfile::tempfile()?;
-        std::io::copy(&mut decoder, &mut tmp)?;
-        tmp.seek(std::io::SeekFrom::Start(0))?;
-        tmp
-    } else {
-        // Read uncompressed file directly
-        fs::File::open(&gguf_path)?
-    };
+    // Load GGUF from embedded asset (already decompressed by embed_zst_asset macro)
+    println!("Loading Q8_0 quantized model (recommended, compressed)");
+    println!("  Loading GGUF file from assets...");
+    let gguf_bytes = PARAKEET_MODEL_Q8_0_GGUF.bytes(&assets).map_err(|_| {
+        Error::new(
+            ErrorKind::Other,
+            "failed to load PARAKEET_MODEL_Q8_0_GGUF",
+        )
+    })?;
 
     // Use quantized VarBuilder to keep weights quantized for faster inference
-    println!("  Creating quantized VarBuilder (keeps weights in Q8_0/Q4K format)...");
-
-    // Read GGUF content into memory for quantized_var_builder
-    gguf_file.seek(std::io::SeekFrom::Start(0))?;
-    let mut gguf_bytes = Vec::new();
-    std::io::Read::read_to_end(&mut gguf_file, &mut gguf_bytes)?;
+    println!("  Creating quantized VarBuilder (keeps weights in Q8_0 format)...");
 
     let vb = candle_transformers::quantized_var_builder::VarBuilder::from_gguf_buffer(
-        &gguf_bytes,
+        gguf_bytes,
         device,
     )?;
     println!("  ✓ Quantized VarBuilder created (weights stay quantized for speed)");
@@ -1369,7 +1360,53 @@ pub fn load_parakeet_ctc_from_gguf_local<P: AsRef<Path>>(
     Ok(model)
 }
 
+/// Load Parakeet CTC model from safetensors (FP32 full-precision inference)
+#[cfg(not(feature = "quantized"))]
+pub fn load_parakeet_ctc_from_gguf_local<P: AsRef<Path>>(
+    dir: P,
+    device: &Device,
+) -> Result<ParakeetFastConformerCtc> {
+    use std::io::{Error, ErrorKind};
+    let assets = dir.as_ref().to_path_buf();
+
+    println!("Loading model with FP32 full-precision inference (from safetensors)");
+
+    // Load config from embedded asset
+    let cfg_bytes = PARAKEET_CONFIG.bytes(&assets).map_err(|_| {
+        Error::new(ErrorKind::Other, "failed to load PARAKEET_CONFIG")
+    })?;
+    let hf_cfg: HfParakeetCtcConfig = serde_json::from_slice(cfg_bytes).map_err(|e| {
+        Error::new(ErrorKind::Other, format!("failed to parse config: {e}"))
+    })?;
+    let cfg = FastConformerConfig::from_hf(&hf_cfg);
+
+    // Load tokenizer from embedded asset
+    let tok_bytes = PARAKEET_TOKENIZER.bytes(&assets).map_err(|_| {
+        Error::new(ErrorKind::Other, "failed to load PARAKEET_TOKENIZER")
+    })?;
+    let tokenizer = Tokenizer::from_bytes(tok_bytes)
+        .map_err(|e| Error::new(ErrorKind::Other, format!("failed to parse tokenizer: {e}")))?;
+
+    // Load safetensors from embedded asset (already decompressed by embed_zst_asset macro)
+    println!("  Loading safetensors file from assets...");
+    let safetensors_bytes = PARAKEET_MODEL_SAFETENSORS.bytes(&assets).map_err(|_| {
+        Error::new(ErrorKind::Other, "failed to load PARAKEET_MODEL_SAFETENSORS")
+    })?;
+
+    // Create VarBuilder from safetensors bytes
+    println!("  Creating FP32 VarBuilder...");
+    let vb = VarBuilder::from_buffered_safetensors(safetensors_bytes.to_vec(), DType::F32, device)?;
+    println!("  ✓ FP32 VarBuilder created");
+
+    println!("  Building model...");
+    let model = ParakeetFastConformerCtc::new_with_tokenizer(cfg, vb, tokenizer)?;
+    println!("✓ Model loaded successfully (FP32 inference)\n");
+
+    Ok(model)
+}
+
 /// Common helper to load GGUF model from paths (using quantized inference)
+#[cfg(feature = "quantized")]
 fn load_gguf_model_common<P: AsRef<Path>>(
     config_path: P,
     gguf_path: P,
@@ -1408,3 +1445,4 @@ fn load_gguf_model_common<P: AsRef<Path>>(
 
     Ok(model)
 }
+

@@ -12,9 +12,9 @@ name = "main"           # !Dash
 path = "src/main.rs"    # !Dash
 
 [features]
-default = []
-quantized = []
-embed-assets = []
+default = ["quantized"]  # Quantized inference is default (faster)
+quantized = []            # Use quantized inference (QMatMul with Q8_0/Q4K weights)
+embed-assets = []         # Embed model assets in binary
 
 [dependencies]
 anyhow = "1"
