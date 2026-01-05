@@ -75,12 +75,14 @@ fn main() -> Result<()> {
     const VAD_CHUNK_SIZE: usize = 160; // 10ms at 16kHz for VAD processing
     const SPEECH_THRESHOLD: f32 = 0.5;
     const MIN_SPEECH_DURATION_MS: f32 = 250.0;
+    const PRE_BUFFER_MS: f32 = 300.0; // Pre-buffer to capture start of speech
     const COMMA_PAUSE_DURATION_MS: f32 = 150.0; // Short pause → comma
     const PERIOD_PAUSE_DURATION_MS: f32 = 300.0; // Long pause → period
 
     println!("Configuration:");
     println!("  Speech threshold: {}", SPEECH_THRESHOLD);
     println!("  Min speech: {}ms", MIN_SPEECH_DURATION_MS);
+    println!("  Pre-buffer: {}ms (captures start of speech)", PRE_BUFFER_MS);
     println!("  Comma pause: {}ms (short pause)", COMMA_PAUSE_DURATION_MS);
     println!("  Period pause: {}ms (long pause - triggers transcription)\n", PERIOD_PAUSE_DURATION_MS);
 
@@ -94,6 +96,11 @@ fn main() -> Result<()> {
     let mut total_samples_processed: usize = 0;
     let mut segment_count = 0;
     let mut total_speech_duration = 0.0f32;
+
+    // Pre-buffer to capture audio before speech detection (prevents cutting off start of speech)
+    // Keep 300ms of audio = 4800 samples at 16kHz
+    const PRE_BUFFER_SAMPLES: usize = (PRE_BUFFER_MS * 16.0) as usize;
+    let mut pre_buffer: std::collections::VecDeque<f32> = std::collections::VecDeque::with_capacity(PRE_BUFFER_SAMPLES);
 
     // Load all samples (but process/transcribe incrementally)
     let all_samples: Vec<f32> = match (spec.sample_format, spec.bits_per_sample) {
@@ -123,12 +130,23 @@ fn main() -> Result<()> {
     // Key insight: VAD probabilities indicate speech state, but we accumulate
     // samples independently based on that state, not per-probability
     let mut idx = 0;
-    let mut sample_idx = 0; // Track position in audio stream for sample accumulation
+    let mut sample_idx: usize = 0; // Track position in audio stream for sample accumulation
 
     while idx < all_samples.len() {
         let end = (idx + VAD_CHUNK_SIZE).min(all_samples.len());
         let chunk = &all_samples[idx..end];
         let probs = vad_stream.push(chunk)?;
+
+        // Add chunk to pre-buffer (circular buffer - keep last 300ms)
+        if current_segment_start.is_none() {
+            // Only maintain pre-buffer when not in active speech
+            for &sample in chunk {
+                if pre_buffer.len() >= PRE_BUFFER_SAMPLES {
+                    pre_buffer.pop_front();
+                }
+                pre_buffer.push_back(sample);
+            }
+        }
 
         // Process VAD probabilities to update speech state
         for prob in probs {
@@ -138,9 +156,15 @@ fn main() -> Result<()> {
                 silence_frames = 0;
 
                 if current_segment_start.is_none() {
-                    // Start new speech segment at current sample position
-                    current_segment_start = Some(sample_idx);
+                    // Start new speech segment
+                    // Calculate actual start position accounting for pre-buffer
+                    let pre_buffer_len = pre_buffer.len();
+                    current_segment_start = Some(sample_idx.saturating_sub(pre_buffer_len));
                     current_segment.clear();
+
+                    // Include pre-buffered audio to capture start of speech
+                    current_segment.extend(pre_buffer.iter().copied());
+                    pre_buffer.clear();
                 }
             } else {
                 // Silence detected

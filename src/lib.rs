@@ -157,6 +157,9 @@ struct SpeechInner {
     current_segment: Vec<f32>,
     current_segment_start: Option<f64>, // Start time in seconds
 
+    // Pre-buffer to capture audio before speech detection (300ms)
+    pre_buffer: std::collections::VecDeque<f32>,
+
     // Sub-segments (phrases) for comma insertion
     // Tracks sample positions where pauses occurred (comma boundaries)
     phrase_boundaries: Vec<usize>, // Sample indices where commas should go
@@ -168,6 +171,7 @@ struct SpeechInner {
     // Configuration (VAD mode)
     speech_threshold: f32,
     min_speech_duration_ms: f32,
+    pre_buffer_ms: f32,            // Pre-buffer duration (300ms)
     comma_pause_duration_ms: f32, // Short pause → comma (150ms)
     period_pause_duration_ms: f32, // Long pause → period (300ms)
 
@@ -197,17 +201,25 @@ impl SpeechInner {
         };
 
         info!("VAD mode: enabled (speech detection with pause-based punctuation)");
+
+        // Pre-buffer to capture audio before speech detection
+        let pre_buffer_ms = 300.0;
+        let pre_buffer_samples = (pre_buffer_ms * 16.0) as usize; // 4800 samples at 16kHz
+        let pre_buffer = std::collections::VecDeque::with_capacity(pre_buffer_samples);
+
         Ok(Self {
             vad_stream,
             parakeet_model,
             device,
             current_segment: Vec::new(),
             current_segment_start: None,
+            pre_buffer,
             phrase_boundaries: Vec::new(),
             total_samples_processed: 0,
             silence_frames: 0,
             speech_threshold: 0.5,
             min_speech_duration_ms: 250.0,
+            pre_buffer_ms,
             comma_pause_duration_ms: 150.0,  // Short pause → comma
             period_pause_duration_ms: 300.0, // Long pause → period/end segment
             debug_wav_writer,
@@ -249,6 +261,17 @@ impl SpeechInner {
             let probs = self.vad_stream.push(chunk)
                 .map_err(|e| napi::Error::from_reason(format!("VAD error: {}", e)))?;
 
+            // Add chunk to pre-buffer (circular buffer) if not in active speech
+            if self.current_segment_start.is_none() {
+                let pre_buffer_max = (self.pre_buffer_ms * 16.0) as usize;
+                for &sample in chunk {
+                    if self.pre_buffer.len() >= pre_buffer_max {
+                        self.pre_buffer.pop_front();
+                    }
+                    self.pre_buffer.push_back(sample);
+                }
+            }
+
             // Each probability corresponds to ~512 samples (32ms at 16kHz)
             for prob in probs {
                 let is_speech = prob >= self.speech_threshold;
@@ -258,10 +281,17 @@ impl SpeechInner {
 
                     if self.current_segment_start.is_none() {
                         // Start new speech segment
-                        let start_time = self.total_samples_processed as f64 / 16000.0;
+                        // Account for pre-buffer when calculating start time
+                        let pre_buffer_duration = self.pre_buffer.len() as f64 / 16000.0;
+                        let start_time = (self.total_samples_processed as f64 / 16000.0) - pre_buffer_duration;
                         self.current_segment_start = Some(start_time);
                         self.current_segment.clear();
-                        info!("VAD: Speech started at {:.3}s (prob={:.3})", start_time, prob);
+
+                        // Include pre-buffered audio to capture start of speech
+                        self.current_segment.extend(self.pre_buffer.iter().copied());
+                        info!("VAD: Speech started at {:.3}s (prob={:.3}, pre-buffer={}ms)",
+                              start_time, prob, pre_buffer_duration * 1000.0);
+                        self.pre_buffer.clear();
                     }
                 } else {
                     // Silence detected
