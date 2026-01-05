@@ -9,7 +9,7 @@
 ///   PARAKEET_DEVICE=cpu cargo run --example transcribe_quantized --release -- dots.wav
 
 use anyhow::Result;
-use parakeet::{get_device, load_parakeet_ctc_from_gguf_local};
+use speech::parakeet::{get_device, load_parakeet_ctc_from_gguf_local};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -17,10 +17,10 @@ fn main() -> Result<()> {
     if args.len() < 2 {
         eprintln!("Usage: {} <audio.wav>", args[0]);
         eprintln!("\nThis example uses GGUF quantized weights for fast inference.");
-        eprintln!("Expected files in hf_parakeet/:");
-        eprintln!("  - config.json");
-        eprintln!("  - model_q8_0.gguf (recommended) or model_q4k.gguf");
-        eprintln!("  - tokenizer.json");
+        eprintln!("Expected files in assets/:");
+        eprintln!("  - config.json.zst");
+        eprintln!("  - model_q8_0.gguf.zst (recommended) or model_q4k.gguf.zst");
+        eprintln!("  - tokenizer.json.zst");
         return Ok(());
     }
 
@@ -35,11 +35,11 @@ fn main() -> Result<()> {
 
     // Load quantized model (tries Q8_0 first, then Q4K)
     println!("Loading model from GGUF...");
-    let model = load_parakeet_ctc_from_gguf_local("hf_parakeet", &device)?;
+    let model = load_parakeet_ctc_from_gguf_local("assets", &device)?;
 
     // Load audio and extract features
     println!("Processing audio...");
-    let features = parakeet::load_wav_as_features(
+    let features = speech::parakeet::load_wav_as_features(
         audio_path,
         model.cfg.feat_in,
         &device

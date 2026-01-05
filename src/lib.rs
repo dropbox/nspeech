@@ -12,6 +12,7 @@ use log::{info, LevelFilter, Log, Metadata, Record};
 use napi::bindgen_prelude::{Function, Unknown};
 use napi::threadsafe_function::{ThreadsafeFunctionCallMode, ThreadsafeCallContext};
 use once_cell::sync::OnceCell;
+use hound::{WavWriter, WavSpec, SampleFormat};
 
 #[napi(object)]
 pub struct LogEvent {
@@ -160,10 +161,13 @@ struct SpeechInner {
     total_samples_processed: usize,
     silence_frames: usize,
 
-    // Configuration
+    // Configuration (VAD mode)
     speech_threshold: f32,
     min_speech_duration_ms: f32,
     min_silence_duration_ms: f32,
+
+    // Debug WAV writer
+    debug_wav_writer: Option<WavWriter<std::io::BufWriter<std::fs::File>>>,
 }
 
 impl SpeechInner {
@@ -175,6 +179,19 @@ impl SpeechInner {
         let vad_stream = VadStream::new(vad, &device)
             .map_err(|e| napi::Error::from_reason(format!("Failed to create VAD stream: {}", e)))?;
 
+        // Create debug WAV writer
+        let debug_wav_writer = match Self::create_debug_wav_writer() {
+            Ok(writer) => {
+                info!("Debug WAV writer created: debug_input.wav");
+                Some(writer)
+            }
+            Err(e) => {
+                info!("Failed to create debug WAV writer: {}", e);
+                None
+            }
+        };
+
+        info!("VAD mode: enabled (speech detection)");
         Ok(Self {
             vad_stream,
             parakeet_model,
@@ -186,10 +203,30 @@ impl SpeechInner {
             speech_threshold: 0.5,
             min_speech_duration_ms: 250.0,
             min_silence_duration_ms: 300.0,
+            debug_wav_writer,
         })
     }
 
+    fn create_debug_wav_writer() -> std::result::Result<WavWriter<std::io::BufWriter<std::fs::File>>, hound::Error> {
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+        };
+        WavWriter::create("debug_input.wav", spec)
+    }
+
     fn process_samples(&mut self, samples: &[f32]) -> Result<Vec<Transcription>> {
+        // Write incoming samples to debug WAV file
+        if let Some(ref mut writer) = self.debug_wav_writer {
+            for &sample in samples {
+                let _ = writer.write_sample(sample);
+            }
+            // Flush constantly as requested for debugging
+            let _ = writer.flush();
+        }
+
         let mut transcriptions = Vec::new();
 
         // Process through VAD in 160-sample chunks (10ms at 16kHz)
@@ -212,17 +249,17 @@ impl SpeechInner {
 
                     if self.current_segment_start.is_none() {
                         // Start new speech segment
-                        self.current_segment_start = Some(self.total_samples_processed as f64 / 16000.0);
+                        let start_time = self.total_samples_processed as f64 / 16000.0;
+                        self.current_segment_start = Some(start_time);
                         self.current_segment.clear();
+                        info!("VAD: Speech started at {:.3}s (prob={:.3})", start_time, prob);
                     }
 
-                    // Add samples to current segment (approximate - we add the chunk)
+                    // Add samples to current segment
+                    // Note: We accumulate the full chunk even though VAD probs correspond to ~512 samples
+                    // This ensures we capture all speech audio
                     if self.current_segment_start.is_some() {
-                        let segment_start = self.total_samples_processed.saturating_sub(chunk.len());
-                        let segment_end = self.total_samples_processed;
-                        if segment_start < samples.len() && segment_end <= samples.len() {
-                            self.current_segment.extend_from_slice(chunk);
-                        }
+                        self.current_segment.extend_from_slice(chunk);
                     }
                 } else {
                     // Silence detected
@@ -236,17 +273,32 @@ impl SpeechInner {
                             let end_time = self.total_samples_processed as f64 / 16000.0;
                             let duration_ms = (end_time - start_time) * 1000.0;
 
+                            info!("VAD: Speech ended at {:.3}s (duration={:.0}ms, samples={})",
+                                  end_time, duration_ms, self.current_segment.len());
+
                             if duration_ms >= self.min_speech_duration_ms as f64 {
                                 // Transcribe the accumulated segment
-                                if let Ok(text) = self.transcribe_segment() {
-                                    if !text.is_empty() {
-                                        transcriptions.push(Transcription {
-                                            text,
-                                            start_time,
-                                            end_time,
-                                        });
+                                info!("VAD: Transcribing segment {:.3}s-{:.3}s", start_time, end_time);
+                                match self.transcribe_segment() {
+                                    Ok(text) => {
+                                        if !text.is_empty() {
+                                            info!("VAD: Generated transcription: \"{}\"", text);
+                                            transcriptions.push(Transcription {
+                                                text,
+                                                start_time,
+                                                end_time,
+                                            });
+                                        } else {
+                                            info!("VAD: Transcription was empty (likely silence/noise)");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        info!("VAD: Transcription FAILED: {}", e);
                                     }
                                 }
+                            } else {
+                                info!("VAD: Segment too short ({:.0}ms < {:.0}ms), skipping",
+                                      duration_ms, self.min_speech_duration_ms);
                             }
 
                             self.current_segment.clear();
@@ -267,26 +319,28 @@ impl SpeechInner {
 
     fn transcribe_segment(&self) -> Result<String> {
         if self.current_segment.is_empty() {
+            info!("Transcribe: Segment is empty, returning empty string");
             return Ok(String::new());
         }
 
-        // Extract features from segment
-        let features = parakeet::extract_features_from_samples(
+        info!("Transcribe: Processing {} samples", self.current_segment.len());
+
+        // Use streaming transcription helper (no context for VAD segments)
+        let text = parakeet::transcribe_streaming_chunk(
             &self.current_segment,
-            self.parakeet_model.cfg.feat_in,
+            None, // No left context
+            None, // No right context
+            &self.parakeet_model,
             &self.device,
         )
-        .map_err(|e| napi::Error::from_reason(format!("Feature extraction error: {}", e)))?;
+        .map_err(|e| {
+            let err = format!("Transcription error: {}", e);
+            info!("Transcribe: ERROR - {}", err);
+            napi::Error::from_reason(err)
+        })?;
 
-        // Run inference
-        let logits = self.parakeet_model.forward(&features, false)
-            .map_err(|e| napi::Error::from_reason(format!("Inference error: {}", e)))?;
-
-        // Decode
-        let transcriptions = self.parakeet_model.greedy_decode(&logits)
-            .map_err(|e| napi::Error::from_reason(format!("Decoding error: {}", e)))?;
-
-        Ok(transcriptions.first().cloned().unwrap_or_default())
+        info!("Transcribe: Result length: {} chars", text.len());
+        Ok(text)
     }
 }
 
@@ -310,7 +364,10 @@ impl Task for TranscribeTask {
 
     /// Runs on main JS thread - emits results via callback
     fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        info!("Callback: Sending {} transcription(s) to JavaScript", output.len());
         for transcription in output {
+            info!("Callback: Emitting \"{}\", {:.3}s-{:.3}s",
+                  transcription.text, transcription.start_time, transcription.end_time);
             (self.callback)(transcription);
         }
         Ok(())
@@ -355,7 +412,7 @@ impl Speech {
 
         info!("Models loaded successfully");
 
-        // Create inner state
+        // Create inner state with VAD
         let inner = SpeechInner::new(vad, parakeet_model, device).unwrap();
 
         // Create threadsafe callback and wrap in Arc so it can be cloned for async tasks
