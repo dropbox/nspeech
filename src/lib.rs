@@ -167,13 +167,14 @@ struct SpeechInner {
     // Tracking
     total_samples_processed: usize,
     silence_frames: usize,
+    was_speech_last_frame: bool,  // Track speech->silence transitions
 
     // Configuration (VAD mode)
     speech_threshold: f32,
     min_speech_duration_ms: f32,
     pre_buffer_ms: f32,            // Pre-buffer duration (300ms)
     comma_pause_duration_ms: f32, // Short pause → comma (150ms)
-    period_pause_duration_ms: f32, // Long pause → period (300ms)
+    period_pause_duration_ms: f32, // Long pause → period (500ms - longer to avoid breaking natural speech)
 
     // Debug WAV writer
     debug_wav_writer: Option<WavWriter<std::io::BufWriter<std::fs::File>>>,
@@ -217,11 +218,12 @@ impl SpeechInner {
             phrase_boundaries: Vec::new(),
             total_samples_processed: 0,
             silence_frames: 0,
+            was_speech_last_frame: false,
             speech_threshold: 0.5,
             min_speech_duration_ms: 250.0,
             pre_buffer_ms,
             comma_pause_duration_ms: 150.0,  // Short pause → comma
-            period_pause_duration_ms: 300.0, // Long pause → period/end segment
+            period_pause_duration_ms: 500.0, // Long pause → period (increased to avoid breaking natural speech)
             debug_wav_writer,
         })
     }
@@ -261,23 +263,30 @@ impl SpeechInner {
             let probs = self.vad_stream.push(chunk)
                 .map_err(|e| napi::Error::from_reason(format!("VAD error: {}", e)))?;
 
-            // Add chunk to pre-buffer (circular buffer) if not in active speech
-            if self.current_segment_start.is_none() {
-                let pre_buffer_max = (self.pre_buffer_ms * 16.0) as usize;
-                for &sample in chunk {
-                    if self.pre_buffer.len() >= pre_buffer_max {
-                        self.pre_buffer.pop_front();
-                    }
-                    self.pre_buffer.push_back(sample);
-                }
-            }
-
             // Each probability corresponds to ~512 samples (32ms at 16kHz)
             for prob in probs {
                 let is_speech = prob >= self.speech_threshold;
 
                 if is_speech {
+                    // Check if speech is resuming after silence within an active segment
+                    if self.current_segment_start.is_some() && !self.was_speech_last_frame && self.silence_frames > 0 {
+                        // Speech resumed after a brief pause - prepend pre-buffer to capture start of resumed speech
+                        let pre_buffer_len = self.pre_buffer.len();
+                        if pre_buffer_len > 0 {
+                            info!("VAD: Speech resumed after {}ms pause, prepending {}ms pre-buffer",
+                                  self.silence_frames as f32 * 32.0, pre_buffer_len as f32 / 16.0);
+                            // Insert pre-buffer before the current position
+                            let insert_pos = self.current_segment.len();
+                            self.current_segment.reserve(pre_buffer_len);
+                            self.current_segment.extend(self.pre_buffer.iter().copied());
+                            // Rotate to put pre-buffer before current position
+                            self.current_segment[insert_pos..].rotate_right(pre_buffer_len);
+                        }
+                        self.pre_buffer.clear();
+                    }
+
                     self.silence_frames = 0;
+                    self.was_speech_last_frame = true;
 
                     if self.current_segment_start.is_none() {
                         // Start new speech segment
@@ -294,6 +303,7 @@ impl SpeechInner {
                         self.pre_buffer.clear();
                     }
                 } else {
+                    self.was_speech_last_frame = false;
                     // Silence detected
                     if self.current_segment_start.is_some() {
                         self.silence_frames += 1;
@@ -356,6 +366,18 @@ impl SpeechInner {
                 }
 
                 self.total_samples_processed += 512;
+            }
+
+            // Always maintain pre-buffer during silence (even within an active segment)
+            // This ensures we capture the start of resumed speech after brief pauses
+            if !self.was_speech_last_frame {
+                let pre_buffer_max = (self.pre_buffer_ms * 16.0) as usize;
+                for &sample in chunk {
+                    if self.pre_buffer.len() >= pre_buffer_max {
+                        self.pre_buffer.pop_front();
+                    }
+                    self.pre_buffer.push_back(sample);
+                }
             }
 
             // Accumulate chunk samples if we're in an active speech segment

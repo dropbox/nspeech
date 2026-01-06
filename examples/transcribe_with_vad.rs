@@ -77,12 +77,12 @@ fn main() -> Result<()> {
     const MIN_SPEECH_DURATION_MS: f32 = 250.0;
     const PRE_BUFFER_MS: f32 = 300.0; // Pre-buffer to capture start of speech
     const COMMA_PAUSE_DURATION_MS: f32 = 150.0; // Short pause → comma
-    const PERIOD_PAUSE_DURATION_MS: f32 = 300.0; // Long pause → period
+    const PERIOD_PAUSE_DURATION_MS: f32 = 500.0; // Long pause → period (increased to avoid breaking natural speech)
 
     println!("Configuration:");
     println!("  Speech threshold: {}", SPEECH_THRESHOLD);
     println!("  Min speech: {}ms", MIN_SPEECH_DURATION_MS);
-    println!("  Pre-buffer: {}ms (captures start of speech)", PRE_BUFFER_MS);
+    println!("  Pre-buffer: {}ms (captures start of speech + resumed speech)", PRE_BUFFER_MS);
     println!("  Comma pause: {}ms (short pause)", COMMA_PAUSE_DURATION_MS);
     println!("  Period pause: {}ms (long pause - triggers transcription)\n", PERIOD_PAUSE_DURATION_MS);
 
@@ -93,6 +93,7 @@ fn main() -> Result<()> {
     let mut current_segment_start: Option<usize> = None;
     let mut phrase_boundaries: Vec<usize> = Vec::new(); // Sample positions for comma insertion
     let mut silence_frames = 0;
+    let mut was_speech_last_frame = false; // Track speech->silence transitions
     let mut total_samples_processed: usize = 0;
     let mut segment_count = 0;
     let mut total_speech_duration = 0.0f32;
@@ -137,23 +138,28 @@ fn main() -> Result<()> {
         let chunk = &all_samples[idx..end];
         let probs = vad_stream.push(chunk)?;
 
-        // Add chunk to pre-buffer (circular buffer - keep last 300ms)
-        if current_segment_start.is_none() {
-            // Only maintain pre-buffer when not in active speech
-            for &sample in chunk {
-                if pre_buffer.len() >= PRE_BUFFER_SAMPLES {
-                    pre_buffer.pop_front();
-                }
-                pre_buffer.push_back(sample);
-            }
-        }
-
         // Process VAD probabilities to update speech state
         for prob in probs {
             let is_speech = prob >= SPEECH_THRESHOLD;
 
             if is_speech {
+                // Check if speech is resuming after silence within an active segment
+                if current_segment_start.is_some() && !was_speech_last_frame && silence_frames > 0 {
+                    // Speech resumed after a brief pause - prepend pre-buffer to capture start of resumed speech
+                    let pre_buffer_len = pre_buffer.len();
+                    if pre_buffer_len > 0 {
+                        // Insert pre-buffer before the current position
+                        let insert_pos = current_segment.len();
+                        current_segment.reserve(pre_buffer_len);
+                        current_segment.extend(pre_buffer.iter().copied());
+                        // Rotate to put pre-buffer before current position
+                        current_segment[insert_pos..].rotate_right(pre_buffer_len);
+                    }
+                    pre_buffer.clear();
+                }
+
                 silence_frames = 0;
+                was_speech_last_frame = true;
 
                 if current_segment_start.is_none() {
                     // Start new speech segment
@@ -167,6 +173,7 @@ fn main() -> Result<()> {
                     pre_buffer.clear();
                 }
             } else {
+                was_speech_last_frame = false;
                 // Silence detected
                 if current_segment_start.is_some() {
                     silence_frames += 1;
@@ -256,6 +263,17 @@ fn main() -> Result<()> {
             }
 
             total_samples_processed += 512;
+        }
+
+        // Always maintain pre-buffer during silence (even within an active segment)
+        // This ensures we capture the start of resumed speech after brief pauses
+        if !was_speech_last_frame {
+            for &sample in chunk {
+                if pre_buffer.len() >= PRE_BUFFER_SAMPLES {
+                    pre_buffer.pop_front();
+                }
+                pre_buffer.push_back(sample);
+            }
         }
 
         // Accumulate chunk samples if we're in an active speech segment
