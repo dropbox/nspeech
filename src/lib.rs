@@ -156,11 +156,6 @@ struct SpeechInner {
     parakeet_model: parakeet::ParakeetCtc,
     device: candle_core::Device,
 
-    // Streaming buffer for continuous updates
-    streaming_buffer: streaming_buffer::StreamingBuffer,
-    block_duration_samples: usize, // How often to transcribe (750ms default)
-    samples_since_transcribe: usize,
-
     // Accumulated samples for current speech segment (VAD-based)
     current_segment: Vec<f32>,
     current_segment_start: Option<f64>, // Start time in seconds
@@ -212,28 +207,16 @@ impl SpeechInner {
         };
 
         info!("VAD mode: enabled (speech detection with pause-based punctuation)");
-        info!("Streaming mode: enabled (continuous buffer updates every 750ms)");
 
         // Pre-buffer to capture audio before speech detection
         let pre_buffer_ms = 300.0;
         let pre_buffer_samples = (pre_buffer_ms * 16.0) as usize; // 4800 samples at 16kHz
         let pre_buffer = std::collections::VecDeque::with_capacity(pre_buffer_samples);
 
-        // Streaming buffer configuration (matches index.html)
-        let max_buffer_secs = 10.0; // 10 second rolling window
-        let overlap_secs = 0.25;     // 250ms overlap
-        let streaming_buffer = streaming_buffer::StreamingBuffer::new(max_buffer_secs, overlap_secs, 16000);
-
-        // Transcribe every 750ms (matches index.html BLOCK_DURATION)
-        let block_duration_samples = (0.75 * 16000.0) as usize; // 12000 samples
-
         Ok(Self {
             vad_stream,
             parakeet_model,
             device,
-            streaming_buffer,
-            block_duration_samples,
-            samples_since_transcribe: 0,
             current_segment: Vec::new(),
             current_segment_start: None,
             pre_buffer,
@@ -317,59 +300,6 @@ impl SpeechInner {
 
         // Update last audio time
         self.last_audio_time = std::time::Instant::now();
-
-        // Add samples to streaming buffer for continuous updates
-        let should_commit = self.streaming_buffer.push_samples(samples);
-        self.samples_since_transcribe += samples.len();
-
-        // Check if it's time to transcribe the rolling buffer (every 750ms)
-        if self.samples_since_transcribe >= self.block_duration_samples {
-            let buffer = self.streaming_buffer.get_buffer();
-            if !buffer.is_empty() {
-                let buffer_duration = self.streaming_buffer.buffer_duration_secs(16000);
-                let start_time = (self.total_samples_processed as f64 / 16000.0) - buffer_duration as f64;
-                let end_time = self.total_samples_processed as f64 / 16000.0;
-
-                info!("Streaming: Transcribing buffer ({:.2}s)", buffer_duration);
-
-                // Transcribe the rolling buffer
-                match parakeet::transcribe_streaming_chunk(
-                    &buffer,
-                    None,
-                    None,
-                    &self.parakeet_model,
-                    &self.device,
-                ) {
-                    Ok(raw_text) => {
-                        if !raw_text.is_empty() {
-                            let text = parakeet::add_punctuation(&raw_text);
-                            info!("Streaming: Update - \"{}\"", text);
-
-                            // Update streaming buffer's current line
-                            self.streaming_buffer.update_current_line(text.clone());
-
-                            // Invoke callback immediately
-                            callback(Transcription {
-                                text,
-                                start_time,
-                                end_time,
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        info!("Streaming: Transcription error: {}", e);
-                    }
-                }
-            }
-
-            self.samples_since_transcribe = 0;
-
-            // Handle buffer commit if rolling window is full
-            if should_commit {
-                info!("Streaming: Buffer full, committing line");
-                self.streaming_buffer.commit_and_trim(samples.len());
-            }
-        }
 
         // Process through VAD in 160-sample chunks (10ms at 16kHz)
         // Key: VAD probabilities indicate speech state, but we accumulate samples
@@ -606,44 +536,7 @@ impl SpeechInner {
     where
         F: Fn(Transcription),
     {
-        let mut transcription_count = 0;
-
-        // First, flush the streaming buffer if it has content
-        let buffer = self.streaming_buffer.get_buffer();
-        if !buffer.is_empty() {
-            let buffer_duration = self.streaming_buffer.buffer_duration_secs(16000);
-            let start_time = (self.total_samples_processed as f64 / 16000.0) - buffer_duration as f64;
-            let end_time = self.total_samples_processed as f64 / 16000.0;
-
-            info!("Flush: Transcribing streaming buffer ({:.2}s)", buffer_duration);
-
-            match parakeet::transcribe_streaming_chunk(
-                &buffer,
-                None,
-                None,
-                &self.parakeet_model,
-                &self.device,
-            ) {
-                Ok(raw_text) => {
-                    if !raw_text.is_empty() {
-                        let text = parakeet::add_punctuation(&raw_text);
-                        info!("Flush: Streaming buffer - \"{}\"", text);
-
-                        callback(Transcription {
-                            text,
-                            start_time,
-                            end_time,
-                        });
-                        transcription_count += 1;
-                    }
-                }
-                Err(e) => {
-                    info!("Flush: Streaming buffer transcription error: {}", e);
-                }
-            }
-        }
-
-        // Also flush VAD-based segment if present
+        // Flush VAD-based segment if present
         if let Some(start_time) = self.current_segment_start {
             if !self.current_segment.is_empty() {
                 let end_time = self.total_samples_processed as f64 / 16000.0;
@@ -656,20 +549,26 @@ impl SpeechInner {
                     match self.transcribe_segment() {
                         Ok(text) => {
                             if !text.is_empty() {
-                                info!("Flush: VAD segment - \"{}\"", text);
+                                info!("Flush: Generated transcription: \"{}\"", text);
                                 callback(Transcription {
                                     text,
                                     start_time,
                                     end_time,
                                 });
-                                transcription_count += 1;
+                            } else {
+                                info!("Flush: Transcription was empty");
                             }
                         }
                         Err(e) => {
-                            info!("Flush: VAD segment transcription error: {}", e);
+                            info!("Flush: Transcription error: {}", e);
                         }
                     }
+                } else {
+                    info!("Flush: Segment too short ({:.0}ms < {:.0}ms), skipping",
+                          duration_ms, self.min_speech_duration_ms);
                 }
+            } else {
+                info!("Flush: No content in current segment");
             }
 
             // Clear VAD state
@@ -677,16 +576,8 @@ impl SpeechInner {
             self.current_segment_start = None;
             self.phrase_boundaries.clear();
             self.silence_frames = 0;
-        }
-
-        // Clear streaming buffer state
-        self.streaming_buffer.clear();
-        self.samples_since_transcribe = 0;
-
-        if transcription_count == 0 {
-            info!("Flush: No content to flush");
         } else {
-            info!("Flush: Invoked callback {} time(s)", transcription_count);
+            info!("Flush: No active segment");
         }
 
         Ok(())
