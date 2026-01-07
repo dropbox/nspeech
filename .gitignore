@@ -7,6 +7,8 @@ target
 __pycache__/
 *.pyc
 *.pyo
+env/
+venv/
 
 # Debug files
 *.bin

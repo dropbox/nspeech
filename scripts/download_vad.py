@@ -1,29 +1,150 @@
 """
 Download Silero VAD models and compress for deployment.
 
-The Silero VAD models need to be obtained from the official repository and
-converted to safetensors format. This script will compress existing VAD files
-or help you set them up.
+This script downloads the Silero VAD v4.0 model from GitHub in safetensors format
+and compresses it for use in the speech recognition system.
 
 Usage:
-  # If you already have vad16.safetensors and vad16.config.json:
   python scripts/download_vad.py
 
-  # This will compress them and copy to assets directory
+  # Or specify custom directories:
+  python scripts/download_vad.py --cache .cache/vad --assets assets
 
 The VAD model is small (~1.2 MB) and will be compressed to ~948 KB.
-
-To obtain the VAD model:
-1. Download from: https://github.com/snakers4/silero-vad
-2. Convert PyTorch JIT model to safetensors (or use existing converted version)
-3. Place vad16.safetensors and vad16.config.json in cache directory
+No PyTorch required - downloads safetensors directly.
 """
 
 import argparse
+import json
 import pathlib
 import shutil
 import subprocess
 import sys
+import urllib.request
+
+
+# Updated URL - files moved from files/ to src/silero_vad/data/
+# Using direct safetensors format (no PyTorch conversion needed)
+SILERO_VAD_URL = "https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad_16k.safetensors"
+
+SILERO_CONFIG = {
+    "model_type": "silero_vad",
+    "version": "4.0",
+    "sample_rate": 16000,
+    "min_speech_duration_ms": 250,
+    "min_silence_duration_ms": 100,
+    "speech_pad_ms": 30,
+    # STFT parameters (from GitHub model)
+    "hop_length": 128,           # 8ms hop at 16kHz (GitHub model uses 128)
+    "win_length": 256,           # 16ms window at 16kHz (basis kernel size)
+    "n_fft": 512,                # FFT size (258 bins = 512/2 + 2)
+    "stft_right_padding": 64,    # Reflection padding for streaming
+    # Encoder parameters
+    "encoder_padding": 1,        # Conv1d padding
+    # Streaming parameters
+    "context_size": 64,          # Context samples (4ms at 16kHz)
+    "chunk_size": 512            # Processing chunk (32ms at 16kHz)
+}
+
+
+def download_file(url: str, dest_path: pathlib.Path) -> None:
+    """Download a file from URL to dest_path."""
+    print(f"  Downloading {url}")
+    print(f"  → {dest_path.name}")
+
+    try:
+        with urllib.request.urlopen(url) as response:
+            total_size = int(response.headers.get('content-length', 0))
+            downloaded = 0
+            chunk_size = 8192
+
+            with open(dest_path, 'wb') as f:
+                while True:
+                    chunk = response.read(chunk_size)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+
+                    if total_size > 0:
+                        percent = (downloaded / total_size) * 100
+                        print(f"\r  Progress: {percent:.1f}%", end='', flush=True)
+
+            print()  # New line after progress
+
+    except Exception as e:
+        print(f"\n  ✗ Download failed: {e}")
+        raise
+
+
+def convert_github_safetensors(input_path: pathlib.Path, output_path: pathlib.Path) -> None:
+    """Convert GitHub safetensors format to expected tensor names."""
+    print(f"  Converting tensor names to expected format...")
+
+    try:
+        from safetensors import safe_open
+        from safetensors.torch import save_file
+        import torch
+    except ImportError:
+        print("  ✗ Missing dependencies. Install with:")
+        print("    pip install torch safetensors")
+        sys.exit(1)
+
+    # Load GitHub safetensors
+    tensors = {}
+    with safe_open(str(input_path), framework="pt", device="cpu") as f:
+        for key in f.keys():
+            tensors[key] = f.get_tensor(key)
+
+    # Map GitHub tensor names to expected names
+    name_mapping = {
+        # STFT basis (only weight, no bias)
+        "stft_conv.weight": "stft.forward_basis_buffer",
+
+        # Encoder convolutions (4 layers)
+        "conv1.weight": "enc.0.weight",
+        "conv1.bias": "enc.0.bias",
+        "conv2.weight": "enc.1.weight",
+        "conv2.bias": "enc.1.bias",
+        "conv3.weight": "enc.2.weight",
+        "conv3.bias": "enc.2.bias",
+        "conv4.weight": "enc.3.weight",
+        "conv4.bias": "enc.3.bias",
+
+        # RNN/LSTM weights
+        "lstm_cell.weight_ih": "rnn.weight_ih",
+        "lstm_cell.weight_hh": "rnn.weight_hh",
+        "lstm_cell.bias_ih": "rnn.bias_ih",
+        "lstm_cell.bias_hh": "rnn.bias_hh",
+
+        # Head (output layer)
+        "final_conv.weight": "head.weight",
+        "final_conv.bias": "head.bias",
+    }
+
+    # Create mapped state dict
+    mapped_tensors = {}
+    for old_name, tensor in tensors.items():
+        if old_name in name_mapping:
+            new_name = name_mapping[old_name]
+            mapped_tensors[new_name] = tensor
+            print(f"    {old_name} → {new_name}")
+        else:
+            print(f"    Warning: Unmapped tensor: {old_name}")
+
+    # Verify all expected tensors are present
+    expected_tensors = set(name_mapping.values())
+    found_tensors = set(mapped_tensors.keys())
+    missing = expected_tensors - found_tensors
+    if missing:
+        print(f"  ✗ Missing expected tensors: {missing}")
+        sys.exit(1)
+
+    # Save with mapped names
+    save_file(mapped_tensors, str(output_path))
+
+    size_mb = output_path.stat().st_size / (1024 * 1024)
+    print(f"  ✓ Converted safetensors ({size_mb:.2f} MB)")
 
 
 def compress_file(input_path: pathlib.Path, output_path: pathlib.Path) -> None:
@@ -35,15 +156,21 @@ def compress_file(input_path: pathlib.Path, output_path: pathlib.Path) -> None:
             text=True,
             check=True,
         )
-        if result.stderr:
-            for line in result.stderr.split('\n'):
-                if input_path.name in line and ':' in line:
-                    print(f"    {line.strip()}")
+
+        compressed_size = output_path.stat().st_size / 1024
+        original_size = input_path.stat().st_size / 1024
+        ratio = (1 - compressed_size / original_size) * 100
+
+        print(f"  ✓ {input_path.name} → {output_path.name}")
+        print(f"    {original_size:.1f} KB → {compressed_size:.1f} KB ({ratio:.1f}% smaller)")
+
     except subprocess.CalledProcessError as e:
         print(f"  ✗ Compression failed: {e}")
         raise
     except FileNotFoundError:
-        print(f"  ✗ zstd command not found. Install with: brew install zstd")
+        print(f"  ✗ zstd command not found. Install with:")
+        print(f"    macOS:  brew install zstd")
+        print(f"    Ubuntu: sudo apt install zstd")
         raise
 
 
@@ -61,6 +188,11 @@ def main() -> None:
         default="assets",
         help="Assets directory for final compressed files (default: assets)",
     )
+    parser.add_argument(
+        "--skip-download",
+        action="store_true",
+        help="Skip download if files already exist in cache",
+    )
     args = parser.parse_args()
 
     # Determine cache directory
@@ -74,89 +206,78 @@ def main() -> None:
     assets_dir = pathlib.Path(args.assets)
 
     print("Silero VAD Model Download & Setup")
-    print("=" * 40)
+    print("=" * 60)
     print(f"Cache:  {cache_dir}")
     print(f"Assets: {assets_dir}\n")
 
-    # Create cache directory
+    # Create directories
     cache_dir.mkdir(parents=True, exist_ok=True)
-
-    # Check if files already exist in cache or assets
-    model_path = cache_dir / "vad16.safetensors"
-    config_path = cache_dir / "vad16.config.json"
-
-    # If not in cache, check assets directory (user might have them there already)
-    if not model_path.exists():
-        assets_model = assets_dir / "vad16.safetensors"
-        if assets_model.exists():
-            print("Found existing VAD model in assets, copying to cache...")
-            shutil.copy2(assets_model, model_path)
-
-    if not config_path.exists():
-        assets_config = assets_dir / "vad16.config.json"
-        if assets_config.exists():
-            print("Found existing VAD config in assets, copying to cache...")
-            shutil.copy2(assets_config, config_path)
-
-    # Check if we have the files now
-    if not model_path.exists() or not config_path.exists():
-        print("✗ VAD model files not found in cache or assets")
-        print("\nTo use this script, you need to obtain the Silero VAD model:")
-        print("  1. Download from: https://github.com/snakers4/silero-vad")
-        print("  2. Convert to safetensors format (or obtain pre-converted version)")
-        print("  3. Place the files in the cache directory:")
-        print(f"     {cache_dir}/vad16.safetensors")
-        print(f"     {cache_dir}/vad16.config.json")
-        print("\nOr place them directly in assets and re-run this script.")
-        sys.exit(1)
-
-    model_size_mb = model_path.stat().st_size / (1024 * 1024)
-    config_size_b = config_path.stat().st_size
-
-    print(f"✓ Found VAD files:")
-    print(f"  vad16.safetensors ({model_size_mb:.2f} MB)")
-    print(f"  vad16.config.json ({config_size_b} B)\n")
-
-    # Compress files
-    print("Compressing with zstd (level 19)...")
-
-    compressed_files = []
-
-    # Compress model
-    model_zst = cache_dir / "vad16.safetensors.zst"
-    print(f"  ✓ {model_path.name} -> {model_zst.name}")
-    compress_file(model_path, model_zst)
-    compressed_files.append(model_zst)
-
-    # Compress config
-    config_zst = cache_dir / "vad16.config.json.zst"
-    print(f"  ✓ {config_path.name} -> {config_zst.name}")
-    compress_file(config_path, config_zst)
-    compressed_files.append(config_zst)
-
-    # Copy compressed files to assets directory
-    print(f"\nCopying compressed files to assets: {assets_dir}")
     assets_dir.mkdir(parents=True, exist_ok=True)
 
-    for src_file in compressed_files:
-        dst_file = assets_dir / src_file.name
-        print(f"  ✓ Copying {src_file.name}")
-        shutil.copy2(src_file, dst_file)
+    # File paths
+    github_model_path = cache_dir / "silero_vad_16k_github.safetensors"  # Downloaded from GitHub
+    model_path = cache_dir / "vad16.safetensors"  # Converted format
+    config_path = cache_dir / "vad16.config.json"
+
+    # Check if files exist in project root (already present in repo)
+    project_root = pathlib.Path(__file__).parent.parent
+    root_model = project_root / "vad16.safetensors"
+    root_config = project_root / "vad16.config.json"
+
+    # Copy from project root to cache if they exist there
+    if root_model.exists() and not model_path.exists():
+        print("Step 1: Found VAD model in project root, copying to cache...")
+        shutil.copy2(root_model, model_path)
+        size_mb = model_path.stat().st_size / (1024 * 1024)
+        print(f"  ✓ Copied vad16.safetensors ({size_mb:.2f} MB)\n")
+    elif model_path.exists():
+        size_mb = model_path.stat().st_size / (1024 * 1024)
+        print(f"Step 1: Using cached safetensors: {model_path} ({size_mb:.2f} MB)\n")
+    else:
+        # Download and convert GitHub safetensors
+        print("Step 1: Downloading Silero VAD v4.0 safetensors model...")
+        print("  Note: If download fails, you can manually place vad16.safetensors in the project root")
+        download_file(SILERO_VAD_URL, github_model_path)
+        print("\nStep 2: Converting tensor names to expected format...")
+        convert_github_safetensors(github_model_path, model_path)
+        size_mb = model_path.stat().st_size / (1024 * 1024)
+        print(f"  ✓ Model ready ({size_mb:.2f} MB)\n")
+
+    if root_config.exists() and not config_path.exists():
+        print("Step 3: Found VAD config in project root, copying to cache...")
+        shutil.copy2(root_config, config_path)
+        print(f"  ✓ Copied vad16.config.json\n")
+    elif not config_path.exists():
+        print("Step 3: Creating config file...")
+        with open(config_path, 'w') as f:
+            json.dump(SILERO_CONFIG, f, indent=2)
+        print(f"  ✓ Created {config_path.name}\n")
+    else:
+        print(f"Step 3: Using cached config: {config_path}\n")
+
+    # Compress files
+    print("Step 4: Compressing with zstd (level 19)...")
+
+    model_zst = assets_dir / "vad16.safetensors.zst"
+    compress_file(model_path, model_zst)
+
+    config_zst = assets_dir / "vad16.config.json.zst"
+    compress_file(config_path, config_zst)
 
     # Summary
-    print("\n" + "=" * 40)
+    print("\n" + "=" * 60)
     print("✓ Setup complete!")
     print(f"\nCache directory: {cache_dir}")
-    print(f"  - Original vad16.safetensors and vad16.config.json kept for future use")
+    print("  - Original files kept for future use")
+
     print(f"\nAssets directory: {assets_dir}")
-    print(f"  - Only compressed .zst files needed for inference")
-    print("\nAssets contents:")
+    print("  - Compressed .zst files ready for inference:")
     for p in sorted(assets_dir.glob("vad*.zst")):
         size_kb = p.stat().st_size / 1024
-        print(f"  - {p.name} ({size_kb:.1f} KB)")
+        print(f"    • {p.name} ({size_kb:.1f} KB)")
 
-    print("\nTo use in your code:")
-    print(f"  let vad = SileroVad::load(\"{args.assets}\", &device)?;")
+    print("\nYou can now run:")
+    print("  cargo run --release --features quantized --example transcribe_with_vad -- audio.wav")
 
 
 if __name__ == "__main__":
