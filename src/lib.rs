@@ -480,6 +480,62 @@ impl SpeechInner {
             Ok(text)
         }
     }
+
+    fn flush(&mut self) -> Result<Option<Transcription>> {
+        // If there's no active speech segment, nothing to flush
+        if self.current_segment_start.is_none() || self.current_segment.is_empty() {
+            info!("Flush: No active segment to flush");
+            return Ok(None);
+        }
+
+        let start_time = self.current_segment_start.unwrap();
+        let end_time = self.total_samples_processed as f64 / 16000.0;
+        let duration_ms = (end_time - start_time) * 1000.0;
+
+        info!("Flush: Forcing transcription of active segment {:.3}s-{:.3}s (duration={:.0}ms, samples={}, phrases={})",
+              start_time, end_time, duration_ms, self.current_segment.len(), self.phrase_boundaries.len() + 1);
+
+        if duration_ms >= self.min_speech_duration_ms as f64 {
+            // Transcribe the accumulated segment
+            match self.transcribe_segment() {
+                Ok(text) => {
+                    if !text.is_empty() {
+                        info!("Flush: Generated transcription: \"{}\"", text);
+                        let transcription = Transcription {
+                            text,
+                            start_time,
+                            end_time,
+                        };
+
+                        // Clear state
+                        self.current_segment.clear();
+                        self.current_segment_start = None;
+                        self.phrase_boundaries.clear();
+                        self.silence_frames = 0;
+
+                        return Ok(Some(transcription));
+                    } else {
+                        info!("Flush: Transcription was empty (likely silence/noise)");
+                    }
+                }
+                Err(e) => {
+                    info!("Flush: Transcription FAILED: {}", e);
+                    return Err(e);
+                }
+            }
+        } else {
+            info!("Flush: Segment too short ({:.0}ms < {:.0}ms), skipping",
+                  duration_ms, self.min_speech_duration_ms);
+        }
+
+        // Clear state even if we didn't transcribe
+        self.current_segment.clear();
+        self.current_segment_start = None;
+        self.phrase_boundaries.clear();
+        self.silence_frames = 0;
+
+        Ok(None)
+    }
 }
 
 /// Async task for processing audio samples in the background
@@ -507,6 +563,36 @@ impl Task for TranscribeTask {
             info!("Callback: Emitting \"{}\", {:.3}s-{:.3}s",
                   transcription.text, transcription.start_time, transcription.end_time);
             (self.callback)(transcription);
+        }
+        Ok(())
+    }
+}
+
+/// Async task for flushing accumulated speech segment
+struct FlushTask {
+    inner: Arc<Mutex<SpeechInner>>,
+    callback: Arc<Box<dyn Fn(Transcription) + Send + Sync>>,
+}
+
+impl Task for FlushTask {
+    type Output = Option<Transcription>;
+    type JsValue = ();
+
+    /// Runs on background thread - forces transcription of current segment
+    fn compute(&mut self) -> Result<Self::Output> {
+        let mut inner = self.inner.lock()
+            .map_err(|e| napi::Error::from_reason(format!("Lock error: {}", e)))?;
+        inner.flush()
+    }
+
+    /// Runs on main JS thread - emits result via callback if present
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        if let Some(transcription) = output {
+            info!("Flush callback: Emitting \"{}\", {:.3}s-{:.3}s",
+                  transcription.text, transcription.start_time, transcription.end_time);
+            (self.callback)(transcription);
+        } else {
+            info!("Flush callback: No segment to flush");
         }
         Ok(())
     }
@@ -580,6 +666,22 @@ impl Speech {
         let task = TranscribeTask {
             inner: Arc::clone(&self.inner),
             samples: samples_f32,
+            callback: Arc::clone(&self.callback),
+        };
+
+        // Spawn task on background thread - returns immediately
+        env.spawn(task)?;
+
+        Ok(())
+    }
+
+    #[napi]
+    pub fn flush(&self, env: Env) -> Result<()> {
+        info!("flush: forcing transcription of current segment (async)");
+
+        // Create async task with cloned Arc references
+        let task = FlushTask {
+            inner: Arc::clone(&self.inner),
             callback: Arc::clone(&self.callback),
         };
 
