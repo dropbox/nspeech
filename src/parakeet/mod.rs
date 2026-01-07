@@ -148,7 +148,11 @@ pub fn add_punctuation_internal(text: &str, comma_separated: bool) -> String {
         return String::new();
     }
 
-    // Common proper nouns to capitalize (expandable)
+    // Common proper nouns to capitalize (very limited - not a comprehensive solution)
+    // TODO: Replace with proper capitalization model like:
+    //   - truecaser/recaser neural model
+    //   - language model based capitalization
+    //   - or use a different ASR model that outputs capitalization
     let proper_nouns = [
         "i", "americans", "america", "american", "god", "jesus", "christ",
         "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",

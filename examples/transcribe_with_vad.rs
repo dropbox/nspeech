@@ -238,12 +238,14 @@ fn main() -> Result<()> {
                                 }
 
                                 let raw_text = phrases.join(" , ");
+                                eprintln!("DEBUG: Raw model output: \"{}\"", raw_text);
                                 parakeet::add_punctuation_internal(&raw_text, true)
                             } else {
                                 // Single phrase
                                 let raw_text = parakeet::transcribe_streaming_chunk(
                                     &current_segment, None, None, &model, &device
                                 )?;
+                                eprintln!("DEBUG: Raw model output: \"{}\"", raw_text);
                                 parakeet::add_punctuation(&raw_text)
                             };
 
@@ -329,12 +331,14 @@ fn main() -> Result<()> {
                 }
 
                 let raw_text = phrases.join(" , ");
+                eprintln!("DEBUG: Raw model output: \"{}\"", raw_text);
                 parakeet::add_punctuation_internal(&raw_text, true)
             } else {
                 // Single phrase
                 let raw_text = parakeet::transcribe_streaming_chunk(
                     &current_segment, None, None, &model, &device
                 )?;
+                eprintln!("DEBUG: Raw model output: \"{}\"", raw_text);
                 parakeet::add_punctuation(&raw_text)
             };
 

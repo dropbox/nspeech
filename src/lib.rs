@@ -1,11 +1,11 @@
 /* Node module API for Parakeet Speech Recognition */
 
-use napi::{Env, Result, Task};
+use napi::Result;
 use napi_derive::napi;
 
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
 };
 
 use log::{info, LevelFilter, Log, Metadata, Record};
@@ -139,6 +139,9 @@ pub mod parakeet;
 pub mod silero;
 use silero::{SileroVad, VadStream};
 
+// Streaming buffer module (shared between Node.js and CLI examples)
+pub mod streaming_buffer;
+
 /// Transcription result with timestamp
 #[napi(object)]
 pub struct Transcription {
@@ -153,7 +156,12 @@ struct SpeechInner {
     parakeet_model: parakeet::ParakeetCtc,
     device: candle_core::Device,
 
-    // Accumulated samples for current speech segment
+    // Streaming buffer for continuous updates
+    streaming_buffer: streaming_buffer::StreamingBuffer,
+    block_duration_samples: usize, // How often to transcribe (750ms default)
+    samples_since_transcribe: usize,
+
+    // Accumulated samples for current speech segment (VAD-based)
     current_segment: Vec<f32>,
     current_segment_start: Option<f64>, // Start time in seconds
 
@@ -168,6 +176,7 @@ struct SpeechInner {
     total_samples_processed: usize,
     silence_frames: usize,
     was_speech_last_frame: bool,  // Track speech->silence transitions
+    last_audio_time: std::time::Instant, // Track when we last received audio
 
     // Configuration (VAD mode)
     speech_threshold: f32,
@@ -175,6 +184,7 @@ struct SpeechInner {
     pre_buffer_ms: f32,            // Pre-buffer duration (300ms)
     comma_pause_duration_ms: f32, // Short pause → comma (150ms)
     period_pause_duration_ms: f32, // Long pause → period (500ms - longer to avoid breaking natural speech)
+    silence_timeout_ms: f32,       // Very long pause → auto-flush (2000ms - end of turn)
 
     // Debug WAV writer
     debug_wav_writer: Option<WavWriter<std::io::BufWriter<std::fs::File>>>,
@@ -202,16 +212,28 @@ impl SpeechInner {
         };
 
         info!("VAD mode: enabled (speech detection with pause-based punctuation)");
+        info!("Streaming mode: enabled (continuous buffer updates every 750ms)");
 
         // Pre-buffer to capture audio before speech detection
         let pre_buffer_ms = 300.0;
         let pre_buffer_samples = (pre_buffer_ms * 16.0) as usize; // 4800 samples at 16kHz
         let pre_buffer = std::collections::VecDeque::with_capacity(pre_buffer_samples);
 
+        // Streaming buffer configuration (matches index.html)
+        let max_buffer_secs = 10.0; // 10 second rolling window
+        let overlap_secs = 0.25;     // 250ms overlap
+        let streaming_buffer = streaming_buffer::StreamingBuffer::new(max_buffer_secs, overlap_secs, 16000);
+
+        // Transcribe every 750ms (matches index.html BLOCK_DURATION)
+        let block_duration_samples = (0.75 * 16000.0) as usize; // 12000 samples
+
         Ok(Self {
             vad_stream,
             parakeet_model,
             device,
+            streaming_buffer,
+            block_duration_samples,
+            samples_since_transcribe: 0,
             current_segment: Vec::new(),
             current_segment_start: None,
             pre_buffer,
@@ -219,11 +241,13 @@ impl SpeechInner {
             total_samples_processed: 0,
             silence_frames: 0,
             was_speech_last_frame: false,
+            last_audio_time: std::time::Instant::now(),
             speech_threshold: 0.5,
             min_speech_duration_ms: 250.0,
             pre_buffer_ms,
             comma_pause_duration_ms: 150.0,  // Short pause → comma
             period_pause_duration_ms: 500.0, // Long pause → period (increased to avoid breaking natural speech)
+            silence_timeout_ms: 2000.0,      // Very long pause → auto-flush segment
             debug_wav_writer,
         })
     }
@@ -238,7 +262,10 @@ impl SpeechInner {
         WavWriter::create("debug_input.wav", spec)
     }
 
-    fn process_samples(&mut self, samples: &[f32]) -> Result<Vec<Transcription>> {
+    fn process_samples<F>(&mut self, samples: &[f32], callback: &F) -> Result<()>
+    where
+        F: Fn(Transcription),
+    {
         // Write incoming samples to debug WAV file
         if let Some(ref mut writer) = self.debug_wav_writer {
             for &sample in samples {
@@ -247,8 +274,102 @@ impl SpeechInner {
             // Flush constantly as requested for debugging
             let _ = writer.flush();
         }
+        //return Ok(());
 
-        let mut transcriptions = Vec::new();
+        // Check if too much time has passed since last audio (silence timeout)
+        let time_since_last_audio = self.last_audio_time.elapsed().as_millis() as f32;
+
+        if time_since_last_audio >= self.silence_timeout_ms {
+            // Very long pause detected - auto-flush any active segment before processing new audio
+            if let Some(start_time) = self.current_segment_start {
+                let end_time = self.total_samples_processed as f64 / 16000.0;
+                let duration_ms = (end_time - start_time) * 1000.0;
+
+                info!("Silence timeout ({}ms) - auto-flushing segment {:.3}s-{:.3}s (duration={:.0}ms)",
+                      time_since_last_audio, start_time, end_time, duration_ms);
+
+                if duration_ms >= self.min_speech_duration_ms as f64 {
+                    // Transcribe the segment before clearing
+                    match self.transcribe_segment() {
+                        Ok(text) => {
+                            if !text.is_empty() {
+                                info!("Auto-flush: Generated transcription: \"{}\"", text);
+                                callback(Transcription {
+                                    text,
+                                    start_time,
+                                    end_time,
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            info!("Auto-flush: Transcription FAILED: {}", e);
+                        }
+                    }
+                }
+
+                // Clear the segment state for fresh start
+                self.current_segment.clear();
+                self.current_segment_start = None;
+                self.phrase_boundaries.clear();
+                self.silence_frames = 0;
+            }
+        }
+
+        // Update last audio time
+        self.last_audio_time = std::time::Instant::now();
+
+        // Add samples to streaming buffer for continuous updates
+        let should_commit = self.streaming_buffer.push_samples(samples);
+        self.samples_since_transcribe += samples.len();
+
+        // Check if it's time to transcribe the rolling buffer (every 750ms)
+        if self.samples_since_transcribe >= self.block_duration_samples {
+            let buffer = self.streaming_buffer.get_buffer();
+            if !buffer.is_empty() {
+                let buffer_duration = self.streaming_buffer.buffer_duration_secs(16000);
+                let start_time = (self.total_samples_processed as f64 / 16000.0) - buffer_duration as f64;
+                let end_time = self.total_samples_processed as f64 / 16000.0;
+
+                info!("Streaming: Transcribing buffer ({:.2}s)", buffer_duration);
+
+                // Transcribe the rolling buffer
+                match parakeet::transcribe_streaming_chunk(
+                    &buffer,
+                    None,
+                    None,
+                    &self.parakeet_model,
+                    &self.device,
+                ) {
+                    Ok(raw_text) => {
+                        if !raw_text.is_empty() {
+                            let text = parakeet::add_punctuation(&raw_text);
+                            info!("Streaming: Update - \"{}\"", text);
+
+                            // Update streaming buffer's current line
+                            self.streaming_buffer.update_current_line(text.clone());
+
+                            // Invoke callback immediately
+                            callback(Transcription {
+                                text,
+                                start_time,
+                                end_time,
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        info!("Streaming: Transcription error: {}", e);
+                    }
+                }
+            }
+
+            self.samples_since_transcribe = 0;
+
+            // Handle buffer commit if rolling window is full
+            if should_commit {
+                info!("Streaming: Buffer full, committing line");
+                self.streaming_buffer.commit_and_trim(samples.len());
+            }
+        }
 
         // Process through VAD in 160-sample chunks (10ms at 16kHz)
         // Key: VAD probabilities indicate speech state, but we accumulate samples
@@ -339,7 +460,7 @@ impl SpeechInner {
                                     Ok(text) => {
                                         if !text.is_empty() {
                                             info!("VAD: Generated transcription: \"{}\"", text);
-                                            transcriptions.push(Transcription {
+                                            callback(Transcription {
                                                 text,
                                                 start_time,
                                                 end_time,
@@ -389,7 +510,7 @@ impl SpeechInner {
             idx = end;
         }
 
-        Ok(transcriptions)
+        Ok(())
     }
 
     fn transcribe_segment(&self) -> Result<String> {
@@ -481,127 +602,109 @@ impl SpeechInner {
         }
     }
 
-    fn flush(&mut self) -> Result<Option<Transcription>> {
-        // If there's no active speech segment, nothing to flush
-        if self.current_segment_start.is_none() || self.current_segment.is_empty() {
-            info!("Flush: No active segment to flush");
-            return Ok(None);
-        }
+    fn flush<F>(&mut self, callback: &F) -> Result<()>
+    where
+        F: Fn(Transcription),
+    {
+        let mut transcription_count = 0;
 
-        let start_time = self.current_segment_start.unwrap();
-        let end_time = self.total_samples_processed as f64 / 16000.0;
-        let duration_ms = (end_time - start_time) * 1000.0;
+        // First, flush the streaming buffer if it has content
+        let buffer = self.streaming_buffer.get_buffer();
+        if !buffer.is_empty() {
+            let buffer_duration = self.streaming_buffer.buffer_duration_secs(16000);
+            let start_time = (self.total_samples_processed as f64 / 16000.0) - buffer_duration as f64;
+            let end_time = self.total_samples_processed as f64 / 16000.0;
 
-        info!("Flush: Forcing transcription of active segment {:.3}s-{:.3}s (duration={:.0}ms, samples={}, phrases={})",
-              start_time, end_time, duration_ms, self.current_segment.len(), self.phrase_boundaries.len() + 1);
+            info!("Flush: Transcribing streaming buffer ({:.2}s)", buffer_duration);
 
-        if duration_ms >= self.min_speech_duration_ms as f64 {
-            // Transcribe the accumulated segment
-            match self.transcribe_segment() {
-                Ok(text) => {
-                    if !text.is_empty() {
-                        info!("Flush: Generated transcription: \"{}\"", text);
-                        let transcription = Transcription {
+            match parakeet::transcribe_streaming_chunk(
+                &buffer,
+                None,
+                None,
+                &self.parakeet_model,
+                &self.device,
+            ) {
+                Ok(raw_text) => {
+                    if !raw_text.is_empty() {
+                        let text = parakeet::add_punctuation(&raw_text);
+                        info!("Flush: Streaming buffer - \"{}\"", text);
+
+                        callback(Transcription {
                             text,
                             start_time,
                             end_time,
-                        };
-
-                        // Clear state
-                        self.current_segment.clear();
-                        self.current_segment_start = None;
-                        self.phrase_boundaries.clear();
-                        self.silence_frames = 0;
-
-                        return Ok(Some(transcription));
-                    } else {
-                        info!("Flush: Transcription was empty (likely silence/noise)");
+                        });
+                        transcription_count += 1;
                     }
                 }
                 Err(e) => {
-                    info!("Flush: Transcription FAILED: {}", e);
-                    return Err(e);
+                    info!("Flush: Streaming buffer transcription error: {}", e);
                 }
             }
+        }
+
+        // Also flush VAD-based segment if present
+        if let Some(start_time) = self.current_segment_start {
+            if !self.current_segment.is_empty() {
+                let end_time = self.total_samples_processed as f64 / 16000.0;
+                let duration_ms = (end_time - start_time) * 1000.0;
+
+                info!("Flush: VAD segment {:.3}s-{:.3}s (duration={:.0}ms, samples={}, phrases={})",
+                      start_time, end_time, duration_ms, self.current_segment.len(), self.phrase_boundaries.len() + 1);
+
+                if duration_ms >= self.min_speech_duration_ms as f64 {
+                    match self.transcribe_segment() {
+                        Ok(text) => {
+                            if !text.is_empty() {
+                                info!("Flush: VAD segment - \"{}\"", text);
+                                callback(Transcription {
+                                    text,
+                                    start_time,
+                                    end_time,
+                                });
+                                transcription_count += 1;
+                            }
+                        }
+                        Err(e) => {
+                            info!("Flush: VAD segment transcription error: {}", e);
+                        }
+                    }
+                }
+            }
+
+            // Clear VAD state
+            self.current_segment.clear();
+            self.current_segment_start = None;
+            self.phrase_boundaries.clear();
+            self.silence_frames = 0;
+        }
+
+        // Clear streaming buffer state
+        self.streaming_buffer.clear();
+        self.samples_since_transcribe = 0;
+
+        if transcription_count == 0 {
+            info!("Flush: No content to flush");
         } else {
-            info!("Flush: Segment too short ({:.0}ms < {:.0}ms), skipping",
-                  duration_ms, self.min_speech_duration_ms);
+            info!("Flush: Invoked callback {} time(s)", transcription_count);
         }
 
-        // Clear state even if we didn't transcribe
-        self.current_segment.clear();
-        self.current_segment_start = None;
-        self.phrase_boundaries.clear();
-        self.silence_frames = 0;
-
-        Ok(None)
-    }
-}
-
-/// Async task for processing audio samples in the background
-struct TranscribeTask {
-    inner: Arc<Mutex<SpeechInner>>,
-    samples: Vec<f32>,
-    callback: Arc<Box<dyn Fn(Transcription) + Send + Sync>>,
-}
-
-impl Task for TranscribeTask {
-    type Output = Vec<Transcription>;
-    type JsValue = ();
-
-    /// Runs on background thread - does the heavy processing
-    fn compute(&mut self) -> Result<Self::Output> {
-        let mut inner = self.inner.lock()
-            .map_err(|e| napi::Error::from_reason(format!("Lock error: {}", e)))?;
-        inner.process_samples(&self.samples)
-    }
-
-    /// Runs on main JS thread - emits results via callback
-    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
-        info!("Callback: Sending {} transcription(s) to JavaScript", output.len());
-        for transcription in output {
-            info!("Callback: Emitting \"{}\", {:.3}s-{:.3}s",
-                  transcription.text, transcription.start_time, transcription.end_time);
-            (self.callback)(transcription);
-        }
         Ok(())
     }
 }
 
-/// Async task for flushing accumulated speech segment
-struct FlushTask {
-    inner: Arc<Mutex<SpeechInner>>,
-    callback: Arc<Box<dyn Fn(Transcription) + Send + Sync>>,
-}
-
-impl Task for FlushTask {
-    type Output = Option<Transcription>;
-    type JsValue = ();
-
-    /// Runs on background thread - forces transcription of current segment
-    fn compute(&mut self) -> Result<Self::Output> {
-        let mut inner = self.inner.lock()
-            .map_err(|e| napi::Error::from_reason(format!("Lock error: {}", e)))?;
-        inner.flush()
-    }
-
-    /// Runs on main JS thread - emits result via callback if present
-    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
-        if let Some(transcription) = output {
-            info!("Flush callback: Emitting \"{}\", {:.3}s-{:.3}s",
-                  transcription.text, transcription.start_time, transcription.end_time);
-            (self.callback)(transcription);
-        } else {
-            info!("Flush callback: No segment to flush");
-        }
-        Ok(())
-    }
+/// Work item for the background processing queue
+enum WorkItem {
+    Samples(Vec<f32>),
+    Flush,
+    Shutdown,
 }
 
 #[napi(js_name = "Speech")]
 pub struct Speech {
-    inner: Arc<Mutex<SpeechInner>>,
-    callback: Arc<Box<dyn Fn(Transcription) + Send + Sync>>,
+    work_sender: mpsc::SyncSender<WorkItem>,
+    work_receiver: Arc<Mutex<mpsc::Receiver<WorkItem>>>,
+    worker_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 
 #[napi]
@@ -649,49 +752,151 @@ impl Speech {
             let _ = tsfn.call(t, ThreadsafeFunctionCallMode::NonBlocking);
         }) as Box<dyn Fn(Transcription) + Send + Sync>);
 
+        // Create bounded work queue (buffer up to 150 chunks ~ 9.6MB)
+        // If queue is full, queue will be drained to admit new samples
+        let (tx, rx) = mpsc::sync_channel::<WorkItem>(150);
+        let rx = Arc::new(Mutex::new(rx));
+
+        // Spawn background worker thread
+        let mut inner = inner;
+        let callback_clone = Arc::clone(&callback_fn);
+        let rx_clone = Arc::clone(&rx);
+
+        let worker_thread = std::thread::spawn(move || {
+            info!("Background worker thread started");
+            loop {
+                let work_item = {
+                    let rx = rx_clone.lock().unwrap();
+                    match rx.recv() {
+                        Ok(item) => item,
+                        Err(_) => {
+                            info!("Worker: Channel closed, exiting");
+                            break;
+                        }
+                    }
+                };
+
+                match work_item {
+                    WorkItem::Samples(samples) => {
+                        let callback = Arc::clone(&callback_clone);
+                        let callback_fn = |transcription: Transcription| {
+                            info!("Callback: Emitting \"{}\", {:.3}s-{:.3}s",
+                                  transcription.text, transcription.start_time, transcription.end_time);
+                            callback(transcription);
+                        };
+
+                        if let Err(e) = inner.process_samples(&samples, &callback_fn) {
+                            info!("Worker: process_samples error: {:?}", e);
+                        }
+                    }
+                    WorkItem::Flush => {
+                        let callback = Arc::clone(&callback_clone);
+                        let callback_fn = |transcription: Transcription| {
+                            info!("Flush callback: Emitting \"{}\", {:.3}s-{:.3}s",
+                                  transcription.text, transcription.start_time, transcription.end_time);
+                            callback(transcription);
+                        };
+
+                        if let Err(e) = inner.flush(&callback_fn) {
+                            info!("Worker: flush error: {:?}", e);
+                        }
+                    }
+                    WorkItem::Shutdown => {
+                        info!("Worker: Shutdown requested, exiting");
+                        break;
+                    }
+                }
+            }
+            info!("Background worker thread exited");
+        });
+
         Self {
-            inner: Arc::new(Mutex::new(inner)),
-            callback: callback_fn,
+            work_sender: tx,
+            work_receiver: rx,
+            worker_thread: Arc::new(Mutex::new(Some(worker_thread))),
         }
     }
 
     #[napi]
-    pub fn input(&self, env: Env, samples: Vec<f64>) -> Result<()> {
-        info!("input {} samples (async)", samples.len());
-
+    pub fn input(&self, samples: Vec<f64>) -> Result<()> {
         // Convert f64 to f32
         let samples_f32: Vec<f32> = samples.iter().map(|&x| x as f32).collect();
 
-        // Create async task with cloned Arc references
-        let task = TranscribeTask {
-            inner: Arc::clone(&self.inner),
-            samples: samples_f32,
-            callback: Arc::clone(&self.callback),
-        };
+        // Try to send to queue
+        match self.work_sender.try_send(WorkItem::Samples(samples_f32)) {
+            Ok(_) => Ok(()),
+            Err(mpsc::TrySendError::Full(work_item)) => {
+                // Queue is full - we're falling behind
+                // Drain the queue to skip to current audio (non-blocking)
+                info!("Work queue full, draining stale audio and admitting new samples");
 
-        // Spawn task on background thread - returns immediately
-        env.spawn(task)?;
+                let mut drained = 0;
+                if let Ok(rx) = self.work_receiver.try_lock() {
+                    // Drain all queued items using try_recv (non-blocking)
+                    while let Ok(_) = rx.try_recv() {
+                        drained += 1;
+                    }
+                }
 
-        Ok(())
+                if drained > 0 {
+                    info!("Drained {} stale items from queue", drained);
+                }
+
+                // Now try to send again
+                match self.work_sender.try_send(work_item) {
+                    Ok(_) => {
+                        info!("Sent new samples after draining queue");
+                        Ok(())
+                    }
+                    Err(mpsc::TrySendError::Full(_)) => {
+                        // Still full (worker might be processing slowly)
+                        info!("Queue still full after drain, dropping samples");
+                        Ok(())
+                    }
+                    Err(mpsc::TrySendError::Disconnected(_)) => {
+                        Err(napi::Error::from_reason("Worker thread disconnected"))
+                    }
+                }
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                Err(napi::Error::from_reason("Worker thread disconnected"))
+            }
+        }
     }
 
     #[napi]
-    pub fn flush(&self, env: Env) -> Result<()> {
-        info!("flush: forcing transcription of current segment (async)");
+    pub fn flush(&self) -> Result<()> {
+        info!("flush: queueing flush command");
 
-        // Create async task with cloned Arc references
-        let task = FlushTask {
-            inner: Arc::clone(&self.inner),
-            callback: Arc::clone(&self.callback),
-        };
-
-        // Spawn task on background thread - returns immediately
-        env.spawn(task)?;
-
-        Ok(())
+        // Send flush command to queue
+        match self.work_sender.try_send(WorkItem::Flush) {
+            Ok(_) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => {
+                info!("Work queue full, dropping flush command");
+                Ok(()) // Don't error
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                Err(napi::Error::from_reason("Worker thread disconnected"))
+            }
+        }
     }
 
     #[napi]
     pub fn shutdown(&self) {
+        info!("Shutdown requested - sending shutdown signal to worker");
+
+        // Send shutdown message
+        let _ = self.work_sender.send(WorkItem::Shutdown);
+
+        // Wait for worker thread to finish
+        if let Ok(mut guard) = self.worker_thread.lock() {
+            if let Some(handle) = guard.take() {
+                info!("Waiting for worker thread to finish...");
+                if let Err(e) = handle.join() {
+                    info!("Worker thread panicked: {:?}", e);
+                }
+                info!("Worker thread joined successfully");
+            }
+        }
     }
 }
