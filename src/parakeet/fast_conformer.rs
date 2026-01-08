@@ -11,7 +11,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 #[cfg(feature = "quantized")]
-use std::io::{Read, Seek};
+use std::io::Seek;
 use std::path::Path;
 use tokenizers::Tokenizer;
 

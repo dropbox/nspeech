@@ -73,9 +73,9 @@ fn main() -> Result<()> {
 
     // Streaming configuration with pause-based punctuation
     const VAD_CHUNK_SIZE: usize = 160; // 10ms at 16kHz for VAD processing
-    const SPEECH_THRESHOLD: f32 = 0.5;
+    const SPEECH_THRESHOLD: f32 = 0.1; // Very low threshold to detect speech as early as possible
     const MIN_SPEECH_DURATION_MS: f32 = 250.0;
-    const PRE_BUFFER_MS: f32 = 300.0; // Pre-buffer to capture start of speech
+    const PRE_BUFFER_MS: f32 = 1000.0; // Large pre-buffer to capture start of speech
     const COMMA_PAUSE_DURATION_MS: f32 = 150.0; // Short pause → comma
     const PERIOD_PAUSE_DURATION_MS: f32 = 500.0; // Long pause → period (increased to avoid breaking natural speech)
 

@@ -163,6 +163,10 @@ struct SpeechInner {
     // Pre-buffer to capture audio before speech detection (300ms)
     pre_buffer: std::collections::VecDeque<f32>,
 
+    // Startup buffer to capture initial audio before first speech detection
+    startup_buffer: Vec<f32>,
+    first_speech_detected: bool,
+
     // Sub-segments (phrases) for comma insertion
     // Tracks sample positions where pauses occurred (comma boundaries)
     phrase_boundaries: Vec<usize>, // Sample indices where commas should go
@@ -209,8 +213,8 @@ impl SpeechInner {
         info!("VAD mode: enabled (speech detection with pause-based punctuation)");
 
         // Pre-buffer to capture audio before speech detection
-        let pre_buffer_ms = 300.0;
-        let pre_buffer_samples = (pre_buffer_ms * 16.0) as usize; // 4800 samples at 16kHz
+        let pre_buffer_ms = 1000.0; // Large pre-buffer to capture start of speech
+        let pre_buffer_samples = (pre_buffer_ms * 16.0) as usize; // 16000 samples at 16kHz
         let pre_buffer = std::collections::VecDeque::with_capacity(pre_buffer_samples);
 
         Ok(Self {
@@ -220,12 +224,14 @@ impl SpeechInner {
             current_segment: Vec::new(),
             current_segment_start: None,
             pre_buffer,
+            startup_buffer: Vec::new(),
+            first_speech_detected: false,
             phrase_boundaries: Vec::new(),
             total_samples_processed: 0,
             silence_frames: 0,
             was_speech_last_frame: false,
             last_audio_time: std::time::Instant::now(),
-            speech_threshold: 0.5,
+            speech_threshold: 0.1, // Very low threshold to detect speech as early as possible
             min_speech_duration_ms: 250.0,
             pre_buffer_ms,
             comma_pause_duration_ms: 150.0,  // Short pause → comma
@@ -301,6 +307,18 @@ impl SpeechInner {
         // Update last audio time
         self.last_audio_time = std::time::Instant::now();
 
+        // If we haven't detected speech yet, accumulate all audio in startup buffer
+        // This captures audio from the very beginning to avoid missing initial speech
+        if !self.first_speech_detected {
+            self.startup_buffer.extend_from_slice(samples);
+            // Limit startup buffer to first 3 seconds to avoid unbounded growth
+            if self.startup_buffer.len() > 48000 { // 3s at 16kHz
+                self.startup_buffer.drain(0..(self.startup_buffer.len() - 48000));
+            }
+            info!("VAD: Accumulating to startup buffer, total {} samples ({:.2}s)",
+                  self.startup_buffer.len(), self.startup_buffer.len() as f32 / 16000.0);
+        }
+
         // Process through VAD in 160-sample chunks (10ms at 16kHz)
         // Key: VAD probabilities indicate speech state, but we accumulate samples
         // independently based on that state to avoid duplication
@@ -341,16 +359,27 @@ impl SpeechInner {
 
                     if self.current_segment_start.is_none() {
                         // Start new speech segment
-                        // Account for pre-buffer when calculating start time
-                        let pre_buffer_duration = self.pre_buffer.len() as f64 / 16000.0;
-                        let start_time = (self.total_samples_processed as f64 / 16000.0) - pre_buffer_duration;
-                        self.current_segment_start = Some(start_time);
+                        let start_time;
                         self.current_segment.clear();
 
-                        // Include pre-buffered audio to capture start of speech
-                        self.current_segment.extend(self.pre_buffer.iter().copied());
-                        info!("VAD: Speech started at {:.3}s (prob={:.3}, pre-buffer={}ms)",
-                              start_time, prob, pre_buffer_duration * 1000.0);
+                        // If this is the first speech detection, use the startup buffer
+                        if !self.first_speech_detected {
+                            start_time = 0.0;
+                            self.current_segment.extend(self.startup_buffer.iter().copied());
+                            info!("VAD: First speech detected, using startup buffer ({} samples from beginning)",
+                                  self.startup_buffer.len());
+                            self.startup_buffer.clear();
+                            self.first_speech_detected = true;
+                        } else {
+                            // Normal case: use pre-buffer
+                            let pre_buffer_duration = self.pre_buffer.len() as f64 / 16000.0;
+                            start_time = (self.total_samples_processed as f64 / 16000.0) - pre_buffer_duration;
+                            self.current_segment.extend(self.pre_buffer.iter().copied());
+                            info!("VAD: Speech started at {:.3}s (prob={:.3}, pre-buffer={}ms)",
+                                  start_time, prob, pre_buffer_duration * 1000.0);
+                        }
+
+                        self.current_segment_start = Some(start_time);
                         self.pre_buffer.clear();
                     }
                 } else {
@@ -643,9 +672,9 @@ impl Speech {
             let _ = tsfn.call(t, ThreadsafeFunctionCallMode::NonBlocking);
         }) as Box<dyn Fn(Transcription) + Send + Sync>);
 
-        // Create bounded work queue (buffer up to 150 chunks ~ 9.6MB)
+        // Create bounded work queue (buffer up to 1000 chunks)
         // If queue is full, queue will be drained to admit new samples
-        let (tx, rx) = mpsc::sync_channel::<WorkItem>(150);
+        let (tx, rx) = mpsc::sync_channel::<WorkItem>(1000);
         let rx = Arc::new(Mutex::new(rx));
 
         // Spawn background worker thread

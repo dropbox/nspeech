@@ -55,7 +55,7 @@ impl StftMag {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // Most Silero STFTs behave like center=True (pad n_fft/2 both sides).
         let pad = self.n_fft / 2;
-        let (b, c, t) = x.dims3()?;
+        let (b, c, _t) = x.dims3()?;
         if c != 1 { bail!("expected [B,1,T], got c={c}"); }
 
         let left = Tensor::zeros((b, 1, pad), x.dtype(), x.device())?;
@@ -83,7 +83,7 @@ impl StftMag {
     /// Applies reflection padding on the right: [a,b,c,d] + pad=2 => [a,b,c,d,c,b]
     /// Returns [B, n_bins, frames] - raw magnitude (no log transform)
     pub fn forward_streaming(&self, x: &Tensor) -> Result<Tensor> {
-        let (b, c, t) = x.dims3()?;
+        let (_b, c, t) = x.dims3()?;
         anyhow::ensure!(c == 1, "expected mono [B,1,T], got c={c}");
 
         // Apply reflection padding on the right
@@ -309,7 +309,7 @@ impl SileroVad {
         let z = z.transpose(1, 2)?; // [B,T',C]
         let z = z.transpose(0, 1)?; // [T',B,C]
 
-        let (t, b, ch) = z.dims3()?;
+        let (_t, b, _ch) = z.dims3()?;
 
         // Use provided state or zeros
         let h0 = match h {
