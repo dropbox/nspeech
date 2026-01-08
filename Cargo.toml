@@ -21,9 +21,9 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-candle-core = { version = "0.9", package = "candle-core", features = ["metal", "accelerate"] }
-candle-nn   = { version = "0.9", package = "candle-nn", features = ["metal", "accelerate"] }
-candle-transformers = { version = "0.9", package = "candle-transformers" }
+candle-core = { git = "https://github.com/huggingface/candle", rev="f526033db7ea880c7189628a2dc00e3e2008a9e7", features = ["metal", "accelerate"] }
+candle-nn = { git = "https://github.com/huggingface/candle", rev="f526033db7ea880c7189628a2dc00e3e2008a9e7", features = ["metal", "accelerate"] }
+candle-transformers = { git = "https://github.com/huggingface/candle", rev="f526033db7ea880c7189628a2dc00e3e2008a9e7" }
 
 # Hugging Face Hub client (sync API is fine)
 hf-hub = "0.4"

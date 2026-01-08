@@ -29,6 +29,11 @@ embed_zst_asset!(pub PARAKEET_MODEL_SAFETENSORS,     "model.safetensors.zst");
 embed_zst_asset!(pub PARAKEET_MODEL_Q8_0_GGUF,       "model_q8_0.gguf.zst");
 embed_zst_asset!(pub PARAKEET_MODEL_Q4K_GGUF,        "model_q4k.gguf.zst");
 
+// Qwen2.5-0.5B-Instruct for text correction
+embed_zst_asset!(pub QWEN_CONFIG,                    "qwen2.5-0.5b-instruct-config.json.zst");
+embed_zst_asset!(pub QWEN_TOKENIZER,                 "qwen2.5-0.5b-instruct-tokenizer.json.zst");
+embed_zst_asset!(pub QWEN_MODEL_Q4,                  "qwen2.5-0.5b-instruct-q4_k_m.gguf.zst");
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct FastConformerConfig {
     pub feat_in: usize,

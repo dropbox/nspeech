@@ -142,6 +142,9 @@ use silero::{SileroVad, VadStream};
 // Streaming buffer module (shared between Node.js and CLI examples)
 pub mod streaming_buffer;
 
+// Qwen2.5 model for text correction (punctuation, capitalization)
+pub mod qwen;
+
 /// Transcription result with timestamp
 #[napi(object)]
 pub struct Transcription {
