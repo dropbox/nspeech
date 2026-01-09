@@ -71,9 +71,10 @@ impl QwenCorrector {
         let prompt = format!(
             "<|im_start|>system\n\
             You are a helpful assistant that corrects transcriptions by adding proper punctuation and capitalization. \
-            Only output the corrected text, nothing else.<|im_end|>\n\
+            Only output the corrected text, nothing else, not even an acknowledgement of the
+            instruction.<|im_end|>\n\
             <|im_start|>user\n\
-            Correct this transcription by adding punctuation and capitalization:\n\
+            Correct this transcription by adding punctuation and capitalization of named entities, fixing spelling mistakes, removing pauses like err, uhm, hmm, and dividing up overlapping or mumbled words into clearly legible sentences:\n\
             {}<|im_end|>\n\
             <|im_start|>assistant\n",
             raw_text
