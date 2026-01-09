@@ -4,15 +4,18 @@
 /// 1. Reads audio file in chunks (simulates live streaming)
 /// 2. Uses Silero VAD to detect speech segments in real-time
 /// 3. Transcribes segments immediately when pauses are detected
-/// 4. Target latency: ~1 second from speech end to transcript
+/// 4. Optionally uses Qwen2.5 for text correction (punctuation/capitalization)
+/// 5. Target latency: ~1 second from speech end to transcript
 ///
 /// Usage:
 ///   cargo run --example transcribe_with_vad --release -- dots.wav
+///   cargo run --example transcribe_with_vad --release -- dots.wav --use-qwen
 ///   cargo run --example transcribe_with_vad --release -- MLKDream_16k.wav
 ///   PARAKEET_DEVICE=cpu cargo run --example transcribe_with_vad --release -- audio.wav
 
 use anyhow::Result;
 use speech::parakeet;
+use speech::qwen::QwenCorrector;
 use std::path::PathBuf;
 
 // Import Silero VAD from library
@@ -22,16 +25,21 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Usage: {} <audio.wav>", args[0]);
+        eprintln!("Usage: {} <audio.wav> [--use-qwen]", args[0]);
         eprintln!("\nThis example uses Silero VAD to detect speech segments,");
         eprintln!("then transcribes only the speech portions with Parakeet.");
+        eprintln!("\nOptions:");
+        eprintln!("  --use-qwen    Use Qwen2.5 for text correction (requires model files)");
         eprintln!("\nRequired files:");
         eprintln!("  assets/vad16.safetensors.zst, assets/vad16.config.json.zst");
         eprintln!("  assets/config.json.zst, assets/model_q8_0.gguf.zst, assets/tokenizer.json.zst");
+        eprintln!("\nFor Qwen support:");
+        eprintln!("  Run: ./scripts/download_qwen_model.sh");
         return Ok(());
     }
 
     let audio_path = &args[1];
+    let use_qwen = args.iter().any(|arg| arg == "--use-qwen");
 
     println!("Streaming Transcription with Silero VAD");
     println!("========================================\n");
@@ -52,6 +60,25 @@ fn main() -> Result<()> {
     println!("Loading Parakeet model...");
     let model = parakeet::load_parakeet_ctc_from_gguf_local(&assets, &device)?;
     println!("✓ Parakeet loaded");
+
+    // Load Qwen model if requested
+    let mut qwen_corrector = if use_qwen {
+        println!("Loading Qwen2.5 text correction model...");
+        match QwenCorrector::load(&assets, &device) {
+            Ok(corrector) => {
+                println!("✓ Qwen loaded (text correction enabled)");
+                Some(corrector)
+            }
+            Err(e) => {
+                eprintln!("⚠ Failed to load Qwen: {}", e);
+                eprintln!("  Run: ./scripts/download_qwen_model.sh");
+                eprintln!("  Falling back to rule-based punctuation");
+                None
+            }
+        }
+    } else {
+        None
+    };
     println!();
 
     // Open audio file for streaming
@@ -239,14 +266,26 @@ fn main() -> Result<()> {
 
                                 let raw_text = phrases.join(" , ");
                                 eprintln!("DEBUG: Raw model output: \"{}\"", raw_text);
-                                parakeet::add_punctuation_internal(&raw_text, true)
+
+                                // Use Qwen for correction if available, otherwise fall back to rule-based
+                                if let Some(ref mut corrector) = qwen_corrector {
+                                    corrector.correct_text(&raw_text)?
+                                } else {
+                                    parakeet::add_punctuation_internal(&raw_text, true)
+                                }
                             } else {
                                 // Single phrase
                                 let raw_text = parakeet::transcribe_streaming_chunk(
                                     &current_segment, None, None, &model, &device
                                 )?;
                                 eprintln!("DEBUG: Raw model output: \"{}\"", raw_text);
-                                parakeet::add_punctuation(&raw_text)
+
+                                // Use Qwen for correction if available, otherwise fall back to rule-based
+                                if let Some(ref mut corrector) = qwen_corrector {
+                                    corrector.correct_text(&raw_text)?
+                                } else {
+                                    parakeet::add_punctuation(&raw_text)
+                                }
                             };
 
                             if !text.is_empty() {
@@ -332,14 +371,26 @@ fn main() -> Result<()> {
 
                 let raw_text = phrases.join(" , ");
                 eprintln!("DEBUG: Raw model output: \"{}\"", raw_text);
-                parakeet::add_punctuation_internal(&raw_text, true)
+
+                // Use Qwen for correction if available, otherwise fall back to rule-based
+                if let Some(ref mut corrector) = qwen_corrector {
+                    corrector.correct_text(&raw_text)?
+                } else {
+                    parakeet::add_punctuation_internal(&raw_text, true)
+                }
             } else {
                 // Single phrase
                 let raw_text = parakeet::transcribe_streaming_chunk(
                     &current_segment, None, None, &model, &device
                 )?;
                 eprintln!("DEBUG: Raw model output: \"{}\"", raw_text);
-                parakeet::add_punctuation(&raw_text)
+
+                // Use Qwen for correction if available, otherwise fall back to rule-based
+                if let Some(ref mut corrector) = qwen_corrector {
+                    corrector.correct_text(&raw_text)?
+                } else {
+                    parakeet::add_punctuation(&raw_text)
+                }
             };
 
             if !text.is_empty() {

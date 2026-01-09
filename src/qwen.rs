@@ -130,7 +130,8 @@ impl QwenCorrector {
             let logits = self.model.forward(&input, 0)?; // position 0 for KV cache (simplified)
 
             // Get last token logits [vocab_size]
-            let last_logits = logits.squeeze(0)?.get(tokens.len() - 1)?;
+            // Quantized Qwen2 only returns logits for last position: [1, vocab_size]
+            let last_logits = logits.squeeze(0)?;  // [vocab_size]
 
             // Greedy: argmax
             let next_token = last_logits.argmax(0)?.to_scalar::<u32>()?;
