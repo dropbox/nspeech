@@ -29,12 +29,12 @@ fn main() -> Result<()> {
         eprintln!("\nThis example uses Silero VAD to detect speech segments,");
         eprintln!("then transcribes only the speech portions with Parakeet.");
         eprintln!("\nOptions:");
-        eprintln!("  --use-qwen    Use Qwen2.5 for text correction (requires model files)");
+        eprintln!("  --use-qwen    Use Qwen3 for text correction (requires model files)");
         eprintln!("\nRequired files:");
         eprintln!("  assets/vad16.safetensors.zst, assets/vad16.config.json.zst");
         eprintln!("  assets/config.json.zst, assets/model_q8_0.gguf.zst, assets/tokenizer.json.zst");
         eprintln!("\nFor Qwen support:");
-        eprintln!("  Run: ./scripts/download_qwen_model.sh");
+        eprintln!("  Run: python scripts/download_qwen3.py");
         return Ok(());
     }
 
@@ -71,7 +71,7 @@ fn main() -> Result<()> {
             }
             Err(e) => {
                 eprintln!("⚠ Failed to load Qwen3: {}", e);
-                eprintln!("  Run: ./scripts/download_qwen_model.sh");
+                eprintln!("  Run: python scripts/download_qwen3.py");
                 eprintln!("  Falling back to rule-based punctuation");
                 None
             }

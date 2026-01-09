@@ -1,7 +1,7 @@
 /// Qwen3 model for text correction (punctuation, capitalization)
 ///
 /// **Status**: Work in progress. Requires Qwen model files to be downloaded.
-/// See scripts/download_qwen_model.sh for setup instructions.
+/// See scripts/download_qwen3.py for setup instructions.
 ///
 /// Uses quantized Qwen3-0.6B-Instruct model to correct raw ASR transcriptions
 /// by adding proper punctuation and capitalization.
@@ -28,20 +28,20 @@ impl QwenCorrector {
     /// Load Qwen model from assets directory
     ///
     /// Requires model files to be downloaded and compressed with zstd.
-    /// See scripts/download_qwen_model.sh for setup.
+    /// See scripts/download_qwen3.py for setup.
     pub fn load<P: AsRef<Path>>(assets_dir: P, device: &Device) -> Result<Self> {
         let assets = assets_dir.as_ref().to_path_buf();
 
         // Load tokenizer
         let tokenizer_bytes = QWEN_TOKENIZER.bytes(&assets).map_err(|_| {
-            Error::new(ErrorKind::Other, "Failed to load Qwen tokenizer - run scripts/download_qwen_model.sh")
+            Error::new(ErrorKind::Other, "Failed to load Qwen tokenizer - run: python scripts/download_qwen3.py")
         })?;
         let tokenizer = Tokenizer::from_bytes(tokenizer_bytes)
             .map_err(|e| Error::new(ErrorKind::Other, format!("Tokenizer error: {}", e)))?;
 
         // Load GGUF quantized model
         let gguf_bytes = QWEN_MODEL_Q4.bytes(&assets).map_err(|_| {
-            Error::new(ErrorKind::Other, "Failed to load Qwen GGUF model - run scripts/download_qwen_model.sh")
+            Error::new(ErrorKind::Other, "Failed to load Qwen GGUF model - run: python scripts/download_qwen3.py")
         })?;
 
         // Parse GGUF file

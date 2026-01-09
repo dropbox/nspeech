@@ -46,9 +46,9 @@ embed_zst_asset!(pub QWEN_MODEL_Q4, "qwen2.5-0.5b-instruct-q4_k_m.gguf.zst");
 
 ### 3. Download Script
 
-Created `scripts/download_qwen_model.sh` to automatically:
-- Download Qwen2.5-0.5B-Instruct-Q4_K_M model from Hugging Face
-- Download tokenizer and config
+Created `scripts/download_qwen3.py` to automatically:
+- Download Qwen3-0.6B-Instruct-Q4_K_M model from Hugging Face (bartowski's GGUF repo)
+- Download tokenizer and config from official Qwen repo
 - Compress with zstd level 19
 - Place in assets directory
 
@@ -159,14 +159,13 @@ pub fn new(
 ### 1. Download Model Files
 
 ```bash
-chmod +x scripts/download_qwen_model.sh
-./scripts/download_qwen_model.sh
+python scripts/download_qwen3.py
 ```
 
 This downloads and compresses:
-- `qwen2.5-0.5b-instruct-q4_k_m.gguf.zst` (~350MB)
-- `qwen2.5-0.5b-instruct-tokenizer.json.zst` (~2MB)
-- `qwen2.5-0.5b-instruct-config.json.zst` (~1KB)
+- `qwen3-0.6b-instruct-q4_k_m.gguf.zst` (~400MB)
+- `qwen3-0.6b-instruct-tokenizer.json.zst` (~2MB)
+- `qwen3-0.6b-instruct-config.json.zst` (~1KB)
 
 ### 2. Build with Qwen Support
 
@@ -368,7 +367,7 @@ impl SpeechInner {
 
 Run the download script:
 ```bash
-./scripts/download_qwen_model.sh
+python scripts/download_qwen3.py
 ```
 
 ### High memory usage
