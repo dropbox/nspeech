@@ -1,15 +1,15 @@
-/// Qwen2.5 model for text correction (punctuation, capitalization)
+/// Qwen3 model for text correction (punctuation, capitalization)
 ///
 /// **Status**: Work in progress. Requires Qwen model files to be downloaded.
 /// See scripts/download_qwen_model.sh for setup instructions.
 ///
-/// Uses quantized Qwen2.5-0.5B-Instruct model to correct raw ASR transcriptions
+/// Uses quantized Qwen3-0.6B-Instruct model to correct raw ASR transcriptions
 /// by adding proper punctuation and capitalization.
 
 use anyhow::Result;
 use candle_core::quantized::gguf_file;
 use candle_core::Device;
-use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2Model;
+use candle_transformers::models::quantized_qwen3::ModelWeights as Qwen3Model;
 use std::io::{Error, ErrorKind};
 use std::path::Path;
 use tokenizers::Tokenizer;
@@ -19,7 +19,7 @@ use crate::parakeet::fast_conformer::{QWEN_MODEL_Q4, QWEN_TOKENIZER};
 
 /// Qwen text correction model
 pub struct QwenCorrector {
-    model: Qwen2Model,
+    model: Qwen3Model,
     tokenizer: Tokenizer,
     device: Device,
 }
@@ -49,7 +49,7 @@ impl QwenCorrector {
         let content = gguf_file::Content::read(&mut cursor)?;
 
         // Load model from GGUF
-        let model = Qwen2Model::from_gguf(content, &mut cursor, device)?;
+        let model = Qwen3Model::from_gguf(content, &mut cursor, device)?;
 
         Ok(Self {
             model,
@@ -129,12 +129,9 @@ impl QwenCorrector {
             // Forward pass
             let logits = self.model.forward(&input, 0)?; // position 0 for KV cache (simplified)
 
-            // Get last token logits [vocab_size]
-            // Quantized Qwen2 only returns logits for last position: [1, vocab_size]
-            let last_logits = logits.squeeze(0)?;  // [vocab_size]
-
+            // Quantized Qwen3 already returns squeezed logits: [vocab_size]
             // Greedy: argmax
-            let next_token = last_logits.argmax(0)?.to_scalar::<u32>()?;
+            let next_token = logits.argmax(0)?.to_scalar::<u32>()?;
 
             // Stop on EOS
             if next_token == eos_token_id {

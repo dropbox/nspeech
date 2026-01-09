@@ -4,7 +4,7 @@
 /// 1. Reads audio file in chunks (simulates live streaming)
 /// 2. Uses Silero VAD to detect speech segments in real-time
 /// 3. Transcribes segments immediately when pauses are detected
-/// 4. Optionally uses Qwen2.5 for text correction (punctuation/capitalization)
+/// 4. Optionally uses Qwen3 for text correction (punctuation/capitalization)
 /// 5. Target latency: ~1 second from speech end to transcript
 ///
 /// Usage:
@@ -63,14 +63,14 @@ fn main() -> Result<()> {
 
     // Load Qwen model if requested
     let mut qwen_corrector = if use_qwen {
-        println!("Loading Qwen2.5 text correction model...");
+        println!("Loading Qwen3 text correction model...");
         match QwenCorrector::load(&assets, &device) {
             Ok(corrector) => {
-                println!("✓ Qwen loaded (text correction enabled)");
+                println!("✓ Qwen3 loaded (text correction enabled)");
                 Some(corrector)
             }
             Err(e) => {
-                eprintln!("⚠ Failed to load Qwen: {}", e);
+                eprintln!("⚠ Failed to load Qwen3: {}", e);
                 eprintln!("  Run: ./scripts/download_qwen_model.sh");
                 eprintln!("  Falling back to rule-based punctuation");
                 None
