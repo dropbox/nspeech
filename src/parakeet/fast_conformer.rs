@@ -29,9 +29,12 @@ embed_zst_asset!(pub PARAKEET_MODEL_SAFETENSORS,     "model.safetensors.zst");
 embed_zst_asset!(pub PARAKEET_MODEL_Q8_0_GGUF,       "model_q8_0.gguf.zst");
 embed_zst_asset!(pub PARAKEET_MODEL_Q4K_GGUF,        "model_q4k.gguf.zst");
 
-// Qwen3-0.6B-Instruct for text correction
+// Qwen3-0.6B-Instruct for text correction (only when "qwen" feature enabled)
+#[cfg(feature = "qwen")]
 embed_zst_asset!(pub QWEN_CONFIG,                    "qwen3-0.6b-instruct-config.json.zst");
+#[cfg(feature = "qwen")]
 embed_zst_asset!(pub QWEN_TOKENIZER,                 "qwen3-0.6b-instruct-tokenizer.json.zst");
+#[cfg(feature = "qwen")]
 embed_zst_asset!(pub QWEN_MODEL_Q4,                  "qwen3-0.6b-instruct-q4_k_m.gguf.zst");
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]

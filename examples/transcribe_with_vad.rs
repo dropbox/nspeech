@@ -9,12 +9,15 @@
 ///
 /// Usage:
 ///   cargo run --example transcribe_with_vad --release -- dots.wav
-///   cargo run --example transcribe_with_vad --release -- dots.wav --use-qwen
+///   cargo run --example transcribe_with_vad --release --features qwen -- dots.wav --use-qwen
 ///   cargo run --example transcribe_with_vad --release -- MLKDream_16k.wav
 ///   PARAKEET_DEVICE=cpu cargo run --example transcribe_with_vad --release -- audio.wav
+///
+/// Note: Qwen3 text correction requires the "qwen" feature to be enabled at build time.
 
 use anyhow::Result;
 use speech::parakeet;
+#[cfg(feature = "qwen")]
 use speech::qwen::QwenCorrector;
 use std::path::PathBuf;
 
@@ -29,12 +32,13 @@ fn main() -> Result<()> {
         eprintln!("\nThis example uses Silero VAD to detect speech segments,");
         eprintln!("then transcribes only the speech portions with Parakeet.");
         eprintln!("\nOptions:");
-        eprintln!("  --use-qwen    Use Qwen3 for text correction (requires model files)");
+        eprintln!("  --use-qwen    Use Qwen3 for text correction (requires \"qwen\" feature)");
         eprintln!("\nRequired files:");
         eprintln!("  assets/vad16.safetensors.zst, assets/vad16.config.json.zst");
         eprintln!("  assets/config.json.zst, assets/model_q8_0.gguf.zst, assets/tokenizer.json.zst");
         eprintln!("\nFor Qwen support:");
-        eprintln!("  Run: python scripts/download_qwen3.py");
+        eprintln!("  1. Build with: cargo build --example transcribe_with_vad --release --features qwen");
+        eprintln!("  2. Download model: python scripts/download_qwen3.py");
         return Ok(());
     }
 
@@ -61,7 +65,8 @@ fn main() -> Result<()> {
     let model = parakeet::load_parakeet_ctc_from_gguf_local(&assets, &device)?;
     println!("✓ Parakeet loaded");
 
-    // Load Qwen model if requested
+    // Load Qwen model if requested (only available with "qwen" feature)
+    #[cfg(feature = "qwen")]
     let mut qwen_corrector = if use_qwen {
         println!("Loading Qwen3 text correction model...");
         match QwenCorrector::load(&assets, &device) {
@@ -79,6 +84,17 @@ fn main() -> Result<()> {
     } else {
         None
     };
+
+    #[cfg(not(feature = "qwen"))]
+    let _qwen_corrector: Option<()> = if use_qwen {
+        eprintln!("⚠ Qwen3 support not enabled!");
+        eprintln!("  Rebuild with: cargo build --example transcribe_with_vad --release --features qwen");
+        eprintln!("  Falling back to rule-based punctuation");
+        None
+    } else {
+        None
+    };
+
     println!();
 
     // Open audio file for streaming
@@ -268,11 +284,15 @@ fn main() -> Result<()> {
                                 eprintln!("DEBUG: Raw model output: \"{}\"", raw_text);
 
                                 // Use Qwen for correction if available, otherwise fall back to rule-based
-                                if let Some(ref mut corrector) = qwen_corrector {
+                                #[cfg(feature = "qwen")]
+                                let corrected = if let Some(ref mut corrector) = qwen_corrector {
                                     corrector.correct_text(&raw_text)?
                                 } else {
                                     parakeet::add_punctuation_internal(&raw_text, true)
-                                }
+                                };
+                                #[cfg(not(feature = "qwen"))]
+                                let corrected = parakeet::add_punctuation_internal(&raw_text, true);
+                                corrected
                             } else {
                                 // Single phrase
                                 let raw_text = parakeet::transcribe_streaming_chunk(
@@ -281,11 +301,15 @@ fn main() -> Result<()> {
                                 eprintln!("DEBUG: Raw model output: \"{}\"", raw_text);
 
                                 // Use Qwen for correction if available, otherwise fall back to rule-based
-                                if let Some(ref mut corrector) = qwen_corrector {
+                                #[cfg(feature = "qwen")]
+                                let corrected = if let Some(ref mut corrector) = qwen_corrector {
                                     corrector.correct_text(&raw_text)?
                                 } else {
                                     parakeet::add_punctuation(&raw_text)
-                                }
+                                };
+                                #[cfg(not(feature = "qwen"))]
+                                let corrected = parakeet::add_punctuation(&raw_text);
+                                corrected
                             };
 
                             if !text.is_empty() {
@@ -373,11 +397,15 @@ fn main() -> Result<()> {
                 eprintln!("DEBUG: Raw model output: \"{}\"", raw_text);
 
                 // Use Qwen for correction if available, otherwise fall back to rule-based
-                if let Some(ref mut corrector) = qwen_corrector {
+                #[cfg(feature = "qwen")]
+                let corrected = if let Some(ref mut corrector) = qwen_corrector {
                     corrector.correct_text(&raw_text)?
                 } else {
                     parakeet::add_punctuation_internal(&raw_text, true)
-                }
+                };
+                #[cfg(not(feature = "qwen"))]
+                let corrected = parakeet::add_punctuation_internal(&raw_text, true);
+                corrected
             } else {
                 // Single phrase
                 let raw_text = parakeet::transcribe_streaming_chunk(
@@ -386,11 +414,15 @@ fn main() -> Result<()> {
                 eprintln!("DEBUG: Raw model output: \"{}\"", raw_text);
 
                 // Use Qwen for correction if available, otherwise fall back to rule-based
-                if let Some(ref mut corrector) = qwen_corrector {
+                #[cfg(feature = "qwen")]
+                let corrected = if let Some(ref mut corrector) = qwen_corrector {
                     corrector.correct_text(&raw_text)?
                 } else {
                     parakeet::add_punctuation(&raw_text)
-                }
+                };
+                #[cfg(not(feature = "qwen"))]
+                let corrected = parakeet::add_punctuation(&raw_text);
+                corrected
             };
 
             if !text.is_empty() {

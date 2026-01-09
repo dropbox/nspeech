@@ -15,6 +15,7 @@ path = "src/main.rs"    # !Dash
 default = ["quantized"]  # Quantized inference is default (faster)
 quantized = []            # Use quantized inference (QMatMul with Q8_0/Q4K weights)
 embed-assets = []         # Embed model assets in binary
+qwen = []                 # Enable Qwen3 text correction model (adds ~400MB to assets)
 
 [dependencies]
 anyhow = "1"

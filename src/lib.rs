@@ -142,7 +142,9 @@ use silero::{SileroVad, VadStream};
 // Streaming buffer module (shared between Node.js and CLI examples)
 pub mod streaming_buffer;
 
-// Qwen2.5 model for text correction (punctuation, capitalization)
+// Qwen3 model for text correction (punctuation, capitalization)
+// Only available when "qwen" feature is enabled
+#[cfg(feature = "qwen")]
 pub mod qwen;
 
 /// Transcription result with timestamp
