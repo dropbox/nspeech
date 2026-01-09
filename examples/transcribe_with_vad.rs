@@ -20,6 +20,9 @@ use speech::parakeet;
 #[cfg(feature = "qwen")]
 use speech::qwen::QwenCorrector;
 use std::path::PathBuf;
+use std::time::Instant;
+use log::info;
+use env_logger;
 
 // Import Silero VAD from library
 use speech::silero::{SileroVad, VadStream};
@@ -44,6 +47,11 @@ fn main() -> Result<()> {
 
     let audio_path = &args[1];
     let use_qwen = args.iter().any(|arg| arg == "--use-qwen");
+
+    // Initialize logging
+    env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Info)
+        .init();
 
     println!("Streaming Transcription with Silero VAD");
     println!("========================================\n");
@@ -179,7 +187,11 @@ fn main() -> Result<()> {
     while idx < all_samples.len() {
         let end = (idx + VAD_CHUNK_SIZE).min(all_samples.len());
         let chunk = &all_samples[idx..end];
+
+        let vad_start = Instant::now();
         let probs = vad_stream.push(chunk)?;
+        let vad_elapsed = vad_start.elapsed();
+        //info!("VAD inference: {:.2}ms ({} samples)", vad_elapsed.as_secs_f64() * 1000.0, chunk.len());
 
         // Process VAD probabilities to update speech state
         for prob in probs {
@@ -259,9 +271,14 @@ fn main() -> Result<()> {
                                 for &boundary_pos in &phrase_boundaries {
                                     if boundary_pos > start_idx && boundary_pos <= current_segment.len() {
                                         let phrase_samples = &current_segment[start_idx..boundary_pos];
+
+                                        let asr_start = Instant::now();
                                         let raw_phrase = parakeet::transcribe_streaming_chunk(
                                             phrase_samples, None, None, &model, &device
                                         )?;
+                                        let asr_elapsed = asr_start.elapsed();
+                                        info!("Parakeet ASR (phrase): {:.2}ms ({} samples)", asr_elapsed.as_secs_f64() * 1000.0, phrase_samples.len());
+
                                         if !raw_phrase.is_empty() {
                                             phrases.push(raw_phrase);
                                         }
@@ -272,9 +289,14 @@ fn main() -> Result<()> {
                                 // Final phrase
                                 if start_idx < current_segment.len() {
                                     let final_phrase_samples = &current_segment[start_idx..];
+
+                                    let asr_start = Instant::now();
                                     let raw_phrase = parakeet::transcribe_streaming_chunk(
                                         final_phrase_samples, None, None, &model, &device
                                     )?;
+                                    let asr_elapsed = asr_start.elapsed();
+                                    info!("Parakeet ASR (final phrase): {:.2}ms ({} samples)", asr_elapsed.as_secs_f64() * 1000.0, final_phrase_samples.len());
+
                                     if !raw_phrase.is_empty() {
                                         phrases.push(raw_phrase);
                                     }
@@ -286,7 +308,11 @@ fn main() -> Result<()> {
                                 // Use Qwen for correction if available, otherwise fall back to rule-based
                                 #[cfg(feature = "qwen")]
                                 let corrected = if let Some(ref mut corrector) = qwen_corrector {
-                                    corrector.correct_text(&raw_text)?
+                                    let qwen_start = Instant::now();
+                                    let result = corrector.correct_text(&raw_text)?;
+                                    let qwen_elapsed = qwen_start.elapsed();
+                                    info!("Qwen3 text correction: {:.2}ms ({} chars)", qwen_elapsed.as_secs_f64() * 1000.0, raw_text.len());
+                                    result
                                 } else {
                                     parakeet::add_punctuation_internal(&raw_text, true)
                                 };
@@ -295,15 +321,22 @@ fn main() -> Result<()> {
                                 corrected
                             } else {
                                 // Single phrase
+                                let asr_start = Instant::now();
                                 let raw_text = parakeet::transcribe_streaming_chunk(
                                     &current_segment, None, None, &model, &device
                                 )?;
+                                let asr_elapsed = asr_start.elapsed();
+                                info!("Parakeet ASR (single phrase): {:.2}ms ({} samples)", asr_elapsed.as_secs_f64() * 1000.0, current_segment.len());
                                 eprintln!("DEBUG: Raw model output: \"{}\"", raw_text);
 
                                 // Use Qwen for correction if available, otherwise fall back to rule-based
                                 #[cfg(feature = "qwen")]
                                 let corrected = if let Some(ref mut corrector) = qwen_corrector {
-                                    corrector.correct_text(&raw_text)?
+                                    let qwen_start = Instant::now();
+                                    let result = corrector.correct_text(&raw_text)?;
+                                    let qwen_elapsed = qwen_start.elapsed();
+                                    info!("Qwen3 text correction: {:.2}ms ({} chars)", qwen_elapsed.as_secs_f64() * 1000.0, raw_text.len());
+                                    result
                                 } else {
                                     parakeet::add_punctuation(&raw_text)
                                 };
@@ -372,9 +405,14 @@ fn main() -> Result<()> {
                 for &boundary_pos in &phrase_boundaries {
                     if boundary_pos > start_idx && boundary_pos <= current_segment.len() {
                         let phrase_samples = &current_segment[start_idx..boundary_pos];
+
+                        let asr_start = Instant::now();
                         let raw_phrase = parakeet::transcribe_streaming_chunk(
                             phrase_samples, None, None, &model, &device
                         )?;
+                        let asr_elapsed = asr_start.elapsed();
+                        info!("Parakeet ASR (final segment phrase): {:.2}ms ({} samples)", asr_elapsed.as_secs_f64() * 1000.0, phrase_samples.len());
+
                         if !raw_phrase.is_empty() {
                             phrases.push(raw_phrase);
                         }
@@ -385,9 +423,14 @@ fn main() -> Result<()> {
                 // Final phrase
                 if start_idx < current_segment.len() {
                     let final_phrase_samples = &current_segment[start_idx..];
+
+                    let asr_start = Instant::now();
                     let raw_phrase = parakeet::transcribe_streaming_chunk(
                         final_phrase_samples, None, None, &model, &device
                     )?;
+                    let asr_elapsed = asr_start.elapsed();
+                    info!("Parakeet ASR (final segment final phrase): {:.2}ms ({} samples)", asr_elapsed.as_secs_f64() * 1000.0, final_phrase_samples.len());
+
                     if !raw_phrase.is_empty() {
                         phrases.push(raw_phrase);
                     }
@@ -399,7 +442,11 @@ fn main() -> Result<()> {
                 // Use Qwen for correction if available, otherwise fall back to rule-based
                 #[cfg(feature = "qwen")]
                 let corrected = if let Some(ref mut corrector) = qwen_corrector {
-                    corrector.correct_text(&raw_text)?
+                    let qwen_start = Instant::now();
+                    let result = corrector.correct_text(&raw_text)?;
+                    let qwen_elapsed = qwen_start.elapsed();
+                    info!("Qwen3 text correction (final segment): {:.2}ms ({} chars)", qwen_elapsed.as_secs_f64() * 1000.0, raw_text.len());
+                    result
                 } else {
                     parakeet::add_punctuation_internal(&raw_text, true)
                 };
@@ -408,15 +455,22 @@ fn main() -> Result<()> {
                 corrected
             } else {
                 // Single phrase
+                let asr_start = Instant::now();
                 let raw_text = parakeet::transcribe_streaming_chunk(
                     &current_segment, None, None, &model, &device
                 )?;
+                let asr_elapsed = asr_start.elapsed();
+                info!("Parakeet ASR (final segment single phrase): {:.2}ms ({} samples)", asr_elapsed.as_secs_f64() * 1000.0, current_segment.len());
                 eprintln!("DEBUG: Raw model output: \"{}\"", raw_text);
 
                 // Use Qwen for correction if available, otherwise fall back to rule-based
                 #[cfg(feature = "qwen")]
                 let corrected = if let Some(ref mut corrector) = qwen_corrector {
-                    corrector.correct_text(&raw_text)?
+                    let qwen_start = Instant::now();
+                    let result = corrector.correct_text(&raw_text)?;
+                    let qwen_elapsed = qwen_start.elapsed();
+                    info!("Qwen3 text correction (final segment): {:.2}ms ({} chars)", qwen_elapsed.as_secs_f64() * 1000.0, raw_text.len());
+                    result
                 } else {
                     parakeet::add_punctuation(&raw_text)
                 };
