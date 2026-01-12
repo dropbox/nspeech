@@ -108,6 +108,9 @@ fn main() -> Result<()> {
     };
     let mut transcriber = speech::parakeet::StreamingTransducer::new(model, streaming_config);
 
+    // Accumulate text as we go
+    let mut accumulated_text = String::new();
+
     for chunk_idx in 0..total_chunks {
         let chunk_start_idx = chunk_idx * stride;
         let chunk_end_idx = (chunk_start_idx + SAMPLES_PER_CHUNK).min(samples.len());
@@ -135,11 +138,22 @@ fn main() -> Result<()> {
         print!("{:.1}s processed in {:.2}s ", chunk_samples.len() as f32 / 16000.0, chunk_time.as_secs_f32());
         println!("({} new tokens, {} total)", new_tokens.len(), transcriber.tokens().len());
 
-        // Show partial transcription if we got new tokens
+        // Show NEW text incrementally if we got new tokens
         if !new_tokens.is_empty() {
-            match transcriber.decode_text() {
-                Ok(text) => {
-                    println!("  → {}\n", text.trim());
+            match transcriber.decode_text_incremental() {
+                Ok((new_text, _total_decoded)) => {
+                    if !new_text.is_empty() {
+                        // Print only the NEW text that was decoded
+                        print!("  + \"{}\"", new_text.trim());
+
+                        // Accumulate for full text display
+                        accumulated_text.push_str(&new_text);
+
+                        // Show current full text so far
+                        println!("\n  → Full: {}\n", accumulated_text.trim());
+                    } else {
+                        println!();
+                    }
                 }
                 Err(e) => {
                     println!("  → (decode error: {})\n", e);
@@ -154,12 +168,17 @@ fn main() -> Result<()> {
 
     println!("================================\n");
 
-    // Get final transcription
-    let final_text = transcriber.finalize()?;
+    // Compare accumulated text with final decode
+    let final_text = transcriber.decode_text()?;
 
     println!("=== FINAL TRANSCRIPTION ===");
     println!("{}", final_text.trim());
     println!("===========================\n");
+
+    if accumulated_text.trim() != final_text.trim() {
+        println!("Note: Incremental decode differs slightly from final decode");
+        println!("(This is normal for subword tokenization)\n");
+    }
 
     println!("✓ Streaming transcription complete!");
     println!("\nPerformance:");

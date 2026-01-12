@@ -359,6 +359,34 @@ impl TransducerModel {
         Ok(text)
     }
 
+    /// Decode only new tokens incrementally
+    ///
+    /// This is more efficient for streaming as it only decodes new tokens
+    /// since the last decode operation.
+    ///
+    /// # Arguments
+    /// * `token_ids` - All accumulated token IDs
+    /// * `already_decoded` - Number of tokens already decoded previously
+    ///
+    /// # Returns
+    /// Text for the new tokens only
+    pub fn decode_tokens_incremental(&self, token_ids: &[u32], already_decoded: usize) -> Result<String> {
+        let tokenizer = self.tokenizer.as_ref()
+            .ok_or_else(|| anyhow!("Tokenizer not loaded. Call load_tokenizer() first."))?;
+
+        if already_decoded >= token_ids.len() {
+            // No new tokens
+            return Ok(String::new());
+        }
+
+        // Decode only new tokens
+        let new_tokens = &token_ids[already_decoded..];
+        let new_text = tokenizer.decode(new_tokens, true)
+            .map_err(|e| anyhow!("Failed to decode tokens: {}", e))?;
+
+        Ok(new_text)
+    }
+
     /// Greedy decoding: Simple left-to-right decoding without beam search
     ///
     /// For each encoder timestep, predict the most likely token until blank is emitted.

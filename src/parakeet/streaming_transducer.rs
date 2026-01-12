@@ -53,6 +53,9 @@ pub struct StreamingState {
     /// Accumulated tokens so far
     tokens: Vec<u32>,
 
+    /// Number of tokens already decoded to text
+    tokens_decoded: usize,
+
     /// Configuration
     config: StreamingConfig,
 
@@ -70,6 +73,7 @@ impl StreamingState {
             predictor_states: None,
             last_token: blank_id as u32,
             tokens: Vec::new(),
+            tokens_decoded: 0,
             config,
             blank_id,
             total_samples: 0,
@@ -82,12 +86,23 @@ impl StreamingState {
         self.predictor_states = None;
         self.last_token = self.blank_id as u32;
         self.tokens.clear();
+        self.tokens_decoded = 0;
         self.total_samples = 0;
     }
 
     /// Get accumulated tokens
     pub fn tokens(&self) -> &[u32] {
         &self.tokens
+    }
+
+    /// Get number of tokens already decoded
+    pub fn tokens_decoded(&self) -> usize {
+        self.tokens_decoded
+    }
+
+    /// Mark tokens as decoded
+    pub fn mark_decoded(&mut self, count: usize) {
+        self.tokens_decoded = count;
     }
 }
 
@@ -245,9 +260,42 @@ impl StreamingTransducer {
         self.model.decode_tokens(&self.state.tokens)
     }
 
+    /// Decode only new tokens since last decode (streaming)
+    ///
+    /// This is efficient for streaming as it only decodes new tokens.
+    /// Automatically tracks which tokens have been decoded.
+    ///
+    /// # Returns
+    /// (new_text, total_tokens_decoded)
+    pub fn decode_text_incremental(&mut self) -> Result<(String, usize)> {
+        let already_decoded = self.state.tokens_decoded();
+        let total_tokens = self.state.tokens.len();
+
+        if already_decoded >= total_tokens {
+            // No new tokens to decode
+            return Ok((String::new(), total_tokens));
+        }
+
+        // Decode only new tokens
+        let new_text = self.model.decode_tokens_incremental(
+            &self.state.tokens,
+            already_decoded
+        )?;
+
+        // Update decoded count
+        self.state.mark_decoded(total_tokens);
+
+        Ok((new_text, total_tokens))
+    }
+
     /// Get accumulated tokens
     pub fn tokens(&self) -> &[u32] {
         self.state.tokens()
+    }
+
+    /// Get number of tokens already decoded to text
+    pub fn tokens_decoded(&self) -> usize {
+        self.state.tokens_decoded()
     }
 
     /// Reset state for new stream
