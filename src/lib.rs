@@ -337,7 +337,9 @@ impl SpeechInner {
             let probs = self.vad_stream.push(chunk)
                 .map_err(|e| napi::Error::from_reason(format!("VAD error: {}", e)))?;
 
-            // Each probability corresponds to ~512 samples (32ms at 16kHz)
+            // Each VAD probability represents the speech state for a frame
+            // Note: VAD internally buffers to 512-sample chunks, so probs may be empty
+            // until enough samples accumulate
             for prob in probs {
                 let is_speech = prob >= self.speech_threshold;
 
@@ -449,8 +451,6 @@ impl SpeechInner {
                         }
                     }
                 }
-
-                self.total_samples_processed += 512;
             }
 
             // Always maintain pre-buffer during silence (even within an active segment)
@@ -470,6 +470,10 @@ impl SpeechInner {
             if self.current_segment_start.is_some() {
                 self.current_segment.extend_from_slice(chunk);
             }
+
+            // FIXED: Increment by actual samples processed in this iteration
+            // (not by 512 per VAD probability - that was causing incorrect timestamps)
+            self.total_samples_processed += chunk.len();
 
             idx = end;
         }
