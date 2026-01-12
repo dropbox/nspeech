@@ -115,12 +115,12 @@ def main() -> None:
     size_mb = gguf_path.stat().st_size / (1024 * 1024)
     print(f"    ✓ Downloaded ({size_mb:.1f} MB)")
 
-    # 2. Download tokenizer from official Qwen repo
-    qwen_repo = "Qwen/Qwen3-0.6B-Instruct"
+    # 2. Download tokenizer from base Qwen3-0.6B repo (not Instruct variant)
+    tokenizer_repo = "Qwen/Qwen3-0.6B"
 
-    print(f"\n  Downloading tokenizer from {qwen_repo}...")
+    print(f"\n  Downloading tokenizer from {tokenizer_repo}...")
     tokenizer_path = hf_hub_download(
-        repo_id=qwen_repo,
+        repo_id=tokenizer_repo,
         filename="tokenizer.json",
         cache_dir=str(cache_dir / "huggingface"),
         local_dir=str(cache_dir),
@@ -130,10 +130,10 @@ def main() -> None:
     size_kb = tokenizer_path.stat().st_size / 1024
     print(f"    ✓ Downloaded ({size_kb:.1f} KB)")
 
-    # 3. Download config from official Qwen repo
-    print(f"\n  Downloading config from {qwen_repo}...")
+    # 3. Download config from base Qwen3-0.6B repo
+    print(f"\n  Downloading config from {tokenizer_repo}...")
     config_path = hf_hub_download(
-        repo_id=qwen_repo,
+        repo_id=tokenizer_repo,
         filename="config.json",
         cache_dir=str(cache_dir / "huggingface"),
         local_dir=str(cache_dir),

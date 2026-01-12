@@ -41,6 +41,19 @@ impl QwenCorrector {
         let tokenizer_bytes = QWEN_TOKENIZER.bytes(&assets).map_err(|_| {
             Error::new(ErrorKind::Other, "Failed to load Qwen tokenizer - run: python scripts/download_qwen3.py")
         })?;
+
+        // Validate that the tokenizer bytes are valid JSON (not an error message)
+        if tokenizer_bytes.len() < 100 {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!(
+                    "Qwen tokenizer file is corrupt or incomplete ({} bytes). Contents: {}. Run: python scripts/download_qwen3.py",
+                    tokenizer_bytes.len(),
+                    String::from_utf8_lossy(&tokenizer_bytes)
+                )
+            ).into());
+        }
+
         let tokenizer = Tokenizer::from_bytes(tokenizer_bytes)
             .map_err(|e| Error::new(ErrorKind::Other, format!("Tokenizer error: {}", e)))?;
 
@@ -48,6 +61,17 @@ impl QwenCorrector {
         let gguf_bytes = QWEN_MODEL_Q4.bytes(&assets).map_err(|_| {
             Error::new(ErrorKind::Other, "Failed to load Qwen GGUF model - run: python scripts/download_qwen3.py")
         })?;
+
+        // Validate that the GGUF file is large enough (should be hundreds of MB)
+        if gguf_bytes.len() < 1_000_000 {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!(
+                    "Qwen GGUF model file is corrupt or incomplete ({} bytes). Expected > 1MB. Run: python scripts/download_qwen3.py",
+                    gguf_bytes.len()
+                )
+            ).into());
+        }
 
         // Parse GGUF file
         let mut cursor = std::io::Cursor::new(gguf_bytes);
