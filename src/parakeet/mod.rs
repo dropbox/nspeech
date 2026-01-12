@@ -5,6 +5,7 @@ use candle_core::Device;
 pub mod assets;
 pub mod fast_conformer;
 pub mod features;
+pub mod transducer;
 
 // Re-export commonly used types and functions
 pub use fast_conformer::{
@@ -12,6 +13,12 @@ pub use fast_conformer::{
     load_parakeet_ctc_from_hf, load_parakeet_ctc_from_local,
     load_parakeet_ctc_from_gguf_hf, load_parakeet_ctc_from_gguf_local,
     VAD_CONFIG, VAD_MODEL, // Re-export VAD assets for use in silero module
+};
+
+// Re-export Transducer (TDT) types and functions
+pub use transducer::{
+    TransducerConfig, TransducerModel, PredictionNetwork, JointNetwork,
+    load_parakeet_tdt_from_hf, load_parakeet_tdt_from_local,
 };
 
 // Conditional type alias based on quantized feature

@@ -274,21 +274,21 @@ pub fn load_python_encoder_input<P: AsRef<Path>>(
 /// Extract features from raw PCM samples (16kHz mono, normalized [-1, 1])
 pub fn extract_features_from_samples(
     samples: &[f32],
-    _feat_dim: usize,
+    feat_dim: usize,
     device: &Device,
 ) -> Result<Tensor> {
     if samples.is_empty() {
         return Err(anyhow!("empty audio samples"));
     }
 
-    let fe = ParakeetFeatureExtractor::new(80);
+    let fe = ParakeetFeatureExtractor::new(feat_dim);
     let tensor: Tensor = fe.extract_to_tensor(samples, device)?;
     Ok(tensor)
 }
 
 pub fn load_wav_as_features<P: AsRef<Path>>(
     path: P,
-    _feat_dim: usize,
+    feat_dim: usize,
     device: &Device,
 ) -> Result<Tensor> {
     let mut reader = hound::WavReader::open(&path)?;
@@ -322,5 +322,5 @@ pub fn load_wav_as_features<P: AsRef<Path>>(
         _ => return Err(anyhow!("unsupported WAV format")),
     };
 
-    extract_features_from_samples(&samples, 80, device)
+    extract_features_from_samples(&samples, feat_dim, device)
 }
