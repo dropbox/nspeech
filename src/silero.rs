@@ -4,8 +4,9 @@ use candle_nn as nn;
 use serde::Deserialize;
 use std::path::Path;
 
-// Import VAD assets
-use crate::parakeet::{VAD_CONFIG, VAD_MODEL};
+use crate::embed_zst_asset;
+embed_zst_asset!(pub VAD_CONFIG,                     "vad16.config.json.zst");
+embed_zst_asset!(pub VAD_MODEL,                      "vad16.safetensors.zst");
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct VadConfig {

@@ -13,9 +13,14 @@ use candle_transformers::models::quantized_qwen3::ModelWeights as Qwen3Model;
 use std::io::{Error, ErrorKind};
 use std::path::Path;
 use tokenizers::Tokenizer;
+use crate::embed_zst_asset;
 
 // Import Qwen assets (declared in parakeet fast_conformer module)
-use crate::parakeet::fast_conformer::{QWEN_MODEL_Q4, QWEN_TOKENIZER};
+// Qwen3-0.6B-Instruct for text correction (only when "qwen" feature enabled)
+embed_zst_asset!(QWEN_CONFIG,                    "qwen3-0.6b-instruct-config.json.zst");
+embed_zst_asset!(QWEN_TOKENIZER,                 "qwen3-0.6b-instruct-tokenizer.json.zst");
+embed_zst_asset!(QWEN_MODEL_Q4,                  "qwen3-0.6b-instruct-q4_k_m.gguf.zst");
+
 
 /// Qwen text correction model
 pub struct QwenCorrector {
