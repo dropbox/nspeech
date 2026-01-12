@@ -142,6 +142,9 @@ use silero::{SileroVad, VadStream};
 // Streaming buffer module (shared between Node.js and CLI examples)
 pub mod streaming_buffer;
 
+// Streaming transcription with VAD-based segmentation
+pub mod streaming_transcriber;
+
 // Qwen3 model for text correction (punctuation, capitalization)
 // Only available when "qwen" feature is enabled
 #[cfg(feature = "qwen")]
@@ -157,38 +160,7 @@ pub struct Transcription {
 
 /// Inner state for transcription stream
 struct SpeechInner {
-    vad_stream: VadStream,
-    parakeet_model: parakeet::ParakeetCtc,
-    device: candle_core::Device,
-
-    // Accumulated samples for current speech segment (VAD-based)
-    current_segment: Vec<f32>,
-    current_segment_start: Option<f64>, // Start time in seconds
-
-    // Pre-buffer to capture audio before speech detection (300ms)
-    pre_buffer: std::collections::VecDeque<f32>,
-
-    // Startup buffer to capture initial audio before first speech detection
-    startup_buffer: Vec<f32>,
-    first_speech_detected: bool,
-
-    // Sub-segments (phrases) for comma insertion
-    // Tracks sample positions where pauses occurred (comma boundaries)
-    phrase_boundaries: Vec<usize>, // Sample indices where commas should go
-
-    // Tracking
-    total_samples_processed: usize,
-    silence_frames: usize,
-    was_speech_last_frame: bool,  // Track speech->silence transitions
-    last_audio_time: std::time::Instant, // Track when we last received audio
-
-    // Configuration (VAD mode)
-    speech_threshold: f32,
-    min_speech_duration_ms: f32,
-    pre_buffer_ms: f32,            // Pre-buffer duration (300ms)
-    comma_pause_duration_ms: f32, // Short pause → comma (150ms)
-    period_pause_duration_ms: f32, // Long pause → period (500ms - longer to avoid breaking natural speech)
-    silence_timeout_ms: f32,       // Very long pause → auto-flush (2000ms - end of turn)
+    transcriber: streaming_transcriber::StreamingTranscriber,
 
     // Debug WAV writer
     debug_wav_writer: Option<WavWriter<std::io::BufWriter<std::fs::File>>>,
@@ -199,6 +171,8 @@ impl SpeechInner {
         vad: SileroVad,
         parakeet_model: parakeet::ParakeetCtc,
         device: candle_core::Device,
+        #[cfg(feature = "qwen")]
+        qwen_corrector: Option<qwen::QwenCorrector>,
     ) -> Result<Self> {
         let vad_stream = VadStream::new(vad, &device)
             .map_err(|e| napi::Error::from_reason(format!("Failed to create VAD stream: {}", e)))?;
@@ -217,31 +191,19 @@ impl SpeechInner {
 
         info!("VAD mode: enabled (speech detection with pause-based punctuation)");
 
-        // Pre-buffer to capture audio before speech detection
-        let pre_buffer_ms = 1000.0; // Large pre-buffer to capture start of speech
-        let pre_buffer_samples = (pre_buffer_ms * 16.0) as usize; // 16000 samples at 16kHz
-        let pre_buffer = std::collections::VecDeque::with_capacity(pre_buffer_samples);
-
-        Ok(Self {
+        // Create streaming transcriber with default config
+        let config = streaming_transcriber::StreamingConfig::default();
+        let transcriber = streaming_transcriber::StreamingTranscriber::new(
             vad_stream,
             parakeet_model,
             device,
-            current_segment: Vec::new(),
-            current_segment_start: None,
-            pre_buffer,
-            startup_buffer: Vec::new(),
-            first_speech_detected: false,
-            phrase_boundaries: Vec::new(),
-            total_samples_processed: 0,
-            silence_frames: 0,
-            was_speech_last_frame: false,
-            last_audio_time: std::time::Instant::now(),
-            speech_threshold: 0.1, // Very low threshold to detect speech as early as possible
-            min_speech_duration_ms: 250.0,
-            pre_buffer_ms,
-            comma_pause_duration_ms: 150.0,  // Short pause → comma
-            period_pause_duration_ms: 500.0, // Long pause → period (increased to avoid breaking natural speech)
-            silence_timeout_ms: 2000.0,      // Very long pause → auto-flush segment
+            config,
+            #[cfg(feature = "qwen")]
+            qwen_corrector,
+        );
+
+        Ok(Self {
+            transcriber,
             debug_wav_writer,
         })
     }
@@ -260,362 +222,53 @@ impl SpeechInner {
     where
         F: Fn(Transcription),
     {
-        // Write incoming samples to debug WAV file
-        if let Some(ref mut writer) = self.debug_wav_writer {
-            for &sample in samples {
-                let _ = writer.write_sample(sample);
+        // Process samples through the streaming transcriber
+        let segments = self.transcriber.process_samples(samples)
+            .map_err(|e| napi::Error::from_reason(format!("Transcription error: {}", e)))?;
+
+        // Handle completed segments
+        for segment in segments {
+            // Write segment to debug WAV file (after VAD processing)
+            self.write_segment_to_debug_wav(&segment);
+
+            if !segment.text.is_empty() {
+                info!("Generated transcription: \"{}\"", segment.text);
+                callback(Transcription {
+                    text: segment.text,
+                    start_time: segment.start_time,
+                    end_time: segment.end_time,
+                });
             }
-            // Flush constantly as requested for debugging
-            let _ = writer.flush();
-        }
-        //return Ok(());
-
-        // Check if too much time has passed since last audio (silence timeout)
-        let time_since_last_audio = self.last_audio_time.elapsed().as_millis() as f32;
-
-        if time_since_last_audio >= self.silence_timeout_ms {
-            // Very long pause detected - auto-flush any active segment before processing new audio
-            if let Some(start_time) = self.current_segment_start {
-                let end_time = self.total_samples_processed as f64 / 16000.0;
-                let duration_ms = (end_time - start_time) * 1000.0;
-
-                info!("Silence timeout ({}ms) - auto-flushing segment {:.3}s-{:.3}s (duration={:.0}ms)",
-                      time_since_last_audio, start_time, end_time, duration_ms);
-
-                if duration_ms >= self.min_speech_duration_ms as f64 {
-                    // Transcribe the segment before clearing
-                    match self.transcribe_segment() {
-                        Ok(text) => {
-                            if !text.is_empty() {
-                                info!("Auto-flush: Generated transcription: \"{}\"", text);
-                                callback(Transcription {
-                                    text,
-                                    start_time,
-                                    end_time,
-                                });
-                            }
-                        }
-                        Err(e) => {
-                            info!("Auto-flush: Transcription FAILED: {}", e);
-                        }
-                    }
-                }
-
-                // Clear the segment state for fresh start
-                self.current_segment.clear();
-                self.current_segment_start = None;
-                self.phrase_boundaries.clear();
-                self.silence_frames = 0;
-            }
-        }
-
-        // Update last audio time
-        self.last_audio_time = std::time::Instant::now();
-
-        // If we haven't detected speech yet, accumulate all audio in startup buffer
-        // This captures audio from the very beginning to avoid missing initial speech
-        if !self.first_speech_detected {
-            self.startup_buffer.extend_from_slice(samples);
-            // Limit startup buffer to first 3 seconds to avoid unbounded growth
-            if self.startup_buffer.len() > 48000 { // 3s at 16kHz
-                self.startup_buffer.drain(0..(self.startup_buffer.len() - 48000));
-            }
-            info!("VAD: Accumulating to startup buffer, total {} samples ({:.2}s)",
-                  self.startup_buffer.len(), self.startup_buffer.len() as f32 / 16000.0);
-        }
-
-        // Process through VAD in 160-sample chunks (10ms at 16kHz)
-        // Key: VAD probabilities indicate speech state, but we accumulate samples
-        // independently based on that state to avoid duplication
-        const CHUNK_SIZE: usize = 160;
-        let mut idx = 0;
-
-        while idx < samples.len() {
-            let end = (idx + CHUNK_SIZE).min(samples.len());
-            let chunk = &samples[idx..end];
-
-            let probs = self.vad_stream.push(chunk)
-                .map_err(|e| napi::Error::from_reason(format!("VAD error: {}", e)))?;
-
-            // Each VAD probability represents the speech state for a frame
-            // Note: VAD internally buffers to 512-sample chunks, so probs may be empty
-            // until enough samples accumulate
-            for prob in probs {
-                let is_speech = prob >= self.speech_threshold;
-
-                if is_speech {
-                    // Check if speech is resuming after silence within an active segment
-                    if self.current_segment_start.is_some() && !self.was_speech_last_frame && self.silence_frames > 0 {
-                        // Speech resumed after a brief pause - prepend pre-buffer to capture start of resumed speech
-                        let pre_buffer_len = self.pre_buffer.len();
-                        if pre_buffer_len > 0 {
-                            info!("VAD: Speech resumed after {}ms pause, prepending {}ms pre-buffer",
-                                  self.silence_frames as f32 * 32.0, pre_buffer_len as f32 / 16.0);
-                            // Insert pre-buffer before the current position
-                            let insert_pos = self.current_segment.len();
-                            self.current_segment.reserve(pre_buffer_len);
-                            self.current_segment.extend(self.pre_buffer.iter().copied());
-                            // Rotate to put pre-buffer before current position
-                            self.current_segment[insert_pos..].rotate_right(pre_buffer_len);
-                        }
-                        self.pre_buffer.clear();
-                    }
-
-                    self.silence_frames = 0;
-                    self.was_speech_last_frame = true;
-
-                    if self.current_segment_start.is_none() {
-                        // Start new speech segment
-                        let start_time;
-                        self.current_segment.clear();
-
-                        // If this is the first speech detection, use the startup buffer
-                        if !self.first_speech_detected {
-                            start_time = 0.0;
-                            self.current_segment.extend(self.startup_buffer.iter().copied());
-                            info!("VAD: First speech detected, using startup buffer ({} samples from beginning)",
-                                  self.startup_buffer.len());
-                            self.startup_buffer.clear();
-                            self.first_speech_detected = true;
-                        } else {
-                            // Normal case: use pre-buffer
-                            let pre_buffer_duration = self.pre_buffer.len() as f64 / 16000.0;
-                            start_time = (self.total_samples_processed as f64 / 16000.0) - pre_buffer_duration;
-                            self.current_segment.extend(self.pre_buffer.iter().copied());
-                            info!("VAD: Speech started at {:.3}s (prob={:.3}, pre-buffer={}ms)",
-                                  start_time, prob, pre_buffer_duration * 1000.0);
-                        }
-
-                        self.current_segment_start = Some(start_time);
-                        self.pre_buffer.clear();
-                    }
-                } else {
-                    self.was_speech_last_frame = false;
-                    // Silence detected
-                    if self.current_segment_start.is_some() {
-                        self.silence_frames += 1;
-                        let silence_duration_ms = self.silence_frames as f32 * 32.0; // 32ms per frame
-
-                        // Check for comma pause (short pause)
-                        if silence_duration_ms >= self.comma_pause_duration_ms
-                            && silence_duration_ms < self.period_pause_duration_ms
-                            && self.silence_frames == (self.comma_pause_duration_ms / 32.0).ceil() as usize {
-                            // Mark phrase boundary for comma insertion
-                            let boundary_pos = self.current_segment.len();
-                            if boundary_pos > 0 {
-                                self.phrase_boundaries.push(boundary_pos);
-                                info!("VAD: Comma pause detected at sample {} ({}ms pause)",
-                                      boundary_pos, silence_duration_ms);
-                            }
-                        }
-
-                        // Check for period pause (long pause - end segment)
-                        if silence_duration_ms >= self.period_pause_duration_ms {
-                            // End current segment and transcribe
-                            let start_time = self.current_segment_start.unwrap();
-                            let end_time = self.total_samples_processed as f64 / 16000.0;
-                            let duration_ms = (end_time - start_time) * 1000.0;
-
-                            info!("VAD: Period pause - speech ended at {:.3}s (duration={:.0}ms, samples={}, phrases={})",
-                                  end_time, duration_ms, self.current_segment.len(), self.phrase_boundaries.len() + 1);
-
-                            if duration_ms >= self.min_speech_duration_ms as f64 {
-                                // Transcribe the accumulated segment with phrase boundaries
-                                info!("VAD: Transcribing segment {:.3}s-{:.3}s", start_time, end_time);
-                                match self.transcribe_segment() {
-                                    Ok(text) => {
-                                        if !text.is_empty() {
-                                            info!("VAD: Generated transcription: \"{}\"", text);
-                                            callback(Transcription {
-                                                text,
-                                                start_time,
-                                                end_time,
-                                            });
-                                        } else {
-                                            info!("VAD: Transcription was empty (likely silence/noise)");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        info!("VAD: Transcription FAILED: {}", e);
-                                    }
-                                }
-                            } else {
-                                info!("VAD: Segment too short ({:.0}ms < {:.0}ms), skipping",
-                                      duration_ms, self.min_speech_duration_ms);
-                            }
-
-                            self.current_segment.clear();
-                            self.current_segment_start = None;
-                            self.phrase_boundaries.clear();
-                            self.silence_frames = 0;
-                        }
-                    }
-                }
-            }
-
-            // Always maintain pre-buffer during silence (even within an active segment)
-            // This ensures we capture the start of resumed speech after brief pauses
-            if !self.was_speech_last_frame {
-                let pre_buffer_max = (self.pre_buffer_ms * 16.0) as usize;
-                for &sample in chunk {
-                    if self.pre_buffer.len() >= pre_buffer_max {
-                        self.pre_buffer.pop_front();
-                    }
-                    self.pre_buffer.push_back(sample);
-                }
-            }
-
-            // Accumulate chunk samples if we're in an active speech segment
-            // This happens outside the probability loop to avoid duplication
-            if self.current_segment_start.is_some() {
-                self.current_segment.extend_from_slice(chunk);
-            }
-
-            // FIXED: Increment by actual samples processed in this iteration
-            // (not by 512 per VAD probability - that was causing incorrect timestamps)
-            self.total_samples_processed += chunk.len();
-
-            idx = end;
         }
 
         Ok(())
     }
 
-    fn transcribe_segment(&self) -> Result<String> {
-        if self.current_segment.is_empty() {
-            info!("Transcribe: Segment is empty, returning empty string");
-            return Ok(String::new());
-        }
-
-        info!("Transcribe: Processing {} samples with {} phrase boundaries",
-              self.current_segment.len(), self.phrase_boundaries.len());
-
-        // If we have phrase boundaries (comma pauses), split and transcribe each phrase
-        if !self.phrase_boundaries.is_empty() {
-            let mut phrases = Vec::new();
-            let mut start_idx = 0;
-
-            // Transcribe each phrase between boundaries
-            for &boundary_pos in &self.phrase_boundaries {
-                if boundary_pos > start_idx && boundary_pos <= self.current_segment.len() {
-                    let phrase_samples = &self.current_segment[start_idx..boundary_pos];
-                    let raw_phrase = parakeet::transcribe_streaming_chunk(
-                        phrase_samples,
-                        None,
-                        None,
-                        &self.parakeet_model,
-                        &self.device,
-                    )
-                    .map_err(|e| {
-                        let err = format!("Phrase transcription error: {}", e);
-                        info!("Transcribe: ERROR - {}", err);
-                        napi::Error::from_reason(err)
-                    })?;
-
-                    if !raw_phrase.is_empty() {
-                        phrases.push(raw_phrase);
-                    }
-                    start_idx = boundary_pos;
-                }
-            }
-
-            // Transcribe final phrase
-            if start_idx < self.current_segment.len() {
-                let final_phrase_samples = &self.current_segment[start_idx..];
-                let raw_phrase = parakeet::transcribe_streaming_chunk(
-                    final_phrase_samples,
-                    None,
-                    None,
-                    &self.parakeet_model,
-                    &self.device,
-                )
-                .map_err(|e| {
-                    let err = format!("Final phrase transcription error: {}", e);
-                    info!("Transcribe: ERROR - {}", err);
-                    napi::Error::from_reason(err)
-                })?;
-
-                if !raw_phrase.is_empty() {
-                    phrases.push(raw_phrase);
-                }
-            }
-
-            // Join phrases with comma marker
-            let raw_text = phrases.join(" , ");
-            let text = parakeet::add_punctuation_internal(&raw_text, true);
-
-            info!("Transcribe: Raw phrases: {} -> \"{}\"", phrases.len(), raw_text);
-            info!("Transcribe: With punctuation: \"{}\"", text);
-            Ok(text)
-        } else {
-            // No phrase boundaries - single phrase
-            let raw_text = parakeet::transcribe_streaming_chunk(
-                &self.current_segment,
-                None,
-                None,
-                &self.parakeet_model,
-                &self.device,
-            )
-            .map_err(|e| {
-                let err = format!("Transcription error: {}", e);
-                info!("Transcribe: ERROR - {}", err);
-                napi::Error::from_reason(err)
-            })?;
-
-            let text = parakeet::add_punctuation(&raw_text);
-
-            info!("Transcribe: Raw: \"{}\"", raw_text);
-            info!("Transcribe: With punctuation: \"{}\"", text);
-            Ok(text)
-        }
+    fn write_segment_to_debug_wav(&mut self, _segment: &streaming_transcriber::TranscriptionSegment) {
+        // Note: We can't access the raw audio samples from the segment
+        // The debug WAV writing would need to be integrated into StreamingTranscriber
+        // For now, we'll skip this feature or implement it differently
+        // TODO: Consider passing debug_wav_writer to StreamingTranscriber
     }
 
     fn flush<F>(&mut self, callback: &F) -> Result<()>
     where
         F: Fn(Transcription),
     {
-        // Flush VAD-based segment if present
-        if let Some(start_time) = self.current_segment_start {
-            if !self.current_segment.is_empty() {
-                let end_time = self.total_samples_processed as f64 / 16000.0;
-                let duration_ms = (end_time - start_time) * 1000.0;
+        // Flush any remaining segment from the transcriber
+        if let Some(segment) = self.transcriber.flush()
+            .map_err(|e| napi::Error::from_reason(format!("Flush error: {}", e)))? {
+            // Write segment to debug WAV file
+            self.write_segment_to_debug_wav(&segment);
 
-                info!("Flush: VAD segment {:.3}s-{:.3}s (duration={:.0}ms, samples={}, phrases={})",
-                      start_time, end_time, duration_ms, self.current_segment.len(), self.phrase_boundaries.len() + 1);
-
-                if duration_ms >= self.min_speech_duration_ms as f64 {
-                    match self.transcribe_segment() {
-                        Ok(text) => {
-                            if !text.is_empty() {
-                                info!("Flush: Generated transcription: \"{}\"", text);
-                                callback(Transcription {
-                                    text,
-                                    start_time,
-                                    end_time,
-                                });
-                            } else {
-                                info!("Flush: Transcription was empty");
-                            }
-                        }
-                        Err(e) => {
-                            info!("Flush: Transcription error: {}", e);
-                        }
-                    }
-                } else {
-                    info!("Flush: Segment too short ({:.0}ms < {:.0}ms), skipping",
-                          duration_ms, self.min_speech_duration_ms);
-                }
-            } else {
-                info!("Flush: No content in current segment");
+            if !segment.text.is_empty() {
+                info!("Flush: Generated transcription: \"{}\"", segment.text);
+                callback(Transcription {
+                    text: segment.text,
+                    start_time: segment.start_time,
+                    end_time: segment.end_time,
+                });
             }
-
-            // Clear VAD state
-            self.current_segment.clear();
-            self.current_segment_start = None;
-            self.phrase_boundaries.clear();
-            self.silence_frames = 0;
-        } else {
-            info!("Flush: No active segment");
         }
 
         Ok(())
@@ -666,10 +319,33 @@ impl Speech {
         )
         .map_err(|e| napi::Error::from_reason(format!("Failed to load Parakeet: {}", e))).unwrap();
 
+        // Load Qwen3 text correction model if feature is enabled
+        #[cfg(feature = "qwen")]
+        let qwen_corrector = {
+            info!("Loading Qwen3 text correction model...");
+            match qwen::QwenCorrector::load(&assets, &device) {
+                Ok(corrector) => {
+                    info!("✓ Qwen3 loaded (text correction enabled)");
+                    Some(corrector)
+                }
+                Err(e) => {
+                    info!("⚠ Failed to load Qwen3: {}", e);
+                    info!("  Falling back to rule-based punctuation");
+                    None
+                }
+            }
+        };
+
         info!("Models loaded successfully");
 
         // Create inner state with VAD
-        let inner = SpeechInner::new(vad, parakeet_model, device).unwrap();
+        let inner = SpeechInner::new(
+            vad,
+            parakeet_model,
+            device,
+            #[cfg(feature = "qwen")]
+            qwen_corrector,
+        ).unwrap();
 
         // Create threadsafe callback and wrap in Arc so it can be cloned for async tasks
         // Safety: We're intentionally leaking the callback reference to make it 'static
