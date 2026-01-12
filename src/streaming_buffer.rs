@@ -66,7 +66,8 @@ impl StreamingBuffer {
         self.samples_since_commit += samples.len();
 
         // Check if we should commit (buffer has rolled over)
-        self.samples_since_commit >= self.max_buffer_samples
+        // Return true only when buffer exceeds capacity (starts dropping samples)
+        self.samples_since_commit > self.max_buffer_samples
     }
 
     /// Get the current buffer contents for transcription

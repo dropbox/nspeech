@@ -188,10 +188,11 @@ fn main() -> Result<()> {
         let end = (idx + VAD_CHUNK_SIZE).min(all_samples.len());
         let chunk = &all_samples[idx..end];
 
-        let vad_start = Instant::now();
+        let _vad_start = Instant::now();
         let probs = vad_stream.push(chunk)?;
-        let vad_elapsed = vad_start.elapsed();
-        //info!("VAD inference: {:.2}ms ({} samples)", vad_elapsed.as_secs_f64() * 1000.0, chunk.len());
+        // Uncomment to log VAD timing:
+        // let vad_elapsed = vad_start.elapsed();
+        // info!("VAD inference: {:.2}ms ({} samples)", vad_elapsed.as_secs_f64() * 1000.0, chunk.len());
 
         // Process VAD probabilities to update speech state
         for prob in probs {

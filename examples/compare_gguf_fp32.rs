@@ -7,6 +7,7 @@
 use anyhow::Result;
 use candle_core::{quantized::gguf_file, DType};
 use candle_nn::VarBuilder;
+use speech::parakeet;
 use std::path::Path;
 
 fn compute_stats(data: &[f32]) -> (f32, f32, f32, f32) {

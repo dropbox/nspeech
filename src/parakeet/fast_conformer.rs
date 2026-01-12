@@ -1252,7 +1252,7 @@ pub fn load_parakeet_ctc_from_local<P: AsRef<Path>>(
 ///
 /// # Example
 /// ```no_run
-/// use parakeet::{load_parakeet_ctc_from_gguf_hf, get_device};
+/// use speech::parakeet::{load_parakeet_ctc_from_gguf_hf, get_device};
 /// let device = get_device()?;
 /// let model = load_parakeet_ctc_from_gguf_hf("nvidia/parakeet-ctc-0.6b", "model_q8_0.gguf", &device)?;
 /// # Ok::<(), anyhow::Error>(())
@@ -1303,7 +1303,7 @@ pub fn load_parakeet_ctc_from_gguf_hf(
 ///
 /// # Example
 /// ```no_run
-/// use parakeet::{load_parakeet_ctc_from_gguf_local, get_device};
+/// use speech::parakeet::{load_parakeet_ctc_from_gguf_local, get_device};
 /// let device = get_device()?;
 /// let model = load_parakeet_ctc_from_gguf_local("assets", &device)?;
 /// # Ok::<(), anyhow::Error>(())
