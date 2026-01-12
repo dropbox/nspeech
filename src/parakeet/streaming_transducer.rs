@@ -64,6 +64,9 @@ pub struct StreamingState {
 
     /// Total audio samples processed
     total_samples: usize,
+
+    /// Number of chunks processed (for tracking first vs subsequent chunks)
+    chunks_processed: usize,
 }
 
 impl StreamingState {
@@ -77,6 +80,7 @@ impl StreamingState {
             config,
             blank_id,
             total_samples: 0,
+            chunks_processed: 0,
         }
     }
 
@@ -88,6 +92,7 @@ impl StreamingState {
         self.tokens.clear();
         self.tokens_decoded = 0;
         self.total_samples = 0;
+        self.chunks_processed = 0;
     }
 
     /// Get accumulated tokens
@@ -175,23 +180,35 @@ impl StreamingTransducer {
     /// # Returns
     /// Tokens decoded from these features
     pub fn process_features(&mut self, features: &Tensor) -> Result<Vec<u32>> {
-        let (batch_size, _frames, _feat_dim) = features.dims3()?;
+        let (batch_size, _mel_frames, _feat_dim) = features.dims3()?;
         assert_eq!(batch_size, 1, "Streaming only supports batch_size=1");
 
         // Run encoder on features
         let encoder_out = self.model.encoder.forward(features, false)?;
         let (_, enc_frames, _) = encoder_out.dims3()?;
 
-        // Decode tokens
+        // Decode tokens maintaining LSTM state across chunks
+        // The overlap provides acoustic context to the encoder
+        // Carrying predictor state maintains language model continuity
         let chunk_tokens = self.decode_chunk(&encoder_out, enc_frames)?;
 
         // Accumulate tokens
         self.state.tokens.extend(&chunk_tokens);
 
+        // Increment chunk counter
+        self.state.chunks_processed += 1;
+
         Ok(chunk_tokens)
     }
 
     /// Decode tokens from encoder output using greedy decoding
+    ///
+    /// # Arguments
+    /// * `encoder_out` - Encoder output tensor [1, T, enc_dim]
+    /// * `num_frames` - Number of encoder frames to process
+    ///
+    /// # Returns
+    /// Decoded tokens
     fn decode_chunk(&mut self, encoder_out: &Tensor, num_frames: usize) -> Result<Vec<u32>> {
         let mut decoded = Vec::new();
 
