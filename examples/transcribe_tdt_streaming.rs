@@ -80,21 +80,39 @@ fn main() -> Result<()> {
     // Feature extractor
     let feat_extractor = ParakeetFeatureExtractor::new(128);  // TDT uses 128 mel bins
 
-    // Process audio in chunks of ~3 seconds
-    // This is large enough for the encoder to have sufficient context
-    const CHUNK_SECONDS: f32 = 3.0;
-    const SAMPLES_PER_CHUNK: usize = (16000.0 * CHUNK_SECONDS) as usize;  // 3s at 16kHz
-    let total_chunks = (samples.len() + SAMPLES_PER_CHUNK - 1) / SAMPLES_PER_CHUNK;
+    // Configure streaming with overlapping chunks
+    // Larger chunks = better accuracy, higher latency
+    // Overlap provides context for better boundary handling
+    const CHUNK_SECONDS: f32 = 2.0;
+    const OVERLAP_SECONDS: f32 = 0.5;
+    const SAMPLES_PER_CHUNK: usize = (16000.0 * CHUNK_SECONDS) as usize;
+    const OVERLAP_SAMPLES: usize = (16000.0 * OVERLAP_SECONDS) as usize;
+
+    let stride = SAMPLES_PER_CHUNK - OVERLAP_SAMPLES;
+    let total_chunks = (samples.len() + stride - 1) / stride;
 
     println!("Streaming configuration:");
     println!("  Chunk size: {:.1}s ({} samples)", CHUNK_SECONDS, SAMPLES_PER_CHUNK);
+    println!("  Overlap: {:.1}s ({} samples)", OVERLAP_SECONDS, OVERLAP_SAMPLES);
+    println!("  Stride: {} samples", stride);
     println!("  Total chunks: {}\n", total_chunks);
     println!("=== STREAMING TRANSCRIPTION ===\n");
 
     let start_time = std::time::Instant::now();
-    let mut all_text = Vec::new();
 
-    for (chunk_idx, chunk_samples) in samples.chunks(SAMPLES_PER_CHUNK).enumerate() {
+    // Use StreamingTransducer for state management
+    let streaming_config = speech::parakeet::StreamingConfig {
+        chunk_samples: SAMPLES_PER_CHUNK,
+        overlap_samples: OVERLAP_SAMPLES,
+        emit_partial: true,
+    };
+    let mut transcriber = speech::parakeet::StreamingTransducer::new(model, streaming_config);
+
+    for chunk_idx in 0..total_chunks {
+        let chunk_start_idx = chunk_idx * stride;
+        let chunk_end_idx = (chunk_start_idx + SAMPLES_PER_CHUNK).min(samples.len());
+        let chunk_samples = &samples[chunk_start_idx..chunk_end_idx];
+
         let chunk_start = std::time::Instant::now();
 
         // Extract features for this chunk
@@ -107,32 +125,37 @@ fn main() -> Result<()> {
             features
         };
 
-        // Run encoder
-        let encoder_out = model.encoder.forward(&features, false)?;
-
-        // Greedy decode
-        let tokens = model.greedy_decode(&encoder_out)?;
-
-        // Decode to text
-        let text = model.decode_tokens(&tokens)?;
+        // Process features through streaming transcriber
+        let new_tokens = transcriber.process_features(&features)?;
 
         let chunk_time = chunk_start.elapsed();
 
         // Print progress
         print!("[Chunk {}/{}] ", chunk_idx + 1, total_chunks);
         print!("{:.1}s processed in {:.2}s ", chunk_samples.len() as f32 / 16000.0, chunk_time.as_secs_f32());
-        println!("({} tokens)", tokens.len());
-        println!("  → {}\n", text.trim());
+        println!("({} new tokens, {} total)", new_tokens.len(), transcriber.tokens().len());
 
-        all_text.push(text);
+        // Show partial transcription if we got new tokens
+        if !new_tokens.is_empty() {
+            match transcriber.decode_text() {
+                Ok(text) => {
+                    println!("  → {}\n", text.trim());
+                }
+                Err(e) => {
+                    println!("  → (decode error: {})\n", e);
+                }
+            }
+        } else {
+            println!();
+        }
     }
 
     let total_time = start_time.elapsed();
 
     println!("================================\n");
 
-    // Combine all chunks
-    let final_text = all_text.join(" ");
+    // Get final transcription
+    let final_text = transcriber.finalize()?;
 
     println!("=== FINAL TRANSCRIPTION ===");
     println!("{}", final_text.trim());
@@ -144,12 +167,15 @@ fn main() -> Result<()> {
     println!("  Audio duration: {:.2}s", samples.len() as f32 / spec.sample_rate as f32);
     println!("  Real-time factor: {:.2}x", total_time.as_secs_f32() / (samples.len() as f32 / spec.sample_rate as f32));
     println!("\nStreaming approach:");
-    println!("  - Processes audio in {:.1}s chunks", CHUNK_SECONDS);
-    println!("  - Emits results as each chunk completes");
+    println!("  - Processes audio in {:.1}s chunks with {:.1}s overlap", CHUNK_SECONDS, OVERLAP_SECONDS);
+    println!("  - Maintains predictor (LSTM) state across chunks");
+    println!("  - Emits results incrementally as each chunk completes");
     println!("  - Suitable for buffered/near-realtime applications");
-    println!("\nFor true streaming with frame-level latency:");
-    println!("  - Requires attention caching (not yet implemented)");
-    println!("  - Would process ~40ms chunks with cached attention");
+    println!("\nLatency characteristics:");
+    println!("  - Chunk latency: ~{:.1}s (buffering + processing)", CHUNK_SECONDS + 0.5);
+    println!("  - For true frame-level streaming:");
+    println!("    * Requires attention caching (in development)");
+    println!("    * Would process ~40-80ms chunks with <100ms latency");
 
     Ok(())
 }

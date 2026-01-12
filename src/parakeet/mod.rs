@@ -7,6 +7,7 @@ pub mod fast_conformer;
 pub mod features;
 pub mod transducer;
 pub mod streaming_transducer;
+pub mod streaming_encoder;
 
 // Re-export commonly used types and functions
 pub use fast_conformer::{

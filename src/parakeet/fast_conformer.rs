@@ -859,7 +859,7 @@ pub struct FastConformerEncoder {
     blocks: Vec<FastConformerBlock>,
     pos_dropout: Dropout,
     pos_dropout_positions: Dropout,
-    cfg: FastConformerConfig,
+    pub cfg: FastConformerConfig,
 }
 
 impl FastConformerEncoder {
