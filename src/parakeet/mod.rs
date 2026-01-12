@@ -6,6 +6,7 @@ pub mod assets;
 pub mod fast_conformer;
 pub mod features;
 pub mod transducer;
+pub mod streaming_transducer;
 
 // Re-export commonly used types and functions
 pub use fast_conformer::{
@@ -19,6 +20,11 @@ pub use fast_conformer::{
 pub use transducer::{
     TransducerConfig, TransducerModel, PredictionNetwork, JointNetwork,
     load_parakeet_tdt_from_hf, load_parakeet_tdt_from_local,
+};
+
+// Re-export Streaming Transducer types
+pub use streaming_transducer::{
+    StreamingTransducer, StreamingConfig, StreamingState,
 };
 
 // Conditional type alias based on quantized feature
