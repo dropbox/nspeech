@@ -30,6 +30,7 @@ pub trait ParakeetCtcModel {
     fn forward(&self, xs: &candle_core::Tensor, train: bool) -> Result<candle_core::Tensor>;
     fn greedy_decode(&self, logits: &candle_core::Tensor) -> Result<Vec<String>>;
     fn config(&self) -> &FastConformerConfig;
+    fn dtype(&self) -> candle_core::DType;
 }
 
 // Implement trait for regular model
@@ -43,6 +44,9 @@ impl ParakeetCtcModel for ParakeetFastConformerCtc {
     fn config(&self) -> &FastConformerConfig {
         &self.cfg
     }
+    fn dtype(&self) -> candle_core::DType {
+        self.dtype
+    }
 }
 
 // Implement trait for quantized model
@@ -55,6 +59,10 @@ impl ParakeetCtcModel for QParakeetFastConformerCtc {
     }
     fn config(&self) -> &FastConformerConfig {
         &self.cfg
+    }
+    fn dtype(&self) -> candle_core::DType {
+        // Quantized models internally compute in F32
+        candle_core::DType::F32
     }
 }
 
@@ -95,6 +103,10 @@ pub fn transcribe_streaming_chunk<M: ParakeetCtcModel>(
         model.config().feat_in,
         device,
     )?;
+
+    // Convert features to match model dtype (models can be F16 or F32)
+    // F16 models need F16 inputs, quantized models handle their own conversion
+    let features = features.to_dtype(model.dtype())?;
 
     // Run inference on full input
     let logits = model.forward(&features, false)?;

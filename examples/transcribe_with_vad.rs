@@ -170,13 +170,14 @@ fn main() -> Result<()> {
             let duration = segment.end_time - segment.start_time;
             total_speech_duration += duration as f32;
 
-            print!("[Segment {}] {:.2}s - {:.2}s ({:.2}s) - ",
+            println!("[Segment {}] {:.2}s - {:.2}s ({:.2}s)",
                    segment_count, segment.start_time, segment.end_time, duration);
 
             if !segment.text.is_empty() {
-                println!("\"{}\"", segment.text);
+                println!("  Raw:       \"{}\"", segment.raw_text);
+                println!("  Corrected: \"{}\"", segment.text);
             } else {
-                println!("(empty)");
+                println!("  (empty)");
             }
         }
 
@@ -189,13 +190,14 @@ fn main() -> Result<()> {
         let duration = segment.end_time - segment.start_time;
         total_speech_duration += duration as f32;
 
-        print!("[Segment {}] {:.2}s - {:.2}s ({:.2}s) - ",
+        println!("[Segment {}] {:.2}s - {:.2}s ({:.2}s)",
                segment_count, segment.start_time, segment.end_time, duration);
 
         if !segment.text.is_empty() {
-            println!("\"{}\"", segment.text);
+            println!("  Raw:       \"{}\"", segment.raw_text);
+            println!("  Corrected: \"{}\"", segment.text);
         } else {
-            println!("(empty)");
+            println!("  (empty)");
         }
     }
 

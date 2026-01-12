@@ -99,14 +99,19 @@ impl QwenCorrector {
         // Construct prompt for text correction
         let prompt = format!(
             "<|im_start|>system\n\
-            You are a helpful assistant that corrects transcriptions by adding proper punctuation and capitalization. \
-            Only output the corrected text, nothing else, not even an acknowledgement of the
-            instruction.<|im_end|>\n\
-            <|im_start|>user\n\
-            Correct this transcription by adding punctuation and capitalization of named entities, fixing spelling mistakes, removing pauses like err, uhm, hmm, and dividing up overlapping or mumbled words into clearly legible sentences:\n\
-            {}<|im_end|>\n\
-            <|im_start|>assistant\n",
-            raw_text
+            You are an ASR transcript post-processor.
+
+            Goal: improve readability while preserving the speaker's meaning.
+            Do NOT summarize. Do NOT shorten sentences. Do NOT drop subjects, verbs, or intent.
+
+            Edits allowed:
+            - Remove filler words (\"um\", \"uh\", \"hm\", \"like\") when they are fillers.
+            - Fix obvious punctuation/casing.
+
+            Output:
+            - Return ONLY the corrected transcript (no explanations, no quotes).
+            <|im_end|>
+            {raw_text}"
         );
 
         // Tokenize

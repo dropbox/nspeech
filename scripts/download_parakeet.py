@@ -4,11 +4,16 @@ Download Parakeet CTC weights/config/tokenizer from Hugging Face.
 Automatically:
 1. Downloads model files from HuggingFace to cache
 2. Compresses JSON configs with zstd (for optional binary embedding)
-3. Quantizes model to GGUF format with zstd compression
-4. Copies only compressed .zst files needed for inference to assets directory
+3. Converts model to FP16 safetensors with zstd compression (for unquantized inference)
+4. Quantizes model to GGUF Q8_0 format with zstd compression (for quantized inference)
+5. Copies only compressed .zst files needed for inference to assets directory
 
 Usage:
   python scripts/download_parakeet.py --repo nvidia/parakeet-ctc-0.6b
+
+Requirements:
+  - safetensors and torch for FP16 conversion: uv pip install safetensors torch
+  - zstd for compression: brew install zstd
 
 If the repo is private, set HF_TOKEN or run `huggingface-cli login` first.
 """
@@ -19,6 +24,85 @@ import shutil
 import subprocess
 import sys
 from huggingface_hub import snapshot_download
+
+try:
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+    import torch
+    SAFETENSORS_AVAILABLE = True
+except ImportError:
+    SAFETENSORS_AVAILABLE = False
+
+
+def convert_to_fp16(cache_path: pathlib.Path) -> pathlib.Path | None:
+    """Convert FP32 safetensors model to FP16 and compress with zstd.
+
+    Returns path to compressed FP16 model, or None if conversion failed.
+    """
+    if not SAFETENSORS_AVAILABLE:
+        print("\n⚠ Skipping FP16 conversion: safetensors and torch not installed")
+        print("  Install with: uv pip install safetensors torch")
+        return None
+
+    print("\nConverting model to FP16 format...")
+
+    fp32_path = cache_path / "model.safetensors"
+    fp16_path = cache_path / "model_fp16.safetensors"
+    fp16_zst_path = cache_path / "model_fp16.safetensors.zst"
+
+    if not fp32_path.exists():
+        print(f"  ✗ model.safetensors not found in {cache_path}")
+        return None
+
+    try:
+        print(f"  Input:  {fp32_path.name}")
+        print(f"  Output: {fp16_zst_path.name}")
+
+        # Load FP32 tensors
+        print("  Loading FP32 model...")
+        tensors = {}
+        with safe_open(str(fp32_path), framework="pt", device="cpu") as f:
+            for key in f.keys():
+                tensors[key] = f.get_tensor(key)
+
+        # Convert to FP16
+        print("  Converting to FP16...")
+        fp16_tensors = {}
+        for key, tensor in tensors.items():
+            if tensor.dtype == torch.float32:
+                fp16_tensors[key] = tensor.half()
+            else:
+                # Keep non-float tensors as-is (e.g., int32)
+                fp16_tensors[key] = tensor
+
+        # Save as safetensors
+        print("  Saving FP16 safetensors...")
+        save_file(fp16_tensors, str(fp16_path))
+
+        fp32_size_mb = fp32_path.stat().st_size / (1024 * 1024)
+        fp16_size_mb = fp16_path.stat().st_size / (1024 * 1024)
+        print(f"  Size: {fp32_size_mb:.1f} MB → {fp16_size_mb:.1f} MB ({fp16_size_mb/fp32_size_mb*100:.1f}%)")
+
+        # Compress with zstd
+        print("  Compressing with zstd level 19...")
+        result = subprocess.run(
+            ["zstd", "-19", "-f", str(fp16_path), "-o", str(fp16_zst_path)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        zst_size_mb = fp16_zst_path.stat().st_size / (1024 * 1024)
+        print(f"  ✓ Compressed: {zst_size_mb:.1f} MB ({zst_size_mb/fp32_size_mb*100:.1f}% of original)")
+
+        # Clean up uncompressed FP16 file
+        fp16_path.unlink()
+
+        return fp16_zst_path
+
+    except Exception as e:
+        print(f"  ✗ FP16 conversion failed: {e}")
+        return None
 
 
 def compress_json_configs(cache_path: pathlib.Path) -> list[pathlib.Path]:
@@ -190,6 +274,9 @@ def main() -> None:
     if not args.skip_compress:
         compressed_files = compress_json_configs(cache_path)
 
+    # Convert model to FP16 and compress
+    fp16_file = convert_to_fp16(cache_path)
+
     # Quantize model in cache
     gguf_file = None
     if not args.skip_quantize:
@@ -202,6 +289,8 @@ def main() -> None:
     files_to_copy = []
     if compressed_files:
         files_to_copy.extend(compressed_files)
+    if fp16_file:
+        files_to_copy.append(fp16_file)
     if gguf_file:
         files_to_copy.append(gguf_file)
 

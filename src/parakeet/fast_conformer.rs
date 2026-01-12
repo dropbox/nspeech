@@ -26,6 +26,7 @@ embed_zst_asset!(pub VAD_MODEL,                      "vad16.safetensors.zst");
 
 // Model weights (large files)
 embed_zst_asset!(pub PARAKEET_MODEL_SAFETENSORS,     "model.safetensors.zst");
+embed_zst_asset!(pub PARAKEET_MODEL_FP16_SAFETENSORS,"model_fp16.safetensors.zst");
 embed_zst_asset!(pub PARAKEET_MODEL_Q8_0_GGUF,       "model_q8_0.gguf.zst");
 embed_zst_asset!(pub PARAKEET_MODEL_Q4K_GGUF,        "model_q4k.gguf.zst");
 
@@ -68,7 +69,7 @@ impl Default for FastConformerConfig {
     }
 }
 
-fn relative_positional_encoding(batch: usize, seq: usize, dim: usize, device: &Device) -> Result<Tensor> {
+fn relative_positional_encoding(batch: usize, seq: usize, dim: usize, device: &Device, dtype: DType) -> Result<Tensor> {
     // Relative positional encoding needs 2*seq-1 positions for all relative distances
     // Positions range from -(seq-1) to +(seq-1), centered at 0
     // Python uses symmetric encoding: sin(abs(pos)) with sign flip for negative positions
@@ -92,7 +93,7 @@ fn relative_positional_encoding(batch: usize, seq: usize, dim: usize, device: &D
             }
         }
     }
-    let pos = Tensor::from_slice(&data, (1, pos_len, dim), device)?;
+    let pos = Tensor::from_slice(&data, (1, pos_len, dim), device)?.to_dtype(dtype)?;
     Ok(pos.broadcast_as((batch, pos_len, dim))?)
 }
 
@@ -286,10 +287,26 @@ impl MultiHeadSelfAttention {
             attn_scores = (attn_scores + mask)?;
         }
         let scale = (self.head_dim as f64).sqrt() as f32;
-        let scale_t = Tensor::from_slice(&[scale], (), xs.device())?;
+        let scale_t = Tensor::from_slice(&[scale], (), xs.device())?.to_dtype(xs.dtype())?;
         let scale_t = scale_t.broadcast_as(attn_scores.shape())?;
         attn_scores = (attn_scores / scale_t)?;
-        let attn_weights = candle_nn::ops::softmax(&attn_scores, D::Minus1)?;
+
+        // MIXED PRECISION: Compute softmax in F32 for numerical stability
+        // F16/BF16 softmax can overflow/underflow, causing attention to collapse
+        let original_dtype = attn_scores.dtype();
+        let needs_upcast = original_dtype == DType::F16 || original_dtype == DType::BF16;
+        let attn_scores_f32 = if needs_upcast {
+            attn_scores.to_dtype(DType::F32)?
+        } else {
+            attn_scores
+        };
+        let attn_weights_f32 = candle_nn::ops::softmax(&attn_scores_f32, D::Minus1)?;
+        let attn_weights = if needs_upcast {
+            attn_weights_f32.to_dtype(original_dtype)?
+        } else {
+            attn_weights_f32
+        };
+
         let attn_weights = self.dropout.forward(&attn_weights, train)?;
         let context = attn_weights.matmul(&v)?;
         let context = context.transpose(1, 2)?.reshape((b, t, d))?;
@@ -338,8 +355,10 @@ impl ConvModule {
         // IMPORTANT: Depthwise conv MUST have bias (Python uses bias=True)
         let dw = conv1d(d_model, d_model, kernel_size, cfg_dw, vb.pp("depthwise_conv"))?;
 
+        // Use larger epsilon for reduced precision to avoid numerical issues
+        let eps = if vb.dtype() == DType::F16 || vb.dtype() == DType::BF16 { 1e-3 } else { 1e-5 };
         let bn_cfg = BatchNormConfig {
-            eps: 1e-5,
+            eps,
             momentum: 0.1,
             affine: true,
             remove_mean: true,  // Must be true to match PyTorch BatchNorm (which always centers)
@@ -497,10 +516,26 @@ impl QMultiHeadSelfAttention {
             attn_scores = (attn_scores + mask)?;
         }
         let scale = (self.head_dim as f64).sqrt() as f32;
-        let scale_t = Tensor::from_slice(&[scale], (), xs.device())?;
+        let scale_t = Tensor::from_slice(&[scale], (), xs.device())?.to_dtype(xs.dtype())?;
         let scale_t = scale_t.broadcast_as(attn_scores.shape())?;
         attn_scores = (attn_scores / scale_t)?;
-        let attn_weights = candle_nn::ops::softmax(&attn_scores, D::Minus1)?;
+
+        // MIXED PRECISION: Compute softmax in F32 for numerical stability
+        // F16/BF16 softmax can overflow/underflow, causing attention to collapse
+        let original_dtype = attn_scores.dtype();
+        let needs_upcast = original_dtype == DType::F16 || original_dtype == DType::BF16;
+        let attn_scores_f32 = if needs_upcast {
+            attn_scores.to_dtype(DType::F32)?
+        } else {
+            attn_scores
+        };
+        let attn_weights_f32 = candle_nn::ops::softmax(&attn_scores_f32, D::Minus1)?;
+        let attn_weights = if needs_upcast {
+            attn_weights_f32.to_dtype(original_dtype)?
+        } else {
+            attn_weights_f32
+        };
+
         let attn_weights = self.dropout.forward(&attn_weights, train)?;
         let context = attn_weights.matmul(&v)?;
         let context = context.transpose(1, 2)?.reshape((b, t, d))?;
@@ -719,13 +754,13 @@ impl QFastConformerEncoder {
         }
         let xs = if self.cfg.scale_input {
             let scale = (self.cfg.d_model as f64).sqrt() as f32;
-            let scale_t = Tensor::from_slice(&[scale], (), device)?;
+            let scale_t = Tensor::from_slice(&[scale], (), device)?.to_dtype(xs.dtype())?;
             let scale_t = scale_t.broadcast_as(xs.shape())?;
             (xs * scale_t)?
         } else {
             xs
         };
-        let pos = relative_positional_encoding(b, t, d, device)?;
+        let pos = relative_positional_encoding(b, t, d, device, xs.dtype())?;
         let pos = self.pos_dropout_positions.forward(&pos, train)?;
         let mut h = self.pos_dropout.forward(&xs, train)?;
         for blk in self.blocks.iter() {
@@ -754,11 +789,14 @@ pub struct FastConformerBlock {
 impl FastConformerBlock {
     pub fn new(cfg: &FastConformerConfig, vb: VarBuilder<'_>) -> Result<Self> {
         let d_model = cfg.d_model;
+        // Use larger epsilon for reduced precision to avoid numerical issues
+        let eps = if vb.dtype() == DType::F16 || vb.dtype() == DType::BF16 { 1e-3 } else { 1e-5 };
         let ln_cfg = LayerNormConfig {
-            eps: 1e-5,
+            eps,
             affine: true,
             remove_mean: true,
         };
+
         Ok(Self {
             ff1: FeedForward::new(d_model, cfg.ff_mult, cfg.dropout, vb.pp("feed_forward1"))?,
             ff2: FeedForward::new(d_model, cfg.ff_mult, cfg.dropout, vb.pp("feed_forward2"))?,
@@ -861,13 +899,13 @@ impl FastConformerEncoder {
         }
         let xs = if self.cfg.scale_input {
             let scale = (self.cfg.d_model as f64).sqrt() as f32;
-            let scale_t = Tensor::from_slice(&[scale], (), device)?;
+            let scale_t = Tensor::from_slice(&[scale], (), device)?.to_dtype(xs.dtype())?;
             let scale_t = scale_t.broadcast_as(xs.shape())?;
             (xs * scale_t)?
         } else {
             xs
         };
-        let pos = relative_positional_encoding(b, t, d, device)?;
+        let pos = relative_positional_encoding(b, t, d, device, xs.dtype())?;
         let pos = self.pos_dropout_positions.forward(&pos, train)?;
         let mut h = self.pos_dropout.forward(&xs, train)?;
         for blk in self.blocks.iter() {
@@ -895,13 +933,13 @@ impl FastConformerEncoder {
         }
         let xs = if self.cfg.scale_input {
             let scale = (self.cfg.d_model as f64).sqrt() as f32;
-            let scale_t = Tensor::from_slice(&[scale], (), device)?;
+            let scale_t = Tensor::from_slice(&[scale], (), device)?.to_dtype(xs.dtype())?;
             let scale_t = scale_t.broadcast_as(xs.shape())?;
             (xs * scale_t)?
         } else {
             xs
         };
-        let pos = relative_positional_encoding(b, t, d, device)?;
+        let pos = relative_positional_encoding(b, t, d, device, xs.dtype())?;
         let pos = self.pos_dropout_positions.forward(&pos, train)?;
         let mut h = self.pos_dropout.forward(&xs, train)?;
 
@@ -1034,6 +1072,7 @@ pub struct ParakeetFastConformerCtc {
     pub cfg: FastConformerConfig,
     tokenizer: Option<Tokenizer>,
     id2token: Option<Vec<String>>,
+    pub(crate) dtype: DType,
 }
 
 impl ParakeetFastConformerCtc {
@@ -1059,12 +1098,16 @@ impl ParakeetFastConformerCtc {
             linear(cfg.d_model, cfg.vocab_size, ctc_vb)?
         };
 
+        // Get dtype from the model weights
+        let dtype = vb.dtype();
+
         Ok(Self {
             encoder,
             proj,
             cfg,
             tokenizer: None,
             id2token: Some(id2token),
+            dtype,
         })
     }
 
@@ -1084,12 +1127,17 @@ impl ParakeetFastConformerCtc {
         };
         let bias = ctc_vb.get(cfg.vocab_size, "bias")?;
         let proj = Linear::new(weight, Some(bias));
+
+        // Get dtype from the model weights
+        let dtype = vb.dtype();
+
         Ok(Self {
             encoder,
             proj,
             cfg,
             tokenizer: Some(tokenizer),
             id2token: None,
+            dtype,
         })
     }
 
@@ -1202,7 +1250,7 @@ pub fn load_parakeet_ctc_from_hf(repo_id: &str, device: &Device) -> Result<Parak
     let tokenizer = Tokenizer::from_file(tokenizer_path)
         .map_err(|e| anyhow!("tokenizer load error: {e}"))?;
     let vb =
-        unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, device)? };
+        unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F16, device)? };
     ParakeetFastConformerCtc::new_with_tokenizer(cfg, vb, tokenizer)
 }
 
@@ -1231,7 +1279,7 @@ pub fn load_parakeet_ctc_from_local<P: AsRef<Path>>(
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow!("tokenizer load error: {e}"))?;
     let vb =
-        unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, device)? };
+        unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F16, device)? };
     ParakeetFastConformerCtc::new_with_tokenizer(cfg, vb, tokenizer)
 }
 
@@ -1360,7 +1408,7 @@ pub fn load_parakeet_ctc_from_gguf_local<P: AsRef<Path>>(
     Ok(model)
 }
 
-/// Load Parakeet CTC model from safetensors (FP32 full-precision inference)
+/// Load Parakeet CTC model from safetensors (FP16 on GPU, F32 on CPU)
 #[cfg(not(feature = "quantized"))]
 pub fn load_parakeet_ctc_from_gguf_local<P: AsRef<Path>>(
     dir: P,
@@ -1369,7 +1417,27 @@ pub fn load_parakeet_ctc_from_gguf_local<P: AsRef<Path>>(
     use std::io::{Error, ErrorKind};
     let assets = dir.as_ref().to_path_buf();
 
-    println!("Loading model with FP32 full-precision inference (from safetensors)");
+    // Use BF16 on GPU by default (model's native training dtype)
+    // BF16 has FP32's range but 16-bit size - perfect for GPU inference
+    let dtype = if std::env::var("PARAKEET_FP32").is_ok() {
+        DType::F32
+    } else if std::env::var("PARAKEET_FP16").is_ok() {
+        println!("⚠ Using FP16 (experimental, may be unstable)");
+        DType::F16
+    } else if device.is_cpu() {
+        // CPU: use F32 (CPU doesn't support BF16 operations efficiently)
+        DType::F32
+    } else {
+        // GPU: use BF16 (matches training dtype, 2x memory savings vs F32)
+        DType::BF16
+    };
+
+    let dtype_name = match dtype {
+        DType::BF16 => "BF16",
+        DType::F16 => "FP16",
+        _ => "FP32",
+    };
+    println!("Loading model with {} inference (from safetensors)", dtype_name);
 
     // Load config from embedded asset
     let cfg_bytes = PARAKEET_CONFIG.bytes(&assets).map_err(|_| {
@@ -1387,20 +1455,22 @@ pub fn load_parakeet_ctc_from_gguf_local<P: AsRef<Path>>(
     let tokenizer = Tokenizer::from_bytes(tok_bytes)
         .map_err(|e| Error::new(ErrorKind::Other, format!("failed to parse tokenizer: {e}")))?;
 
-    // Load safetensors from embedded asset (already decompressed by embed_zst_asset macro)
+    // Load FP32 safetensors and let VarBuilder convert to target dtype
+    // This is more reliable than loading pre-converted FP16 files
     println!("  Loading safetensors file from assets...");
     let safetensors_bytes = PARAKEET_MODEL_SAFETENSORS.bytes(&assets).map_err(|_| {
         Error::new(ErrorKind::Other, "failed to load PARAKEET_MODEL_SAFETENSORS")
     })?;
 
-    // Create VarBuilder from safetensors bytes
-    println!("  Creating FP32 VarBuilder...");
-    let vb = VarBuilder::from_buffered_safetensors(safetensors_bytes.to_vec(), DType::F32, device)?;
-    println!("  ✓ FP32 VarBuilder created");
+    // Create VarBuilder from safetensors bytes with target dtype
+    // VarBuilder will automatically convert FP32 weights to F16 on GPU or keep as F32 on CPU
+    println!("  Creating VarBuilder (dtype={:?})...", dtype);
+    let vb = VarBuilder::from_buffered_safetensors(safetensors_bytes.to_vec(), dtype, device)?;
+    println!("  ✓ VarBuilder created");
 
     println!("  Building model...");
     let model = ParakeetFastConformerCtc::new_with_tokenizer(cfg, vb, tokenizer)?;
-    println!("✓ Model loaded successfully (FP32 inference)\n");
+    println!("✓ Model loaded successfully\n");
 
     Ok(model)
 }

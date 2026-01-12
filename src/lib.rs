@@ -154,6 +154,7 @@ pub mod qwen;
 #[napi(object)]
 pub struct Transcription {
     pub text: String,
+    pub raw_text: String,
     pub start_time: f64,
     pub end_time: f64,
 }
@@ -235,6 +236,7 @@ impl SpeechInner {
                 info!("Generated transcription: \"{}\"", segment.text);
                 callback(Transcription {
                     text: segment.text,
+                    raw_text: segment.raw_text,
                     start_time: segment.start_time,
                     end_time: segment.end_time,
                 });
@@ -265,6 +267,7 @@ impl SpeechInner {
                 info!("Flush: Generated transcription: \"{}\"", segment.text);
                 callback(Transcription {
                     text: segment.text,
+                    raw_text: segment.raw_text,
                     start_time: segment.start_time,
                     end_time: segment.end_time,
                 });
