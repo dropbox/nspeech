@@ -211,6 +211,8 @@ impl StreamingTransducer {
     /// Decoded tokens
     fn decode_chunk(&mut self, encoder_out: &Tensor, num_frames: usize) -> Result<Vec<u32>> {
         let mut decoded = Vec::new();
+        let mut consecutive_blanks = 0;
+        const MAX_CONSECUTIVE_BLANKS: usize = 50; // Reset after ~3s of silence
 
         for t in 0..num_frames {
             // Inner loop: keep predicting until blank
@@ -257,14 +259,47 @@ impl StreamingTransducer {
 
                 if token == self.state.blank_id as u32 {
                     // Blank: move to next timestep
+                    consecutive_blanks += 1;
+
+                    // Reset LSTM state after extended silence to prevent drift
+                    if consecutive_blanks >= MAX_CONSECUTIVE_BLANKS {
+                        self.state.predictor_states = None;
+                        self.state.last_token = self.state.blank_id as u32;
+                        consecutive_blanks = 0;
+                    }
+
                     break;
                 } else if token >= self.model.config.vocab_size as u32 {
                     // Special token, treat as blank
                     break;
                 } else {
-                    // Valid vocabulary token: emit and continue at same timestep
-                    decoded.push(token);
-                    self.state.last_token = token;
+                    // Valid vocabulary token - apply light filtering for obvious errors
+                    // Note: Individual tokens may look odd due to subword tokenization,
+                    // so we only reject tokens that decode to clear garbage
+                    let should_emit = if let Ok(token_text) = self.model.decode_tokens(&[token]) {
+                        // Reject only if it contains <unk> or has Cyrillic/CJK characters
+                        // (which shouldn't appear in English speech)
+                        !token_text.contains("<unk>")
+                            && !token_text.chars().any(|c| {
+                                // Cyrillic range: U+0400-U+04FF
+                                // CJK ranges and other non-Latin scripts
+                                matches!(c, '\u{0400}'..='\u{04FF}' | '\u{4E00}'..='\u{9FFF}' | '\u{3040}'..='\u{30FF}')
+                            })
+                    } else {
+                        true  // If decode fails, emit anyway (let tokenizer handle it)
+                    };
+
+                    if should_emit {
+                        // Emit token and continue at same timestep
+                        decoded.push(token);
+                        self.state.last_token = token;
+                        consecutive_blanks = 0; // Reset blank counter on valid token
+                    } else {
+                        // Rejected token: update state but treat as blank
+                        self.state.last_token = token;
+                        consecutive_blanks += 1;
+                        break;
+                    }
                 }
             }
         }
