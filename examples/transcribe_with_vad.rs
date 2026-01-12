@@ -22,7 +22,6 @@ use speech::qwen::QwenCorrector;
 use std::path::PathBuf;
 use std::time::Instant;
 use log::info;
-use env_logger;
 
 // Import Silero VAD from library
 use speech::silero::{SileroVad, VadStream};
@@ -47,11 +46,6 @@ fn main() -> Result<()> {
 
     let audio_path = &args[1];
     let use_qwen = args.iter().any(|arg| arg == "--use-qwen");
-
-    // Initialize logging
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .init();
 
     println!("Streaming Transcription with Silero VAD");
     println!("========================================\n");
