@@ -1,7 +1,14 @@
-/// VAD-based transcription using Parakeet TDT (Transducer)
+/// VAD-based streaming transcription using Parakeet TDT (Transducer)
 ///
-/// Uses Silero VAD to detect speech regions, then transcribes each region
-/// using the same high-quality beam search decoder as transcribe_tdt.rs.
+/// This example demonstrates real-time streaming transcription using VAD
+/// to detect natural speech boundaries. Processes audio in chunks and
+/// transcribes segments as they complete.
+///
+/// Key features:
+/// - Streaming audio processing (500ms chunks)
+/// - VAD-based speech detection
+/// - High-quality beam search decoding (matches transcribe_tdt.rs)
+/// - Natural pause detection for segment boundaries
 ///
 /// Usage:
 ///   cargo run --example transcribe_tdt_with_vad --release -- dots.wav
@@ -9,96 +16,239 @@
 ///   PARAKEET_DEVICE=cpu cargo run --example transcribe_tdt_with_vad --release -- audio.wav
 
 use anyhow::Result;
-use speech::parakeet::{get_device, load_parakeet_tdt_from_local, load_wav_as_features};
+use speech::parakeet::{get_device, load_parakeet_tdt_from_local, TransducerModel};
 use speech::silero::{SileroVad, VadStream};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 
-/// Speech segment with timing
+/// Configuration for VAD-based streaming
 #[derive(Debug, Clone)]
-struct SpeechSegment {
-    start_sample: usize,
-    end_sample: usize,
-    start_time: f64,
-    end_time: f64,
+struct StreamConfig {
+    /// VAD probability threshold for speech detection
+    speech_threshold: f32,
+    /// Minimum speech duration in milliseconds
+    min_speech_duration_ms: f32,
+    /// Pre-buffer duration to capture start of speech (ms)
+    pre_buffer_ms: f32,
+    /// Pause duration to trigger transcription (ms)
+    pause_duration_ms: f32,
 }
 
-/// Detect speech segments using Silero VAD
-fn detect_speech_segments(
-    samples: &[f32],
-    vad: SileroVad,
-    device: &candle_core::Device,
-    speech_threshold: f32,
-    min_speech_samples: usize,
-    min_silence_samples: usize,
-) -> Result<Vec<SpeechSegment>> {
-    let mut vad_stream = VadStream::new(vad, device)?;
-    let mut segments = Vec::new();
+impl Default for StreamConfig {
+    fn default() -> Self {
+        Self {
+            speech_threshold: 0.3,        // Lower threshold to catch more speech
+            min_speech_duration_ms: 250.0,
+            pre_buffer_ms: 1000.0,        // 1s pre-buffer to capture start
+            pause_duration_ms: 1000.0,    // 1s pause triggers transcription
+        }
+    }
+}
 
-    // Track speech regions
-    let mut in_speech = false;
-    let mut speech_start = 0;
-    let mut silence_count = 0;
+/// Streaming transcriber with VAD
+struct StreamingTranscriber {
+    vad_stream: VadStream,
+    config: StreamConfig,
+    device: candle_core::Device,
 
-    // Process in 10ms chunks (160 samples at 16kHz)
-    const CHUNK_SIZE: usize = 160;
-    let mut sample_idx = 0;
+    // Current segment accumulation
+    current_segment: Vec<f32>,
+    current_segment_start_time: Option<f64>,
 
-    for chunk_start in (0..samples.len()).step_by(CHUNK_SIZE) {
-        let chunk_end = (chunk_start + CHUNK_SIZE).min(samples.len());
-        let chunk = &samples[chunk_start..chunk_end];
+    // Pre-buffer to capture audio before speech detection
+    pre_buffer: VecDeque<f32>,
 
-        let probs = vad_stream.push(chunk)?;
+    // State tracking
+    total_samples_processed: usize,
+    silence_frames: usize,
+    in_speech: bool,
+}
 
-        for prob in probs {
-            let is_speech = prob >= speech_threshold;
+impl StreamingTranscriber {
+    fn new(
+        vad_stream: VadStream,
+        config: StreamConfig,
+        device: candle_core::Device,
+    ) -> Self {
+        let pre_buffer_samples = (config.pre_buffer_ms * 16.0) as usize;
 
-            if is_speech {
-                if !in_speech {
-                    // Speech started
-                    speech_start = sample_idx;
-                    in_speech = true;
-                }
-                silence_count = 0;
-            } else if in_speech {
-                // In silence during speech
-                silence_count += CHUNK_SIZE;
+        Self {
+            vad_stream,
+            config,
+            device,
+            current_segment: Vec::new(),
+            current_segment_start_time: None,
+            pre_buffer: VecDeque::with_capacity(pre_buffer_samples),
+            total_samples_processed: 0,
+            silence_frames: 0,
+            in_speech: false,
+        }
+    }
 
-                if silence_count >= min_silence_samples {
-                    // End of speech segment
-                    let speech_length = sample_idx - speech_start;
+    /// Process a chunk of audio samples
+    /// Returns completed speech segments ready for transcription
+    fn process_chunk(&mut self, samples: &[f32]) -> Result<Vec<(Vec<f32>, f64, f64)>> {
+        let mut completed_segments = Vec::new();
 
-                    if speech_length >= min_speech_samples {
-                        segments.push(SpeechSegment {
-                            start_sample: speech_start,
-                            end_sample: sample_idx - silence_count,
-                            start_time: speech_start as f64 / 16000.0,
-                            end_time: (sample_idx - silence_count) as f64 / 16000.0,
-                        });
+        // Process through VAD in 10ms chunks (160 samples at 16kHz)
+        const VAD_CHUNK_SIZE: usize = 160;
+        let mut idx = 0;
+
+        while idx < samples.len() {
+            let end = (idx + VAD_CHUNK_SIZE).min(samples.len());
+            let chunk = &samples[idx..end];
+
+            // Get VAD probabilities
+            let probs = self.vad_stream.push(chunk)?;
+
+            for prob in probs {
+                let is_speech = prob >= self.config.speech_threshold;
+
+                if is_speech {
+                    self.silence_frames = 0;
+
+                    // Speech detected - start new segment if needed
+                    if !self.in_speech {
+                        self.in_speech = true;
+
+                        // Calculate start time (accounting for pre-buffer)
+                        let start_time = (self.total_samples_processed as f64
+                                        - self.pre_buffer.len() as f64) / 16000.0;
+                        self.current_segment_start_time = Some(start_time);
+
+                        // Prepend pre-buffer to capture start of speech
+                        self.current_segment.clear();
+                        self.current_segment.extend(self.pre_buffer.iter());
+
+                        eprintln!("  [VAD] Speech started at {:.2}s", start_time);
                     }
+                } else {
+                    // Silence detected
+                    self.silence_frames += 1;
 
-                    in_speech = false;
-                    silence_count = 0;
+                    if self.in_speech {
+                        // Check if pause is long enough to end segment
+                        let pause_ms = (self.silence_frames * 10) as f32;
+
+                        if pause_ms >= self.config.pause_duration_ms {
+                            // Long pause - end segment
+                            let segment_duration_ms = self.current_segment.len() as f32 / 16.0;
+
+                            if segment_duration_ms >= self.config.min_speech_duration_ms {
+                                // Valid segment - queue for transcription
+                                let start = self.current_segment_start_time.unwrap();
+                                let end = self.total_samples_processed as f64 / 16000.0;
+
+                                eprintln!("  [VAD] Speech ended at {:.2}s (duration: {:.2}s)",
+                                         end, segment_duration_ms / 1000.0);
+
+                                completed_segments.push((
+                                    self.current_segment.clone(),
+                                    start,
+                                    end,
+                                ));
+                            }
+
+                            // Reset for next segment
+                            self.in_speech = false;
+                            self.silence_frames = 0;
+                            self.current_segment.clear();
+                            self.current_segment_start_time = None;
+                        }
+                    }
                 }
             }
 
-            sample_idx += CHUNK_SIZE;
+            // Maintain pre-buffer during silence
+            if !self.in_speech {
+                let pre_buffer_max = (self.config.pre_buffer_ms * 16.0) as usize;
+                for &sample in chunk {
+                    if self.pre_buffer.len() >= pre_buffer_max {
+                        self.pre_buffer.pop_front();
+                    }
+                    self.pre_buffer.push_back(sample);
+                }
+            }
+
+            // Accumulate to current segment if in speech
+            if self.in_speech {
+                self.current_segment.extend_from_slice(chunk);
+            }
+
+            self.total_samples_processed += chunk.len();
+            idx = end;
         }
+
+        Ok(completed_segments)
     }
 
-    // Handle final segment
-    if in_speech {
-        let speech_length = samples.len() - speech_start;
-        if speech_length >= min_speech_samples {
-            segments.push(SpeechSegment {
-                start_sample: speech_start,
-                end_sample: samples.len(),
-                start_time: speech_start as f64 / 16000.0,
-                end_time: samples.len() as f64 / 16000.0,
-            });
+    /// Flush any remaining segment (call at end of stream)
+    fn flush(&mut self) -> Result<Option<(Vec<f32>, f64, f64)>> {
+        if self.in_speech && !self.current_segment.is_empty() {
+            let segment_duration_ms = self.current_segment.len() as f32 / 16.0;
+
+            if segment_duration_ms >= self.config.min_speech_duration_ms {
+                let start = self.current_segment_start_time.unwrap();
+                let end = self.total_samples_processed as f64 / 16000.0;
+
+                eprintln!("  [VAD] Flushing final segment ({:.2}s)", segment_duration_ms / 1000.0);
+
+                let segment = self.current_segment.clone();
+                self.current_segment.clear();
+                self.current_segment_start_time = None;
+                self.in_speech = false;
+
+                return Ok(Some((segment, start, end)));
+            }
         }
+
+        Ok(None)
+    }
+}
+
+/// Transcribe a speech segment using beam search
+fn transcribe_segment(
+    audio_samples: &[f32],
+    model: &TransducerModel,
+    device: &candle_core::Device,
+) -> Result<(String, usize)> {
+    // Save to temp file for feature extraction
+    let temp_path = format!("/tmp/segment_{}.wav", std::process::id());
+    {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&temp_path, spec)?;
+        for &sample in audio_samples {
+            writer.write_sample((sample * i16::MAX as f32) as i16)?;
+        }
+        writer.finalize()?;
     }
 
-    Ok(segments)
+    // Extract features
+    let features = speech::parakeet::load_wav_as_features(&temp_path, 128, device)?;
+
+    // Clean up temp file
+    std::fs::remove_file(&temp_path).ok();
+
+    // Convert to BF16 on GPU
+    let features = if !device.is_cpu() {
+        features.to_dtype(candle_core::DType::BF16)?
+    } else {
+        features
+    };
+
+    // Run encoder
+    let encoder_out = model.encoder.forward(&features, false)?;
+
+    // Beam decode with beam_size=2 (same as transcribe_tdt.rs)
+    let tokens = model.beam_decode(&encoder_out, 2)?;
+    let text = model.decode_tokens(&tokens)?;
+
+    Ok((text, tokens.len()))
 }
 
 fn main() -> Result<()> {
@@ -106,15 +256,15 @@ fn main() -> Result<()> {
 
     if args.len() < 2 {
         eprintln!("Usage: {} <audio.wav>", args[0]);
-        eprintln!("\nThis example uses VAD to detect speech regions, then transcribes");
-        eprintln!("each region with the same quality as the non-VAD version.");
+        eprintln!("\nThis example demonstrates streaming VAD-based transcription");
+        eprintln!("with the same quality as the non-streaming version.");
         return Ok(());
     }
 
     let audio_path = &args[1];
 
-    println!("VAD-Based TDT Transcription");
-    println!("============================\n");
+    println!("Streaming VAD-Based TDT Transcription");
+    println!("======================================\n");
     println!("Audio: {}\n", audio_path);
 
     // Get device
@@ -127,6 +277,7 @@ fn main() -> Result<()> {
     // Load Silero VAD
     println!("Loading Silero VAD...");
     let vad = SileroVad::load(&assets, &device)?;
+    let vad_stream = VadStream::new(vad, &device)?;
     println!("✓ VAD loaded\n");
 
     // Load Parakeet TDT model
@@ -155,95 +306,78 @@ fn main() -> Result<()> {
     let total_duration_sec = all_samples.len() as f64 / 16000.0;
     println!("✓ Loaded: {:.2}s ({} samples)\n", total_duration_sec, all_samples.len());
 
-    // Detect speech segments
-    println!("Detecting speech segments...");
-    let speech_threshold = 0.3;       // Lower threshold to catch more speech
-    let min_speech_ms = 250.0;        // Minimum 250ms of speech
-    let min_silence_ms = 1000.0;      // 1000ms silence ends segment (tolerate pauses)
+    // Create streaming transcriber
+    let stream_config = StreamConfig::default();
+    println!("Stream Configuration:");
+    println!("  Speech threshold: {}", stream_config.speech_threshold);
+    println!("  Min speech: {}ms", stream_config.min_speech_duration_ms);
+    println!("  Pre-buffer: {}ms", stream_config.pre_buffer_ms);
+    println!("  Pause threshold: {}ms\n", stream_config.pause_duration_ms);
 
-    let min_speech_samples = (min_speech_ms * 16.0) as usize;
-    let min_silence_samples = (min_silence_ms * 16.0) as usize;
+    let mut streaming_transcriber = StreamingTranscriber::new(
+        vad_stream,
+        stream_config,
+        device.clone(),
+    );
 
-    let segments = detect_speech_segments(
-        &all_samples,
-        vad,
-        &device,
-        speech_threshold,
-        min_speech_samples,
-        min_silence_samples,
-    )?;
+    println!("=== STREAMING TRANSCRIPTION ===\n");
 
-    println!("✓ Detected {} speech segment(s)\n", segments.len());
-
-    // Show segment details
-    for (i, seg) in segments.iter().enumerate() {
-        println!("  Segment {}: {:.2}s - {:.2}s ({:.2}s)",
-                 i + 1, seg.start_time, seg.end_time, seg.end_time - seg.start_time);
-    }
-    println!();
-
-    // Transcribe each segment
-    println!("=== TRANSCRIPTION ===\n");
-    let mut all_texts = Vec::new();
+    // Process audio in streaming chunks (500ms chunks simulate real-time)
+    const STREAM_CHUNK_SIZE: usize = 8000; // 500ms chunks at 16kHz
+    let mut idx = 0;
+    let mut segment_count = 0;
     let mut total_tokens = 0;
+    let mut all_transcriptions = Vec::new();
 
-    for (i, segment) in segments.iter().enumerate() {
-        println!("Segment {}: {:.2}s - {:.2}s", i + 1, segment.start_time, segment.end_time);
+    while idx < all_samples.len() {
+        let end = (idx + STREAM_CHUNK_SIZE).min(all_samples.len());
+        let chunk = &all_samples[idx..end];
 
-        // Extract segment audio
-        let segment_audio = &all_samples[segment.start_sample..segment.end_sample];
+        // Process through VAD and get completed segments
+        let completed = streaming_transcriber.process_chunk(chunk)?;
 
-        // Save to temp file for feature extraction
-        let temp_path = format!("/tmp/segment_{}.wav", i);
-        {
-            let spec = hound::WavSpec {
-                channels: 1,
-                sample_rate: 16000,
-                bits_per_sample: 16,
-                sample_format: hound::SampleFormat::Int,
-            };
-            let mut writer = hound::WavWriter::create(&temp_path, spec)?;
-            for &sample in segment_audio {
-                writer.write_sample((sample * i16::MAX as f32) as i16)?;
-            }
-            writer.finalize()?;
+        // Transcribe completed segments
+        for (audio_samples, start_time, end_time) in completed {
+            segment_count += 1;
+            println!("\n[Segment {}] Transcribing {:.2}s - {:.2}s ({:.2}s)",
+                   segment_count, start_time, end_time, end_time - start_time);
+
+            let (text, token_count) = transcribe_segment(&audio_samples, &model, &device)?;
+
+            total_tokens += token_count;
+
+            println!("  Tokens: {}", token_count);
+            println!("  Text: {}\n", text.trim());
+
+            all_transcriptions.push((start_time, end_time, text.trim().to_string()));
         }
 
-        // Extract features using the same method as transcribe_tdt.rs
-        let features = load_wav_as_features(&temp_path, 128, &device)?;
-
-        // Clean up temp file
-        std::fs::remove_file(&temp_path).ok();
-
-        // Convert to BF16 on GPU
-        let features = if !device.is_cpu() {
-            features.to_dtype(candle_core::DType::BF16)?
-        } else {
-            features
-        };
-
-        // Run encoder
-        let encoder_out = model.encoder.forward(&features, false)?;
-
-        // Beam decode with beam_size=2 (same as transcribe_tdt.rs)
-        let tokens = model.beam_decode(&encoder_out, 2)?;
-        let text = model.decode_tokens(&tokens)?;
-
-        total_tokens += tokens.len();
-
-        println!("  Tokens: {}", tokens.len());
-        println!("  Text: {}\n", text.trim());
-
-        all_texts.push(text.trim().to_string());
+        idx = end;
     }
 
-    // Combine results
-    println!("=====================\n");
+    // Flush any remaining segment
+    if let Some((audio_samples, start_time, end_time)) = streaming_transcriber.flush()? {
+        segment_count += 1;
+        println!("\n[Segment {}] Transcribing {:.2}s - {:.2}s (final)",
+               segment_count, start_time, end_time);
+
+        let (text, token_count) = transcribe_segment(&audio_samples, &model, &device)?;
+
+        total_tokens += token_count;
+
+        println!("  Tokens: {}", token_count);
+        println!("  Text: {}\n", text.trim());
+
+        all_transcriptions.push((start_time, end_time, text.trim().to_string()));
+    }
+
+    // Print final results
+    println!("===================================\n");
     println!("=== FINAL TRANSCRIPT ===\n");
 
-    for (segment, text) in segments.iter().zip(all_texts.iter()) {
-        if segments.len() > 1 {
-            println!("[{:.2}s - {:.2}s] {}", segment.start_time, segment.end_time, text);
+    for (start, end, text) in &all_transcriptions {
+        if all_transcriptions.len() > 1 {
+            println!("[{:.2}s - {:.2}s] {}", start, end, text);
         } else {
             println!("{}", text);
         }
@@ -251,7 +385,7 @@ fn main() -> Result<()> {
 
     println!("\n=== STATISTICS ===");
     println!("  Total audio: {:.2}s", total_duration_sec);
-    println!("  Speech segments: {}", segments.len());
+    println!("  Speech segments: {}", segment_count);
     println!("  Total tokens: {}", total_tokens);
 
     // Compare with baseline if using dots.wav
@@ -259,7 +393,7 @@ fn main() -> Result<()> {
         let baseline_tokens = 187;  // From transcribe_tdt.rs (beam_size=2)
         let quality_percent = (total_tokens as f32 / baseline_tokens as f32) * 100.0;
         println!("\n  Baseline (transcribe_tdt.rs): {} tokens", baseline_tokens);
-        println!("  VAD-based: {} tokens ({:.1}%)", total_tokens, quality_percent);
+        println!("  Streaming VAD: {} tokens ({:.1}%)", total_tokens, quality_percent);
 
         if quality_percent >= 95.0 && quality_percent <= 105.0 {
             println!("\n✓ Quality matches baseline!");
@@ -268,7 +402,7 @@ fn main() -> Result<()> {
         }
     }
 
-    println!("\n✓ Transcription complete!");
+    println!("\n✓ Streaming transcription complete!");
 
     Ok(())
 }
