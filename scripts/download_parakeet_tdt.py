@@ -126,8 +126,8 @@ def convert_nemo_config_to_json(yaml_config_path: pathlib.Path) -> Dict[str, Any
 
 
 def convert_weights_to_safetensors(ckpt_path: pathlib.Path, output_path: pathlib.Path) -> None:
-    """Convert PyTorch checkpoint to safetensors format."""
-    print(f"\nConverting weights to safetensors...")
+    """Convert PyTorch checkpoint to safetensors format (BF16 for space efficiency)."""
+    print(f"\nConverting weights to safetensors (BF16)...")
     print(f"  Input:  {ckpt_path.name}")
     print(f"  Output: {output_path.name}")
 
@@ -151,18 +151,18 @@ def convert_weights_to_safetensors(ckpt_path: pathlib.Path, output_path: pathlib
 
     print(f"  Found {len(cleaned_state_dict)} tensors")
 
-    # Convert to FP32 for compatibility
-    print("  Converting to FP32...")
-    fp32_state_dict = {}
+    # Convert to BF16 to save disk space (1.5GB vs 2.4GB)
+    print("  Converting to BF16...")
+    bf16_state_dict = {}
     for key, tensor in cleaned_state_dict.items():
-        if tensor.dtype in [torch.float16, torch.bfloat16]:
-            fp32_state_dict[key] = tensor.float()
+        if tensor.dtype != torch.bfloat16:
+            bf16_state_dict[key] = tensor.bfloat16()
         else:
-            fp32_state_dict[key] = tensor
+            bf16_state_dict[key] = tensor
 
     # Save as safetensors
     print("  Saving safetensors...")
-    save_file(fp32_state_dict, str(output_path))
+    save_file(bf16_state_dict, str(output_path))
 
     size_mb = output_path.stat().st_size / (1024 * 1024)
     print(f"  ✓ Saved: {size_mb:.1f} MB")
