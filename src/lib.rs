@@ -135,6 +135,9 @@ pub fn stats(name: &str, number: f64) {
 // Parakeet speech recognition library
 pub mod parakeet;
 
+// Silero VAD (Voice Activity Detection)
+pub mod silero;
+
 // Streaming buffer module (shared between Node.js and CLI examples)
 pub mod streaming_buffer;
 
