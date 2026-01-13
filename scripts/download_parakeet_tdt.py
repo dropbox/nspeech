@@ -88,17 +88,22 @@ def convert_nemo_config_to_json(yaml_config_path: pathlib.Path) -> Dict[str, Any
     d_model = encoder_cfg.get('d_model', 1024)
     ff_expansion = encoder_cfg.get('ff_expansion_factor', 4)  # Conformer uses 4x expansion
 
+    # NeMo nests predictor/joint configs inside prednet/jointnet
+    prednet_cfg = decoder_cfg.get('prednet', {})
+    jointnet_cfg = joint_cfg.get('jointnet', {})
+
     config = {
         'architectures': ['ParakeetForTransducer'],
         'model_type': 'parakeet_transducer',
-        'vocab_size': nemo_config.get('decoder', {}).get('vocab_size', 8192),
-        'blank_id': nemo_config.get('decoder', {}).get('blank_id', 0),
+        'vocab_size': decoder_cfg.get('vocab_size', 8192),
+        'blank_id': decoder_cfg.get('blank_id', 0),
+        'joint_vocab_size': 8198,  # Joint output includes special tokens (verified from model weights)
         'encoder_config': {
             'hidden_size': d_model,
             'num_hidden_layers': encoder_cfg.get('n_layers', 24),
             'num_attention_heads': encoder_cfg.get('n_heads', 8),
             'intermediate_size': d_model * ff_expansion,  # FFN intermediate dimension
-            'num_mel_bins': encoder_cfg.get('feat_in', 80),
+            'num_mel_bins': encoder_cfg.get('feat_in', 128),
             'subsampling_factor': encoder_cfg.get('subsampling_factor', 8),
             'conv_kernel_size': encoder_cfg.get('conv_kernel_size', 9),
             'dropout': encoder_cfg.get('dropout', 0.1),
@@ -108,12 +113,12 @@ def convert_nemo_config_to_json(yaml_config_path: pathlib.Path) -> Dict[str, Any
             'scale_input': True,
         },
         'predictor_config': {
-            'pred_hidden': decoder_cfg.get('pred_hidden', 512),
-            'pred_rnn_layers': decoder_cfg.get('pred_rnn_layers', 2),
+            'pred_hidden': prednet_cfg.get('pred_hidden', 640),
+            'pred_rnn_layers': prednet_cfg.get('pred_rnn_layers', 2),
         },
         'joint_config': {
-            'joint_hidden': joint_cfg.get('joint_hidden', 512),
-            'activation': joint_cfg.get('activation', 'relu'),
+            'joint_hidden': jointnet_cfg.get('joint_hidden', 640),
+            'activation': jointnet_cfg.get('activation', 'relu'),
         }
     }
 
@@ -263,11 +268,38 @@ def main():
     safetensors_path = cache_dir / "model.safetensors"
     convert_weights_to_safetensors(files['weights'], safetensors_path)
 
-    # Copy tokenizer if found
+    # Copy tokenizer if found and convert to JSON format
     if files['tokenizer']:
-        tokenizer_dest = cache_dir / "tokenizer.model"
-        shutil.copy2(files['tokenizer'], tokenizer_dest)
-        print(f"✓ Tokenizer copied: {tokenizer_dest}")
+        tokenizer_model_path = cache_dir / "tokenizer.model"
+        shutil.copy2(files['tokenizer'], tokenizer_model_path)
+        print(f"✓ Tokenizer copied: {tokenizer_model_path}")
+
+        # Convert to tokenizer.json for easier loading in Rust
+        try:
+            from tokenizers import Tokenizer, models as tokenizer_models
+            from sentencepiece import SentencePieceProcessor
+
+            sp = SentencePieceProcessor()
+            sp.load(str(tokenizer_model_path))
+
+            # Get vocabulary
+            vocab = {}
+            for i in range(sp.vocab_size()):
+                piece = sp.id_to_piece(i)
+                score = sp.get_score(i)
+                vocab[piece] = score
+
+            # Create Unigram tokenizer
+            tokenizer = Tokenizer(tokenizer_models.Unigram(list(vocab.items())))
+
+            # Save as JSON
+            tokenizer_json_path = cache_dir / "tokenizer.json"
+            tokenizer.save(str(tokenizer_json_path))
+            print(f"✓ Created tokenizer.json with {len(vocab)} tokens")
+        except ImportError:
+            print("⚠ Warning: sentencepiece or tokenizers not installed, skipping tokenizer.json conversion")
+            print("  The model will still work but may have issues loading the tokenizer")
+            print("  Install with: pip install sentencepiece tokenizers")
 
     # Compress files
     print("\nCompressing files with zstd...")
@@ -281,10 +313,16 @@ def main():
     weights_zst = compress_file(safetensors_path, "parakeet-tdt-model.safetensors.zst")
     compressed_files.append(weights_zst)
 
-    # Compress tokenizer if exists
+    # Compress tokenizers if they exist
     if files['tokenizer']:
-        tokenizer_zst = compress_file(tokenizer_dest, "parakeet-tdt-tokenizer.model.zst")
-        compressed_files.append(tokenizer_zst)
+        # Compress tokenizer.model
+        tokenizer_model_zst = compress_file(tokenizer_model_path, "parakeet-tdt-tokenizer.model.zst")
+        compressed_files.append(tokenizer_model_zst)
+
+        # Compress tokenizer.json if it was created
+        if (cache_dir / "tokenizer.json").exists():
+            tokenizer_json_zst = compress_file(cache_dir / "tokenizer.json", "parakeet-tdt-tokenizer.json.zst")
+            compressed_files.append(tokenizer_json_zst)
 
     # Copy to assets
     print(f"\nCopying to assets directory...")

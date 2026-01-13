@@ -1193,7 +1193,9 @@ impl ParakeetFastConformerCtc {
 
 #[derive(Debug, Deserialize)]
 pub struct HfEncoderConfig {
+    #[serde(default)]
     pub activation_dropout: f64,
+    #[serde(default)]
     pub attention_dropout: f64,
     pub conv_kernel_size: usize,
     pub dropout: f64,

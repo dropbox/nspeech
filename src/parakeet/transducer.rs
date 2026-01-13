@@ -19,6 +19,13 @@ use hf_hub::api::sync::Api;
 use std::path::Path;
 use std::collections::HashMap;
 
+// Embedded TDT model assets (compressed with zstd)
+use crate::embed_zst_asset;
+embed_zst_asset!(pub TDT_CONFIG, "parakeet-tdt-config.json.zst");
+embed_zst_asset!(pub TDT_MODEL, "parakeet-tdt-model.safetensors.zst");
+embed_zst_asset!(pub TDT_TOKENIZER, "parakeet-tdt-tokenizer.model.zst");
+embed_zst_asset!(pub TDT_TOKENIZER_JSON, "parakeet-tdt-tokenizer.json.zst");
+
 /// Token with timestamp information from TDT alignment
 #[derive(Debug, Clone)]
 pub struct TokenWithTimestamp {
@@ -96,7 +103,8 @@ impl PredictionNetwork {
         vb: VarBuilder<'_>,
     ) -> Result<Self> {
         // Embedding layer: vocab → hidden
-        let embedding = embedding(vocab_size, pred_hidden, vb.pp("embed"))?;
+        // NeMo includes blank token in predictor vocabulary, so vocab_size + 1
+        let embedding = embedding(vocab_size + 1, pred_hidden, vb.pp("embed"))?;
 
         // Stack LSTM layers (NeMo uses single multi-layer LSTM with shared prefix)
         let mut lstms = Vec::new();
@@ -344,7 +352,7 @@ impl TransducerModel {
     pub fn load_tokenizer<P: AsRef<Path>>(&mut self, dir: P) -> Result<()> {
         let dir = dir.as_ref();
 
-        // Try HuggingFace tokenizer.json first
+        // Try HuggingFace tokenizer.json first (easier to load)
         let json_path = dir.join("tokenizer.json");
         if json_path.exists() {
             self.tokenizer = Some(Tokenizer::from_file(&json_path)
@@ -352,10 +360,9 @@ impl TransducerModel {
             return Ok(());
         }
 
-        // Try SentencePiece tokenizer.model
+        // Fall back to SentencePiece tokenizer.model
         let sp_path = dir.join("tokenizer.model");
         if sp_path.exists() {
-            // Load SentencePiece model using Unigram
             let model = Unigram::load(&sp_path)
                 .map_err(|e| anyhow!("Failed to load tokenizer.model: {}", e))?;
             self.tokenizer = Some(Tokenizer::new(model));
@@ -977,24 +984,8 @@ pub fn load_parakeet_tdt_from_local<P: AsRef<Path>>(
 ) -> Result<TransducerModel> {
     let dir = dir.as_ref();
     let config_path = dir.join("config.json");
-    let weights_path = dir.join("model.safetensors");
 
-    // Check for tokenizer files (try both SentencePiece .model and HuggingFace .json)
-    // TODO: Add tokenizer support to TransducerModel for token decoding
-    let _tokenizer_path = if dir.join("tokenizer.model").exists() {
-        dir.join("tokenizer.model")
-    } else {
-        dir.join("tokenizer.json")
-    };
-
-    if !config_path.exists() || !weights_path.exists() {
-        return Err(anyhow!(
-            "missing files in {:?}, need config.json and model.safetensors",
-            dir
-        ));
-    }
-
-    // Load config
+    // TEMPORARY: Load directly from filesystem to debug
     let cfg_json = std::fs::read_to_string(&config_path)?;
     let hf_cfg: HfTransducerConfig = serde_json::from_str(&cfg_json)?;
     let tdt_cfg = TransducerConfig::from_hf(&hf_cfg);
@@ -1027,9 +1018,12 @@ pub fn load_parakeet_tdt_from_local<P: AsRef<Path>>(
 
     println!("Loading TDT model with {:?} dtype", dtype);
 
-    // Load safetensors and remap NeMo tensor names to our expected format
-    println!("  Loading and remapping NeMo tensors...");
+    // TEMPORARY: Load directly from filesystem to debug
+    println!("  Loading model weights from filesystem...");
+    let weights_path = dir.join("model.safetensors");
     let tensors_raw: HashMap<String, Tensor> = candle_core::safetensors::load(&weights_path, device)?;
+
+    println!("  Loading and remapping NeMo tensors...");
 
     // Remap tensor names from NeMo format to our expected format
     let mut tensors = HashMap::new();

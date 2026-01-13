@@ -22,6 +22,7 @@ pub use transducer::{
     TransducerConfig, TransducerModel, PredictionNetwork, JointNetwork,
     TokenWithTimestamp,
     load_parakeet_tdt_from_hf, load_parakeet_tdt_from_local,
+    TDT_CONFIG, TDT_MODEL, TDT_TOKENIZER, TDT_TOKENIZER_JSON, // Re-export TDT assets
 };
 
 // Re-export Streaming Transducer types
