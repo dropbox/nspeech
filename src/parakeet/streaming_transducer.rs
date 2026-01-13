@@ -192,6 +192,20 @@ impl StreamingTransducer {
         // Carrying predictor state maintains language model continuity
         let chunk_tokens = self.decode_chunk(&encoder_out, enc_frames)?;
 
+        // Detect silence chunks (mostly blanks) and reset state for next chunk
+        // This prevents state corruption during long pauses
+        let blank_ratio = if enc_frames > 0 {
+            (enc_frames - chunk_tokens.len()) as f32 / enc_frames as f32
+        } else {
+            0.0
+        };
+
+        if blank_ratio > 0.9 {  // 90%+ blanks = silence
+            // Reset LSTM for next chunk to prevent drift
+            self.state.predictor_states = None;
+            self.state.last_token = self.state.blank_id as u32;
+        }
+
         // Accumulate tokens
         self.state.tokens.extend(&chunk_tokens);
 
@@ -211,8 +225,8 @@ impl StreamingTransducer {
     /// Decoded tokens
     fn decode_chunk(&mut self, encoder_out: &Tensor, num_frames: usize) -> Result<Vec<u32>> {
         let mut decoded = Vec::new();
-        let mut consecutive_blanks = 0;
-        const MAX_CONSECUTIVE_BLANKS: usize = 50; // Reset after ~3s of silence
+        let mut garbage_count = 0;
+        const MAX_GARBAGE_TOKENS: usize = 5; // Reset after 5 garbage tokens
 
         for t in 0..num_frames {
             // Inner loop: keep predicting until blank
@@ -259,46 +273,43 @@ impl StreamingTransducer {
 
                 if token == self.state.blank_id as u32 {
                     // Blank: move to next timestep
-                    consecutive_blanks += 1;
-
-                    // Reset LSTM state after extended silence to prevent drift
-                    if consecutive_blanks >= MAX_CONSECUTIVE_BLANKS {
-                        self.state.predictor_states = None;
-                        self.state.last_token = self.state.blank_id as u32;
-                        consecutive_blanks = 0;
-                    }
-
+                    garbage_count = 0; // Reset garbage counter
                     break;
                 } else if token >= self.model.config.vocab_size as u32 {
                     // Special token, treat as blank
+                    garbage_count = 0;
                     break;
                 } else {
-                    // Valid vocabulary token - apply light filtering for obvious errors
-                    // Note: Individual tokens may look odd due to subword tokenization,
-                    // so we only reject tokens that decode to clear garbage
-                    let should_emit = if let Ok(token_text) = self.model.decode_tokens(&[token]) {
-                        // Reject only if it contains <unk> or has Cyrillic/CJK characters
-                        // (which shouldn't appear in English speech)
-                        !token_text.contains("<unk>")
-                            && !token_text.chars().any(|c| {
-                                // Cyrillic range: U+0400-U+04FF
-                                // CJK ranges and other non-Latin scripts
-                                matches!(c, '\u{0400}'..='\u{04FF}' | '\u{4E00}'..='\u{9FFF}' | '\u{3040}'..='\u{30FF}')
-                            })
+                    // Check if token produces garbage (Cyrillic, <unk>, etc.)
+                    let is_garbage = if let Ok(token_text) = self.model.decode_tokens(&[token]) {
+                        token_text.contains("<unk>") ||
+                        token_text.chars().any(|c| {
+                            // Cyrillic: U+0400-U+04FF
+                            matches!(c, '\u{0400}'..='\u{04FF}')
+                        })
                     } else {
-                        true  // If decode fails, emit anyway (let tokenizer handle it)
+                        false
                     };
 
-                    if should_emit {
-                        // Emit token and continue at same timestep
+                    if is_garbage {
+                        garbage_count += 1;
+
+                        // Too many garbage tokens - reset LSTM state
+                        if garbage_count >= MAX_GARBAGE_TOKENS {
+                            self.state.predictor_states = None;
+                            self.state.last_token = self.state.blank_id as u32;
+                            garbage_count = 0;
+                            // Don't emit this token, move to next frame
+                            break;
+                        }
+                        // Skip this garbage token but continue decoding
+                        self.state.last_token = token;
+                        break;
+                    } else {
+                        // Valid token: emit and continue at same timestep
+                        garbage_count = 0;
                         decoded.push(token);
                         self.state.last_token = token;
-                        consecutive_blanks = 0; // Reset blank counter on valid token
-                    } else {
-                        // Rejected token: update state but treat as blank
-                        self.state.last_token = token;
-                        consecutive_blanks += 1;
-                        break;
                     }
                 }
             }
