@@ -421,12 +421,19 @@ impl TransducerModel {
 
             // Inner loop: keep predicting until blank
             let mut inner_steps = 0;
-            const MAX_INNER_STEPS: usize = 50;
+            const MAX_INNER_STEPS: usize = 10;  // Reduced to prevent getting stuck
+            let mut repetition_count = 0;
+            let mut prev_inner_token = None;
 
             loop {
                 inner_steps += 1;
                 if inner_steps > MAX_INNER_STEPS {
-                    println!("    WARNING: Hit max inner steps at timestep {}, forcing blank", t);
+                    // Reset predictor state and force blank to recover
+                    pred_states = None;
+                    last_token = self.config.blank_id as u32;
+                    if t % 50 == 0 {
+                        println!("    WARNING: Hit max inner steps at timestep {}, resetting state", t);
+                    }
                     break;
                 }
 
@@ -444,17 +451,39 @@ impl TransducerModel {
                 // Joint network
                 let logits = self.joint.forward(&enc_t, &pred_out)?;
                 let logits = logits.squeeze(0)?.squeeze(0)?.squeeze(0)?;
-                let logits_f32 = logits.to_dtype(DType::F32)?;
+                let mut logits_f32 = logits.to_dtype(DType::F32)?;
+
+                // Add small blank bias only after several inner steps to encourage termination
+                let blank_bias = if inner_steps > 5 { 0.5 } else { 0.0 };
+                if blank_bias > 0.0 {
+                    let current_blank_logit = logits_f32.get(self.config.blank_id)?.to_scalar::<f32>()?;
+                    let blank_tensor = Tensor::new(&[current_blank_logit + blank_bias], logits_f32.device())?;
+                    logits_f32 = logits_f32.slice_assign(&[self.config.blank_id..self.config.blank_id+1], &blank_tensor)?;
+                }
 
                 // Mask out padding tokens 8193-8197
-                let mut masked_logits = logits_f32.clone();
                 for i in 8193..8198 {
-                    let mask_tensor = Tensor::new(&[-1e9_f32], masked_logits.device())?;
-                    masked_logits = masked_logits.slice_assign(&[i..i+1], &mask_tensor)?;
+                    let mask_tensor = Tensor::new(&[-1e9_f32], logits_f32.device())?;
+                    logits_f32 = logits_f32.slice_assign(&[i..i+1], &mask_tensor)?;
                 }
-                let log_probs_masked = candle_nn::ops::log_softmax(&masked_logits, D::Minus1)?;
+
+                let log_probs_masked = candle_nn::ops::log_softmax(&logits_f32, D::Minus1)?;
                 let token_tensor = log_probs_masked.argmax(D::Minus1)?;
                 let token = token_tensor.to_scalar::<u32>()?;
+
+                // Repetition detection: if we see the same token 3+ times, force blank
+                if let Some(prev_tok) = prev_inner_token {
+                    if prev_tok == token && token != self.config.blank_id as u32 {
+                        repetition_count += 1;
+                        if repetition_count >= 3 {
+                            // Force blank to break repetition loop
+                            break;
+                        }
+                    } else {
+                        repetition_count = 0;
+                    }
+                }
+                prev_inner_token = Some(token);
 
                 if token == self.config.blank_id as u32 {
                     // Blank: move to next timestep
@@ -473,6 +502,7 @@ impl TransducerModel {
             }
         }
 
+        println!("  Decoded {} tokens total", decoded.len());
         Ok(decoded)
     }
 
@@ -585,13 +615,20 @@ impl TransducerModel {
             // Inner loop: keep predicting until blank
             // Add safety limit to prevent infinite loops
             let mut inner_steps = 0;
-            const MAX_INNER_STEPS: usize = 50;
+            const MAX_INNER_STEPS: usize = 10;  // Reduced from 50 to prevent getting stuck
             let mut first_token_this_timestep = None;
+            let mut repetition_count = 0;
+            let mut prev_inner_token = None;
 
             loop {
                 inner_steps += 1;
                 if inner_steps > MAX_INNER_STEPS {
-                    println!("    WARNING: Hit max inner steps at timestep {}, forcing blank", t);
+                    // Reset predictor state and force blank to recover
+                    pred_states = None;
+                    last_token = self.config.blank_id as u32;
+                    if t % 50 == 0 {
+                        println!("    WARNING: Hit max inner steps at timestep {}, resetting state", t);
+                    }
                     break;
                 }
 
@@ -614,44 +651,48 @@ impl TransducerModel {
                 let logits = logits.squeeze(0)?.squeeze(0)?.squeeze(0)?;
 
                 // Convert to F32 for log_softmax (BF16 not supported)
-                let logits_f32 = logits.to_dtype(DType::F32)?;
+                let mut logits_f32 = logits.to_dtype(DType::F32)?;
 
-                // Apply log_softmax for proper probability distribution
-                let log_probs = candle_nn::ops::log_softmax(&logits_f32, D::Minus1)?;
+                // Add small blank bias only after several inner steps to encourage termination
+                // This helps prevent infinite loops while still allowing normal decoding
+                let blank_bias = if inner_steps > 5 { 0.5 } else { 0.0 };
+                if blank_bias > 0.0 {
+                    let current_blank_logit = logits_f32.get(self.config.blank_id)?.to_scalar::<f32>()?;
+                    let blank_tensor = Tensor::new(&[current_blank_logit + blank_bias], logits_f32.device())?;
+                    logits_f32 = logits_f32.slice_assign(&[self.config.blank_id..self.config.blank_id+1], &blank_tensor)?;
+                }
 
                 // Mask out padding tokens 8193-8197 to prevent their use
                 // Valid tokens: 0-8191 (content) + 8192 (blank)
-                let mut masked_logits = logits_f32.clone();
                 for i in 8193..8198 {
-                    let mask_tensor = Tensor::new(&[-1e9_f32], masked_logits.device())?;
-                    masked_logits = masked_logits.slice_assign(&[i..i+1], &mask_tensor)?;
+                    let mask_tensor = Tensor::new(&[-1e9_f32], logits_f32.device())?;
+                    logits_f32 = logits_f32.slice_assign(&[i..i+1], &mask_tensor)?;
                 }
-                let log_probs_masked = candle_nn::ops::log_softmax(&masked_logits, D::Minus1)?;
+
+                let log_probs_masked = candle_nn::ops::log_softmax(&logits_f32, D::Minus1)?;
                 let token_tensor = log_probs_masked.argmax(D::Minus1)?;
                 let token = token_tensor.to_scalar::<u32>()?;
+
+                // Repetition detection: if we see the same token 3+ times, force blank
+                if let Some(prev_tok) = prev_inner_token {
+                    if prev_tok == token && token != self.config.blank_id as u32 {
+                        repetition_count += 1;
+                        if repetition_count >= 3 {
+                            // Force blank to break repetition loop
+                            if t % 50 == 0 {
+                                println!("    Detected repetition of token {}, forcing blank", token);
+                            }
+                            break;
+                        }
+                    } else {
+                        repetition_count = 0;
+                    }
+                }
+                prev_inner_token = Some(token);
 
                 // Debug first token of every 50th timestep
                 if first_token_this_timestep.is_none() {
                     first_token_this_timestep = Some(token);
-                    if t % 50 == 0 {
-                        let blank_prob = log_probs.get(self.config.blank_id)?.to_scalar::<f32>()?;
-                        let token_prob = log_probs.get(token as usize)?.to_scalar::<f32>()?;
-
-                        // Find best content token (0-8191, excluding special tokens 8192-8197)
-                        let mut best_content_token = 0;
-                        let mut best_content_prob = f32::NEG_INFINITY;
-                        for i in 0..8192 {
-                            let prob = log_probs.get(i)?.to_scalar::<f32>()?;
-                            if prob > best_content_prob {
-                                best_content_prob = prob;
-                                best_content_token = i;
-                            }
-                        }
-
-                        println!("    t={}: top=tok{} ({:.3}), blank=tok{} ({:.3}), best_content=tok{} ({:.3})",
-                                 t, token, token_prob, self.config.blank_id, blank_prob,
-                                 best_content_token, best_content_prob);
-                    }
                 }
 
                 if token == self.config.blank_id as u32 {
@@ -659,9 +700,6 @@ impl TransducerModel {
                     break;
                 } else if token >= self.config.vocab_size as u32 {
                     // Special token beyond vocab (can't feed to predictor), treat as blank
-                    if t % 50 == 0 && inner_steps == 1 {
-                        println!("    (Special token {}, treating as blank)", token);
-                    }
                     break;
                 } else {
                     // Valid vocabulary token: emit and continue at same timestep
@@ -671,6 +709,7 @@ impl TransducerModel {
             }
         }
 
+        println!("  Decoded {} tokens total", decoded.len());
         Ok(decoded)
     }
 }
