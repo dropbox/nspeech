@@ -71,6 +71,14 @@ pub struct StreamingState {
     /// Token buffer for LCS-based overlap deduplication
     /// Stores recent tokens to detect duplicates in overlapping regions
     token_buffer: Vec<u32>,
+
+    /// Number of encoder frames consumed so far (for frame-level masking)
+    /// Used to skip overlapping frames when decoding
+    encoder_frames_consumed: usize,
+
+    /// Chunk configuration for calculating overlap frames
+    chunk_samples: usize,
+    overlap_samples: usize,
 }
 
 impl StreamingState {
@@ -81,11 +89,14 @@ impl StreamingState {
             last_token: blank_id as u32,
             tokens: Vec::new(),
             tokens_decoded: 0,
+            chunk_samples: config.chunk_samples,
+            overlap_samples: config.overlap_samples,
             config,
             blank_id,
             total_samples: 0,
             chunks_processed: 0,
             token_buffer: Vec::new(),
+            encoder_frames_consumed: 0,
         }
     }
 
@@ -99,6 +110,7 @@ impl StreamingState {
         self.total_samples = 0;
         self.chunks_processed = 0;
         self.token_buffer.clear();
+        self.encoder_frames_consumed = 0;
     }
 
     /// Get accumulated tokens
@@ -186,22 +198,45 @@ impl StreamingTransducer {
     /// # Returns
     /// Tokens decoded from these features
     pub fn process_features(&mut self, features: &Tensor) -> Result<Vec<u32>> {
-        let (batch_size, _mel_frames, _feat_dim) = features.dims3()?;
+        let (batch_size, mel_frames, _feat_dim) = features.dims3()?;
         assert_eq!(batch_size, 1, "Streaming only supports batch_size=1");
 
-        // Run encoder on features
+        // Run encoder on features (process full overlapping chunk for context)
         let encoder_out = self.model.encoder.forward(features, false)?;
         let (_, enc_frames, _) = encoder_out.dims3()?;
 
-        // Decode tokens maintaining LSTM state across chunks
-        // The overlap provides acoustic context to the encoder
-        // Carrying predictor state maintains language model continuity
-        let chunk_tokens = self.decode_chunk(&encoder_out, enc_frames)?;
+        // Calculate overlap in encoder frames
+        // Encoder does 8x temporal downsampling (ConvSubsampling stride)
+        let overlap_encoder_frames = if self.state.chunks_processed > 0 && self.state.overlap_samples > 0 {
+            // Estimate: overlap_samples -> mel_frames -> encoder_frames
+            // Mel: 160 hop -> overlap_samples/160 frames
+            // Encoder: 8x downsample -> mel_frames/8 frames
+            let overlap_mel_frames = (self.state.overlap_samples / 160) + 1;
+            let overlap_enc = (overlap_mel_frames / 8) + 1;
+            overlap_enc.min(enc_frames) // Clamp to actual frames
+        } else {
+            0 // First chunk - no overlap to skip
+        };
+
+        // Frame-level masking: only decode novel frames (skip overlap)
+        // This prevents LSTM confusion from re-processing same acoustic content
+        let start_frame = overlap_encoder_frames;
+        let frames_to_decode = if start_frame < enc_frames {
+            enc_frames - start_frame
+        } else {
+            0 // All frames are overlap (shouldn't happen)
+        };
+
+        // Decode only novel frames (beyond overlap boundary)
+        let chunk_tokens = self.decode_chunk_masked(&encoder_out, start_frame, frames_to_decode)?;
+
+        // Track total encoder frames consumed
+        self.state.encoder_frames_consumed += frames_to_decode;
 
         // Detect silence chunks (mostly blanks) and reset state for next chunk
-        // This prevents state corruption during long pauses
-        let blank_ratio = if enc_frames > 0 {
-            (enc_frames - chunk_tokens.len()) as f32 / enc_frames as f32
+        // Calculate blank ratio based on frames actually decoded (not total encoder frames)
+        let blank_ratio = if frames_to_decode > 0 {
+            (frames_to_decode - chunk_tokens.len()) as f32 / frames_to_decode as f32
         } else {
             0.0
         };
@@ -232,20 +267,19 @@ impl StreamingTransducer {
         Ok(deduplicated)
     }
 
-    /// Decode tokens from encoder output using greedy decoding
+    /// Decode tokens from encoder output using greedy decoding with frame masking
     ///
     /// # Arguments
     /// * `encoder_out` - Encoder output tensor [1, T, enc_dim]
-    /// * `num_frames` - Number of encoder frames to process
+    /// * `start_frame` - First frame to decode (skip overlap)
+    /// * `num_frames` - Number of frames to decode
     ///
     /// # Returns
     /// Decoded tokens
-    fn decode_chunk(&mut self, encoder_out: &Tensor, num_frames: usize) -> Result<Vec<u32>> {
+    fn decode_chunk_masked(&mut self, encoder_out: &Tensor, start_frame: usize, num_frames: usize) -> Result<Vec<u32>> {
         let mut decoded = Vec::new();
-        let mut garbage_count = 0;
-        const MAX_GARBAGE_TOKENS: usize = 5; // Reset after 5 consecutive garbage tokens
 
-        for t in 0..num_frames {
+        for t in start_frame..(start_frame + num_frames) {
             // Inner loop: keep predicting until blank
             let mut inner_steps = 0;
             const MAX_INNER_STEPS: usize = 30;
@@ -294,50 +328,18 @@ impl StreamingTransducer {
                     // Blank: ROLLBACK state (don't corrupt with blank prediction)
                     // This is critical per NeMo - blanks should not update decoder state
                     self.state.predictor_states = saved_states;
-                    garbage_count = 0;
                     break;
                 } else if token >= self.model.config.vocab_size as u32 {
                     // Special token, treat as blank (rollback state)
                     self.state.predictor_states = saved_states;
-                    garbage_count = 0;
                     break;
                 } else {
                     // Non-blank token: UPDATE state (this is the only place we accept new_states)
                     self.state.predictor_states = Some(new_states);
 
-                    // Check if token produces garbage (Cyrillic, <unk>, etc.)
-                    let is_garbage = if let Ok(token_text) = self.model.decode_tokens(&[token]) {
-                        token_text.contains("<unk>") ||
-                        token_text.chars().any(|c| {
-                            // Cyrillic: U+0400-U+04FF
-                            matches!(c, '\u{0400}'..='\u{04FF}')
-                        })
-                    } else {
-                        false
-                    };
-
-                    if is_garbage {
-                        garbage_count += 1;
-
-                        // Too many garbage tokens - reset LSTM state
-                        if garbage_count >= MAX_GARBAGE_TOKENS {
-                            self.state.predictor_states = None;
-                            self.state.last_token = self.state.blank_id as u32;
-                            garbage_count = 0;
-                            // Don't emit this token, move to next frame
-                            break;
-                        }
-                        // Skip this garbage token but continue decoding
-                        self.state.last_token = token;
-                        break;
-                    } else {
-                        // Valid token: emit and continue at same timestep
-                        garbage_count = 0;
-
-                        // Emit valid token and update last_token
-                        decoded.push(token);
-                        self.state.last_token = token;
-                    }
+                    // Emit token and update last_token
+                    decoded.push(token);
+                    self.state.last_token = token;
                 }
             }
         }
