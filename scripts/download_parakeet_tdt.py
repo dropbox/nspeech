@@ -292,6 +292,10 @@ def main():
             # Create Unigram tokenizer
             tokenizer = Tokenizer(tokenizer_models.Unigram(list(vocab.items())))
 
+            # Add decoder to handle SentencePiece special characters
+            from tokenizers import decoders
+            tokenizer.decoder = decoders.Metaspace(replacement="▁")
+
             # Save as JSON
             tokenizer_json_path = cache_dir / "tokenizer.json"
             tokenizer.save(str(tokenizer_json_path))
