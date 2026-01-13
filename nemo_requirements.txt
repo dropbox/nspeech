@@ -1,0 +1,20 @@
+# Requirements for NeMo baseline scripts
+#
+# Install with: uv pip install -r nemo_requirements.txt
+
+# NeMo toolkit with ASR support
+nemo_toolkit[asr]>=1.23.0
+
+# Core dependencies (usually installed with nemo_toolkit)
+torch>=2.0.0
+torchaudio>=2.0.0
+librosa>=0.10.0
+numpy>=1.23.0
+omegaconf>=2.3.0
+
+# Optional but recommended for better performance
+# soundfile>=0.12.0
+# numba>=0.57.0
+
+# Note: For full NeMo installation with all features:
+# uv pip install nemo-toolkit[all]
