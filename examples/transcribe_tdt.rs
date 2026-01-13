@@ -76,10 +76,10 @@ fn main() -> Result<()> {
     println!("  Encoder output: [{}, {}, {}]", b, t, d);
     println!("  Encoder time: {:.2}s\n", encoder_time.as_secs_f32());
 
-    // Run transducer decoding
+    // Run transducer decoding with beam search (beam_size=2 like NeMo)
     println!("Running transducer decoding...");
     let decode_start = std::time::Instant::now();
-    let token_ids = model.greedy_decode(&encoder_out)?;
+    let token_ids = model.beam_decode(&encoder_out, 2)?;
     let decode_time = decode_start.elapsed();
 
     println!("  Decoded {} tokens", token_ids.len());

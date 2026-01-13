@@ -26,6 +26,21 @@ pub struct TokenWithTimestamp {
     pub frame: usize,  // Encoder frame where this token was emitted
 }
 
+/// Beam search hypothesis for transducer decoding
+#[derive(Debug, Clone)]
+struct BeamHypothesis {
+    /// Accumulated tokens
+    tokens: Vec<u32>,
+    /// Accumulated score (log probability)
+    score: f32,
+    /// Current predictor LSTM state
+    pred_state: Vec<rnn::LSTMState>,
+    /// Last predicted token
+    last_token: u32,
+    /// Current timestep in encoder output
+    timestep: usize,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TransducerConfig {
     pub vocab_size: usize,  // Predictor vocab size
@@ -711,6 +726,156 @@ impl TransducerModel {
 
         println!("  Decoded {} tokens total", decoded.len());
         Ok(decoded)
+    }
+
+    /// Beam search decoding: Explores multiple hypotheses in parallel
+    ///
+    /// Implements beam search with configurable beam size (typically 2).
+    /// For each timestep, maintains the top-K best hypotheses.
+    pub fn beam_decode(&self, encoder_out: &Tensor, beam_size: usize) -> Result<Vec<u32>> {
+        let (batch_size, time_steps, _enc_dim) = encoder_out.dims3()?;
+
+        if batch_size != 1 {
+            return Err(anyhow!("Beam decode currently only supports batch_size=1"));
+        }
+
+        println!("  Beam decoding (beam_size={}) {} timesteps...", beam_size, time_steps);
+
+        // Initialize beam with single hypothesis
+        let init_state = self.predictor.init_states(1, encoder_out.device())?;
+        let mut beam = vec![BeamHypothesis {
+            tokens: Vec::new(),
+            score: 0.0,
+            pred_state: init_state,
+            last_token: self.config.blank_id as u32,
+            timestep: 0,
+        }];
+
+        let mut completed = Vec::new();
+
+        for t in 0..time_steps {
+            if t % 50 == 0 {
+                println!("  Progress: {}/{} timesteps, beam size: {}, completed: {}",
+                         t, time_steps, beam.len(), completed.len());
+            }
+
+            let mut candidates = Vec::new();
+
+            // Expand each hypothesis in the beam
+            for hyp in &beam {
+                // Skip if this hypothesis has already passed this timestep
+                if hyp.timestep > t {
+                    candidates.push(hyp.clone());
+                    continue;
+                }
+
+                // Get encoder output at current timestep
+                let enc_t = encoder_out.narrow(1, t, 1)?;
+
+                // Try extending with non-blank tokens (inner loop)
+                let mut current_hyp = hyp.clone();
+                const MAX_INNER_STEPS: usize = 10;
+                let mut emitted_blank = false;
+
+                for _inner_step in 0..MAX_INNER_STEPS {
+                    // Predictor forward
+                    let pred_input = Tensor::new(&[current_hyp.last_token], encoder_out.device())?
+                        .unsqueeze(0)?;
+
+                    let (pred_out, new_states) = self.predictor.forward(
+                        &pred_input,
+                        Some(&current_hyp.pred_state)
+                    )?;
+
+                    // Joint network
+                    let logits = self.joint.forward(&enc_t, &pred_out)?;
+                    let logits = logits.squeeze(0)?.squeeze(0)?.squeeze(0)?;
+                    let mut logits_f32 = logits.to_dtype(DType::F32)?;
+
+                    // Mask out padding tokens 8193-8197
+                    for i in 8193..8198 {
+                        let mask_tensor = Tensor::new(&[-1e9_f32], logits_f32.device())?;
+                        logits_f32 = logits_f32.slice_assign(&[i..i+1], &mask_tensor)?;
+                    }
+
+                    let log_probs = candle_nn::ops::log_softmax(&logits_f32, D::Minus1)?;
+                    let log_probs_vec: Vec<f32> = log_probs.to_vec1()?;
+
+                    // Get top token
+                    let (mut best_token, mut best_score) = (0usize, f32::NEG_INFINITY);
+                    for (idx, &score) in log_probs_vec.iter().enumerate() {
+                        if idx <= self.config.vocab_size && score > best_score {
+                            best_token = idx;
+                            best_score = score;
+                        }
+                    }
+
+                    let token = best_token as u32;
+
+                    if token == self.config.blank_id as u32 {
+                        // Blank: save current hypothesis with updated timestep
+                        let mut blank_hyp = current_hyp.clone();
+                        blank_hyp.timestep = t + 1;
+                        blank_hyp.score += best_score;
+                        candidates.push(blank_hyp);
+                        emitted_blank = true;
+                        break;
+                    } else if token < self.config.vocab_size as u32 {
+                        // Non-blank: update current hypothesis and continue
+                        current_hyp.tokens.push(token);
+                        current_hyp.score += best_score;
+                        current_hyp.pred_state = new_states;
+                        current_hyp.last_token = token;
+                        // Continue inner loop to look for more tokens
+                    } else {
+                        // Invalid token, treat as blank
+                        let mut blank_hyp = current_hyp.clone();
+                        blank_hyp.timestep = t + 1;
+                        candidates.push(blank_hyp);
+                        emitted_blank = true;
+                        break;
+                    }
+                }
+
+                // If we didn't emit blank after MAX_INNER_STEPS, force it
+                if !emitted_blank {
+                    let mut forced_hyp = current_hyp;
+                    forced_hyp.timestep = t + 1;
+                    candidates.push(forced_hyp);
+                }
+            }
+
+            // Keep top beam_size hypotheses
+            candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+            beam = candidates.into_iter().take(beam_size).collect();
+
+            // Move completed hypotheses (reached end of encoder output)
+            beam.retain(|hyp| {
+                if hyp.timestep >= time_steps {
+                    completed.push(hyp.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+
+            // If beam is empty, we're done
+            if beam.is_empty() {
+                break;
+            }
+        }
+
+        // Add remaining beam hypotheses to completed
+        completed.extend(beam);
+
+        // Return best hypothesis
+        completed.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+
+        let best = completed.first()
+            .ok_or_else(|| anyhow!("No hypotheses generated"))?;
+
+        println!("  Decoded {} tokens with beam search (score: {:.2})", best.tokens.len(), best.score);
+        Ok(best.tokens.clone())
     }
 }
 
