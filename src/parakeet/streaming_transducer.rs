@@ -218,37 +218,38 @@ impl StreamingTransducer {
             0 // First chunk - no overlap to skip
         };
 
-        // Frame-level masking: only decode novel frames (skip overlap)
-        // This prevents LSTM confusion from re-processing same acoustic content
-        let start_frame = overlap_encoder_frames;
-        let frames_to_decode = if start_frame < enc_frames {
-            enc_frames - start_frame
+        // IMPORTANT: Decode ALL frames to provide LSTM context
+        // The LSTM needs overlapping frames as context to produce good predictions
+        // We rely on LCS deduplication to remove duplicate tokens from overlap
+        eprintln!("  [Chunk {}] Enc frames: {}, overlap: {} frames (decoded for context, LCS will dedupe)",
+                  self.state.chunks_processed + 1, enc_frames, overlap_encoder_frames);
+
+        let chunk_tokens = self.decode_chunk_masked(&encoder_out, 0, enc_frames)?;
+
+        // Track encoder frames (skip overlap count for total)
+        let novel_frames = if self.state.chunks_processed > 0 {
+            enc_frames.saturating_sub(overlap_encoder_frames)
         } else {
-            0 // All frames are overlap (shouldn't happen)
+            enc_frames
         };
+        self.state.encoder_frames_consumed += novel_frames;
 
-        // Decode only novel frames (beyond overlap boundary)
-        let chunk_tokens = self.decode_chunk_masked(&encoder_out, start_frame, frames_to_decode)?;
-
-        // Track total encoder frames consumed
-        self.state.encoder_frames_consumed += frames_to_decode;
-
-        // Detect silence chunks (mostly blanks) and reset state for next chunk
-        // Calculate blank ratio based on frames actually decoded (not total encoder frames)
-        let blank_ratio = if frames_to_decode > 0 {
-            (frames_to_decode - chunk_tokens.len()) as f32 / frames_to_decode as f32
-        } else {
-            0.0
-        };
-
-        if blank_ratio > 0.95 {  // 95%+ blanks = silence
-            // Reset LSTM for next chunk to prevent drift during long pauses
-            self.state.predictor_states = None;
-            self.state.last_token = self.state.blank_id as u32;
-        }
+        // Reset LSTM after each chunk to prevent state accumulation issues
+        // Why: The LSTM predictor state can get "stuck" predicting blanks after
+        // processing silence or certain acoustic patterns. Resetting provides
+        // a fresh start for each chunk while the overlap ensures acoustic continuity.
+        // Trade-off: Sacrifices language model continuity for robustness
+        self.state.predictor_states = None;
+        self.state.last_token = self.state.blank_id as u32;
 
         // Deduplicate tokens using LCS (remove overlapping content from previous chunk)
         let deduplicated = self.deduplicate_tokens(chunk_tokens.clone());
+
+        // Log LCS deduplication effect
+        if chunk_tokens.len() != deduplicated.len() {
+            eprintln!("  [LCS] Dedup: {} raw tokens → {} deduplicated ({} removed)",
+                      chunk_tokens.len(), deduplicated.len(), chunk_tokens.len() - deduplicated.len());
+        }
 
         // Update token buffer for next chunk's LCS (keep last N tokens as context)
         const BUFFER_SIZE: usize = 50; // Match MAX_SEARCH_LEN
@@ -278,6 +279,7 @@ impl StreamingTransducer {
     /// Decoded tokens
     fn decode_chunk_masked(&mut self, encoder_out: &Tensor, start_frame: usize, num_frames: usize) -> Result<Vec<u32>> {
         let mut decoded = Vec::new();
+        let mut blank_count = 0;
 
         for t in start_frame..(start_frame + num_frames) {
             // Inner loop: keep predicting until blank
@@ -328,10 +330,12 @@ impl StreamingTransducer {
                     // Blank: ROLLBACK state (don't corrupt with blank prediction)
                     // This is critical per NeMo - blanks should not update decoder state
                     self.state.predictor_states = saved_states;
+                    blank_count += 1;
                     break;
                 } else if token >= self.model.config.vocab_size as u32 {
                     // Special token, treat as blank (rollback state)
                     self.state.predictor_states = saved_states;
+                    blank_count += 1;
                     break;
                 } else {
                     // Non-blank token: UPDATE state (this is the only place we accept new_states)
@@ -342,6 +346,12 @@ impl StreamingTransducer {
                     self.state.last_token = token;
                 }
             }
+        }
+
+        // Debug logging for 0-token chunks
+        if decoded.is_empty() && num_frames > 0 {
+            eprintln!("  [DEBUG] 0 tokens decoded from {} frames ({} blanks, {:.1}% blank ratio)",
+                      num_frames, blank_count, (blank_count as f32 / num_frames as f32) * 100.0);
         }
 
         Ok(decoded)
