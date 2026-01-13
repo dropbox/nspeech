@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use crate::embed_zst_asset;
 embed_zst_asset!(pub TDT_CONFIG, "parakeet-tdt-config.json.zst");
 embed_zst_asset!(pub TDT_MODEL, "parakeet-tdt-model.safetensors.zst");
+embed_zst_asset!(pub TDT_MODEL_Q8_0_GGUF, "parakeet-tdt-model_q8_0.gguf.zst");
 embed_zst_asset!(pub TDT_TOKENIZER, "parakeet-tdt-tokenizer.model.zst");
 embed_zst_asset!(pub TDT_TOKENIZER_JSON, "parakeet-tdt-tokenizer.json.zst");
 
@@ -1206,6 +1207,173 @@ pub fn load_parakeet_tdt_from_hf(
         encoder_cfg.d_model,
         vb,
     )?;
+
+    Ok(model)
+}
+
+/// Load Parakeet TDT (Transducer) model from GGUF quantized format
+///
+/// # Arguments
+/// * `dir` - Directory containing quantized model assets
+/// * `device` - Device to load model on
+///
+/// Expected files in directory:
+/// - `parakeet-tdt-config.json.zst` - Model configuration (compressed)
+/// - `parakeet-tdt-model_q8_0.gguf.zst` - Quantized model weights (compressed)
+/// - `parakeet-tdt-tokenizer.json.zst` - Tokenizer (compressed)
+///
+/// # Example
+/// ```no_run
+/// use speech::parakeet::transducer::{load_parakeet_tdt_from_gguf_local, TransducerModel};
+/// use speech::parakeet::get_device;
+/// let device = get_device()?;
+/// let model = load_parakeet_tdt_from_gguf_local("assets", &device)?;
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub fn load_parakeet_tdt_from_gguf_local<P: AsRef<Path>>(
+    dir: P,
+    device: &Device,
+) -> Result<TransducerModel> {
+    use std::io::{Error, ErrorKind};
+
+    let assets = dir.as_ref().to_path_buf();
+
+    println!("Loading TDT model with Q8_0 quantization (recommended, compressed)");
+
+    // Load config from embedded asset
+    println!("  Loading config from assets...");
+    let cfg_bytes = TDT_CONFIG.bytes(&assets).map_err(|_| {
+        Error::new(
+            ErrorKind::Other,
+            "failed to get decompressed bytes for TDT_CONFIG",
+        )
+    })?;
+    let hf_cfg: HfTransducerConfig = serde_json::from_slice(cfg_bytes).map_err(|e| {
+        Error::new(
+            ErrorKind::Other,
+            format!("failed to parse TDT_CONFIG as JSON: {e}"),
+        )
+    })?;
+    let tdt_cfg = TransducerConfig::from_hf(&hf_cfg);
+
+    // Manually construct encoder config from TDT config structure
+    let enc = &hf_cfg.encoder_config;
+    let encoder_cfg = FastConformerConfig {
+        feat_in: enc.num_mel_bins,
+        d_model: enc.hidden_size,
+        num_heads: enc.num_attention_heads,
+        ff_mult: enc.intermediate_size / enc.hidden_size,
+        num_layers: enc.num_hidden_layers,
+        conv_kernel_size: enc.conv_kernel_size,
+        dropout: enc.dropout,
+        dropout_positions: enc.dropout_positions,
+        subsampling_channels: enc.subsampling_conv_channels,
+        subsampling_stride: enc.subsampling_conv_stride,
+        subsampling_factor: enc.subsampling_factor,
+        scale_input: enc.scale_input.unwrap_or(true),
+        vocab_size: hf_cfg.vocab_size,
+        blank_id: hf_cfg.blank_id,
+    };
+
+    // Load tokenizer from embedded asset
+    println!("  Loading tokenizer from assets...");
+    let tok_bytes = TDT_TOKENIZER_JSON.bytes(&assets).map_err(|_| {
+        Error::new(
+            ErrorKind::Other,
+            "failed to get decompressed bytes for TDT_TOKENIZER_JSON",
+        )
+    })?;
+    let tokenizer = Tokenizer::from_bytes(tok_bytes)
+        .map_err(|e| Error::new(ErrorKind::Other, format!("failed to parse TDT_TOKENIZER_JSON: {e}")))?;
+
+    // Load GGUF from embedded asset (already decompressed by embed_zst_asset macro)
+    println!("  Loading GGUF file from assets...");
+    let gguf_bytes = TDT_MODEL_Q8_0_GGUF.bytes(&assets).map_err(|_| {
+        Error::new(
+            ErrorKind::Other,
+            "failed to load TDT_MODEL_Q8_0_GGUF",
+        )
+    })?;
+
+    // For quantized models, we need to dequantize to FP32/BF16 for inference
+    // TDT uses LSTM which doesn't support quantized operations yet
+    println!("  Dequantizing GGUF to tensors...");
+
+    // Determine target dtype
+    let dtype = if device.is_cpu() {
+        DType::F32
+    } else {
+        DType::BF16  // Use BF16 on GPU (matches training dtype)
+    };
+
+    println!("    Target dtype: {:?}", dtype);
+
+    // Load GGUF and dequantize tensors
+    let gguf_file = candle_core::quantized::gguf_file::Content::read(&mut std::io::Cursor::new(gguf_bytes))?;
+    let mut tensors = HashMap::new();
+
+    for (nemo_name, _) in gguf_file.tensor_infos.iter() {
+        let qtensor = gguf_file.tensor(&mut std::io::Cursor::new(gguf_bytes), nemo_name, device)?;
+        let tensor = qtensor.dequantize(device)?;
+
+        // Convert to target dtype if needed
+        let tensor = if tensor.dtype() != dtype {
+            tensor.to_dtype(dtype)?
+        } else {
+            tensor
+        };
+
+        // Remap NeMo tensor names to our format
+        let our_name = remap_nemo_tensor_name(nemo_name);
+        tensors.insert(our_name.clone(), tensor.clone());
+
+        // Add zero biases for layers that need them (NeMo doesn't have biases)
+        let needs_bias = our_name.contains(".linear1.weight")
+            || our_name.contains(".linear2.weight")
+            || our_name.contains(".q_proj.weight")
+            || our_name.contains(".k_proj.weight")
+            || our_name.contains(".v_proj.weight")
+            || our_name.contains(".o_proj.weight")
+            || our_name.contains(".relative_k_proj.weight")
+            || our_name.contains(".enc_proj.weight")
+            || our_name.contains(".pred_proj.weight")
+            || our_name.contains(".hidden.weight")
+            || our_name.contains(".output.weight")
+            || our_name.contains(".pointwise_conv1.weight")
+            || our_name.contains(".pointwise_conv2.weight")
+            || our_name.contains(".depthwise_conv.weight");
+
+        if needs_bias {
+            let bias_name = our_name.replace(".weight", ".bias");
+            if !tensors.contains_key(&bias_name) {
+                let out_features = tensor.dims()[0];
+                let zero_bias = Tensor::zeros(out_features, dtype, device)?;
+                tensors.insert(bias_name, zero_bias);
+            }
+        }
+    }
+
+    println!("    ✓ Dequantized {} tensors", tensors.len());
+
+    let vb = VarBuilder::from_tensors(tensors, dtype, device);
+
+    // Build encoder
+    println!("  Building encoder...");
+    let encoder = FastConformerEncoder::new(encoder_cfg.clone(), vb.pp("encoder"))?;
+
+    // Build full transducer model
+    println!("  Building transducer model...");
+    let mut model = TransducerModel::new(
+        encoder,
+        tdt_cfg,
+        encoder_cfg.d_model,
+        vb,
+    )?;
+
+    // Store tokenizer
+    model.tokenizer = Some(tokenizer);
+
+    println!("  ✓ TDT model loaded successfully (quantized)");
 
     Ok(model)
 }

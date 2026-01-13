@@ -21,8 +21,8 @@ pub use fast_conformer::{
 pub use transducer::{
     TransducerConfig, TransducerModel, PredictionNetwork, JointNetwork,
     TokenWithTimestamp,
-    load_parakeet_tdt_from_hf, load_parakeet_tdt_from_local,
-    TDT_CONFIG, TDT_MODEL, TDT_TOKENIZER, TDT_TOKENIZER_JSON, // Re-export TDT assets
+    load_parakeet_tdt_from_hf, load_parakeet_tdt_from_local, load_parakeet_tdt_from_gguf_local,
+    TDT_CONFIG, TDT_MODEL, TDT_MODEL_Q8_0_GGUF, TDT_TOKENIZER, TDT_TOKENIZER_JSON, // Re-export TDT assets
 };
 
 // Re-export Streaming Transducer types

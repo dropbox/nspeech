@@ -192,6 +192,56 @@ def compress_file(file_path: pathlib.Path, output_name: str = None) -> pathlib.P
     return zst_path
 
 
+def quantize_tdt_model(cache_dir: pathlib.Path, safetensors_path: pathlib.Path) -> pathlib.Path | None:
+    """Quantize TDT safetensors model to GGUF format with zstd compression.
+
+    Returns path to quantized .gguf.zst file, or None if quantization failed.
+    """
+    print("\nQuantizing TDT model to GGUF with zstd compression...")
+
+    gguf_path = cache_dir / "parakeet-tdt-model_q8_0.gguf.zst"
+
+    if not safetensors_path.exists():
+        print(f"  ✗ model.safetensors not found at {safetensors_path}")
+        return None
+
+    print(f"  Input:  {safetensors_path}")
+    print(f"  Output: {gguf_path}")
+    print(f"  Format: Q8_0 (recommended quality/size balance)")
+    print(f"  Compression: zstd level 19 (inline)\n")
+
+    try:
+        # Run cargo build first to ensure quantize_gguf is compiled
+        print("  Building quantize_gguf tool...")
+        project_root = pathlib.Path(__file__).parent.parent
+        subprocess.run(
+            ["cargo", "build", "--example", "quantize_gguf", "--release"],
+            check=True,
+            cwd=project_root,
+        )
+
+        # Run quantization tool (compression is always enabled)
+        print("  Running quantization (this may take a few minutes)...")
+        subprocess.run(
+            [
+                "cargo", "run", "--example", "quantize_gguf", "--release", "--",
+                str(safetensors_path),
+                str(gguf_path),
+                "--format", "q8_0",
+            ],
+            check=True,
+            cwd=project_root,
+        )
+        print(f"  ✓ Quantized TDT model saved to {gguf_path}")
+        return gguf_path
+    except subprocess.CalledProcessError as e:
+        print(f"  ✗ Quantization failed: {e}")
+        print(f"  You can manually quantize later with:")
+        print(f"    cargo run --example quantize_gguf --release -- \\")
+        print(f"      {safetensors_path} {gguf_path} --format q8_0")
+        return None
+
+
 def main():
     if not DEPS_AVAILABLE:
         print("Error: Required dependencies not installed")
@@ -215,6 +265,11 @@ def main():
         "--keep-extracted",
         action="store_true",
         help="Keep extracted NeMo files after conversion",
+    )
+    parser.add_argument(
+        "--skip-quantize",
+        action="store_true",
+        help="Skip automatic quantization step",
     )
     args = parser.parse_args()
 
@@ -327,6 +382,12 @@ def main():
         if (cache_dir / "tokenizer.json").exists():
             tokenizer_json_zst = compress_file(cache_dir / "tokenizer.json", "parakeet-tdt-tokenizer.json.zst")
             compressed_files.append(tokenizer_json_zst)
+
+    # Quantize model to GGUF format
+    if not args.skip_quantize:
+        gguf_file = quantize_tdt_model(cache_dir, safetensors_path)
+        if gguf_file:
+            compressed_files.append(gguf_file)
 
     # Copy to assets
     print(f"\nCopying to assets directory...")
