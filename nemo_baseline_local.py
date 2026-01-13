@@ -54,8 +54,9 @@ def main():
     # Import NeMo ASR
     try:
         import nemo.collections.asr as nemo_asr
-    except ImportError:
-        print("Error: NeMo toolkit not installed.")
+    except ImportError as e:
+        print(f"Error: NeMo toolkit not installed or has missing dependencies:")
+        print(f"  {e}")
         print("\nInstall with:")
         print("  uv pip install nemo-toolkit")
         print("\nNote: This may have build issues. If it fails, use our Rust implementation:")
