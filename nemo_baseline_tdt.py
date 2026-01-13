@@ -82,6 +82,23 @@ def main():
         model = model.cuda()
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
 
+    # Print decoding configuration
+    print("\nDecoding Configuration:")
+    try:
+        if hasattr(model, 'cfg') and hasattr(model.cfg, 'decoding'):
+            dec_cfg = model.cfg.decoding
+            print(f"  Strategy: {dec_cfg.get('strategy', 'unknown')}")
+            if 'beam' in dec_cfg:
+                print(f"  Beam size: {dec_cfg.beam.get('beam_size', 'N/A')}")
+            if 'greedy' in dec_cfg:
+                print(f"  Max symbols: {dec_cfg.greedy.get('max_symbols', 'N/A')}")
+            print(f"  Preserve alignments: {dec_cfg.get('preserve_alignments', False)}")
+            print(f"  Compute timestamps: {dec_cfg.get('compute_timestamps', False)}")
+        else:
+            print("  (Using default decoding)")
+    except Exception as e:
+        print(f"  (Could not access config: {e})")
+
     print()
 
     # Transcribe
