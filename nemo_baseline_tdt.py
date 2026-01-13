@@ -106,7 +106,13 @@ def main():
     print()
 
     if isinstance(transcription, list) and len(transcription) > 0:
-        text = transcription[0]
+        # Extract text from Hypothesis object
+        hypothesis = transcription[0]
+        if hasattr(hypothesis, 'text'):
+            text = hypothesis.text
+        else:
+            text = str(hypothesis)
+
         print(f'"{text}"')
         print()
 
