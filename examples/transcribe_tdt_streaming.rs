@@ -81,10 +81,9 @@ fn main() -> Result<()> {
     let feat_extractor = ParakeetFeatureExtractor::new(128);  // TDT uses 128 mel bins
 
     // Configure streaming with overlapping chunks
-    // Larger chunks = better accuracy, higher latency
-    // Overlap provides context for better boundary handling
-    const CHUNK_SECONDS: f32 = 2.0;
-    const OVERLAP_SECONDS: f32 = 0.5;
+    // Sweet spot: 3.0s provides best encoder context (tested: 1s too short, 2s/2.5s moderate)
+    const CHUNK_SECONDS: f32 = 3.0;
+    const OVERLAP_SECONDS: f32 = 0.5; // 17% overlap for continuity
     const SAMPLES_PER_CHUNK: usize = (16000.0 * CHUNK_SECONDS) as usize;
     const OVERLAP_SAMPLES: usize = (16000.0 * OVERLAP_SECONDS) as usize;
 
