@@ -81,9 +81,10 @@ fn main() -> Result<()> {
     let feat_extractor = ParakeetFeatureExtractor::new(128);  // TDT uses 128 mel bins
 
     // Configure streaming chunks
-    // Testing non-overlapping chunks to avoid token duplication issues
+    // Note: Overlap disabled - proper overlap handling requires frame-level masking
+    // (see NeMo's delay parameter and middle token alignment)
     const CHUNK_SECONDS: f32 = 3.0;
-    const OVERLAP_SECONDS: f32 = 0.0; // No overlap - avoids duplication without LCS
+    const OVERLAP_SECONDS: f32 = 0.0; // Non-overlapping for now
     const SAMPLES_PER_CHUNK: usize = (16000.0 * CHUNK_SECONDS) as usize;
     const OVERLAP_SAMPLES: usize = (16000.0 * OVERLAP_SECONDS) as usize;
 

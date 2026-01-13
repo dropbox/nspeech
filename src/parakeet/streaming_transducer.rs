@@ -67,6 +67,10 @@ pub struct StreamingState {
 
     /// Number of chunks processed (for tracking first vs subsequent chunks)
     chunks_processed: usize,
+
+    /// Token buffer for LCS-based overlap deduplication
+    /// Stores recent tokens to detect duplicates in overlapping regions
+    token_buffer: Vec<u32>,
 }
 
 impl StreamingState {
@@ -81,6 +85,7 @@ impl StreamingState {
             blank_id,
             total_samples: 0,
             chunks_processed: 0,
+            token_buffer: Vec::new(),
         }
     }
 
@@ -93,6 +98,7 @@ impl StreamingState {
         self.tokens_decoded = 0;
         self.total_samples = 0;
         self.chunks_processed = 0;
+        self.token_buffer.clear();
     }
 
     /// Get accumulated tokens
@@ -206,13 +212,24 @@ impl StreamingTransducer {
             self.state.last_token = self.state.blank_id as u32;
         }
 
-        // Accumulate tokens
-        self.state.tokens.extend(&chunk_tokens);
+        // Deduplicate tokens using LCS (remove overlapping content from previous chunk)
+        let deduplicated = self.deduplicate_tokens(chunk_tokens.clone());
+
+        // Update token buffer for next chunk's LCS (keep last N tokens as context)
+        const BUFFER_SIZE: usize = 50; // Match MAX_SEARCH_LEN
+        self.state.token_buffer.extend(&chunk_tokens);
+        if self.state.token_buffer.len() > BUFFER_SIZE {
+            let drain_count = self.state.token_buffer.len() - BUFFER_SIZE;
+            self.state.token_buffer.drain(..drain_count);
+        }
+
+        // Accumulate only deduplicated tokens
+        self.state.tokens.extend(&deduplicated);
 
         // Increment chunk counter
         self.state.chunks_processed += 1;
 
-        Ok(chunk_tokens)
+        Ok(deduplicated)
     }
 
     /// Decode tokens from encoder output using greedy decoding
@@ -326,6 +343,78 @@ impl StreamingTransducer {
         }
 
         Ok(decoded)
+    }
+
+    /// Find longest common subsequence between buffer tail and new tokens
+    /// Returns the index in new_tokens where novel content begins
+    ///
+    /// Based on NeMo's LCS algorithm for overlap deduplication
+    fn find_lcs_slice_point(&self, buffer: &[u32], new_tokens: &[u32]) -> usize {
+        if buffer.is_empty() || new_tokens.is_empty() {
+            return 0; // No overlap possible
+        }
+
+        // Limit search to reasonable size (per NeMo)
+        const MAX_SEARCH_LEN: usize = 50;
+        let buffer_tail = if buffer.len() > MAX_SEARCH_LEN {
+            &buffer[buffer.len() - MAX_SEARCH_LEN..]
+        } else {
+            buffer
+        };
+
+        let search_len = new_tokens.len().min(MAX_SEARCH_LEN);
+        let new_head = &new_tokens[..search_len];
+
+        // Find longest matching subsequence
+        let mut best_match_len = 0;
+        let mut best_slice_point = 0;
+
+        // Try all possible starting points in buffer
+        for buf_start in 0..buffer_tail.len() {
+            let mut match_len = 0;
+            let mut new_idx = 0;
+
+            // Match as many tokens as possible
+            for buf_idx in buf_start..buffer_tail.len() {
+                if new_idx >= new_head.len() {
+                    break;
+                }
+                if buffer_tail[buf_idx] == new_head[new_idx] {
+                    match_len += 1;
+                    new_idx += 1;
+                } else if match_len > 0 {
+                    // Allow some mismatches (diagonal expansion per NeMo)
+                    new_idx += 1;
+                }
+            }
+
+            if match_len > best_match_len {
+                best_match_len = match_len;
+                best_slice_point = new_idx;
+            }
+        }
+
+        // Only use LCS if match is significant (per NeMo: MIN_MERGE_SUBSEQUENCE_LEN)
+        const MIN_LCS_LENGTH: usize = 3;
+        if best_match_len >= MIN_LCS_LENGTH {
+            best_slice_point
+        } else {
+            0 // No significant overlap, use all tokens
+        }
+    }
+
+    /// Deduplicate chunk tokens using LCS with token buffer
+    fn deduplicate_tokens(&mut self, chunk_tokens: Vec<u32>) -> Vec<u32> {
+        if self.state.token_buffer.is_empty() || chunk_tokens.is_empty() {
+            // First chunk or empty chunk - no deduplication needed
+            return chunk_tokens;
+        }
+
+        // Find where novel content begins
+        let slice_point = self.find_lcs_slice_point(&self.state.token_buffer, &chunk_tokens);
+
+        // Return only novel tokens
+        chunk_tokens[slice_point..].to_vec()
     }
 
     /// Decode accumulated tokens to text
