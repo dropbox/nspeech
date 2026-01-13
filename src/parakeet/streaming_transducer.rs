@@ -67,9 +67,6 @@ pub struct StreamingState {
 
     /// Number of chunks processed (for tracking first vs subsequent chunks)
     chunks_processed: usize,
-
-    /// Recent tokens for repetition detection (spans chunks)
-    recent_tokens: Vec<u32>,
 }
 
 impl StreamingState {
@@ -84,7 +81,6 @@ impl StreamingState {
             blank_id,
             total_samples: 0,
             chunks_processed: 0,
-            recent_tokens: Vec::with_capacity(32),
         }
     }
 
@@ -97,7 +93,6 @@ impl StreamingState {
         self.tokens_decoded = 0;
         self.total_samples = 0;
         self.chunks_processed = 0;
-        self.recent_tokens.clear();
     }
 
     /// Get accumulated tokens
@@ -205,11 +200,10 @@ impl StreamingTransducer {
             0.0
         };
 
-        if blank_ratio > 0.9 {  // 90%+ blanks = silence
-            // Reset LSTM for next chunk to prevent drift
+        if blank_ratio > 0.95 {  // 95%+ blanks = silence
+            // Reset LSTM for next chunk to prevent drift during long pauses
             self.state.predictor_states = None;
             self.state.last_token = self.state.blank_id as u32;
-            self.state.recent_tokens.clear();
         }
 
         // Accumulate tokens
@@ -252,12 +246,14 @@ impl StreamingTransducer {
                 let pred_input = Tensor::new(&[self.state.last_token], encoder_out.device())?
                     .unsqueeze(0)?;
 
+                // CRITICAL: Save state BEFORE prediction (for blank rollback)
+                let saved_states = self.state.predictor_states.clone();
+
                 // Run predictor
                 let (pred_out, new_states) = self.model.predictor.forward(
                     &pred_input,
                     self.state.predictor_states.as_ref()
                 )?;
-                self.state.predictor_states = Some(new_states);
 
                 // Joint network: [1, 1, enc_dim] + [1, 1, pred_dim] → [1, 1, 1, vocab_size]
                 let logits = self.model.joint.forward(&enc_t, &pred_out)?;
@@ -278,14 +274,20 @@ impl StreamingTransducer {
                 let token = token_tensor.to_scalar::<u32>()?;
 
                 if token == self.state.blank_id as u32 {
-                    // Blank: move to next timestep
-                    garbage_count = 0; // Reset garbage counter
+                    // Blank: ROLLBACK state (don't corrupt with blank prediction)
+                    // This is critical per NeMo - blanks should not update decoder state
+                    self.state.predictor_states = saved_states;
+                    garbage_count = 0;
                     break;
                 } else if token >= self.model.config.vocab_size as u32 {
-                    // Special token, treat as blank
+                    // Special token, treat as blank (rollback state)
+                    self.state.predictor_states = saved_states;
                     garbage_count = 0;
                     break;
                 } else {
+                    // Non-blank token: UPDATE state (this is the only place we accept new_states)
+                    self.state.predictor_states = Some(new_states);
+
                     // Check if token produces garbage (Cyrillic, <unk>, etc.)
                     let is_garbage = if let Ok(token_text) = self.model.decode_tokens(&[token]) {
                         token_text.contains("<unk>") ||
@@ -304,7 +306,6 @@ impl StreamingTransducer {
                         if garbage_count >= MAX_GARBAGE_TOKENS {
                             self.state.predictor_states = None;
                             self.state.last_token = self.state.blank_id as u32;
-                            self.state.recent_tokens.clear();
                             garbage_count = 0;
                             // Don't emit this token, move to next frame
                             break;
@@ -316,39 +317,7 @@ impl StreamingTransducer {
                         // Valid token: emit and continue at same timestep
                         garbage_count = 0;
 
-                        // Check for repetition (LSTM loop detection) - track across chunks
-                        self.state.recent_tokens.push(token);
-                        if self.state.recent_tokens.len() > 32 {
-                            self.state.recent_tokens.remove(0);
-                        }
-
-                        // Detect same token repeating (e.g., "MAMA MAMA MAMA")
-                        if self.state.recent_tokens.len() >= 4 {
-                            let last_4 = &self.state.recent_tokens[self.state.recent_tokens.len() - 4..];
-                            if last_4[0] == last_4[1] && last_4[1] == last_4[2] && last_4[2] == last_4[3] {
-                                // Same token 4 times in a row - reset LSTM
-                                self.state.predictor_states = None;
-                                self.state.last_token = self.state.blank_id as u32;
-                                self.state.recent_tokens.clear();
-                                break;
-                            }
-                        }
-
-                        // Detect longer sequence repetition (same 8-token pattern)
-                        if self.state.recent_tokens.len() >= 16 {
-                            let last_8 = &self.state.recent_tokens[self.state.recent_tokens.len() - 8..];
-                            let prev_8 = &self.state.recent_tokens[self.state.recent_tokens.len() - 16..self.state.recent_tokens.len() - 8];
-
-                            if last_8 == prev_8 {
-                                // Detected repetition - reset LSTM state
-                                self.state.predictor_states = None;
-                                self.state.last_token = self.state.blank_id as u32;
-                                self.state.recent_tokens.clear();
-                                // Don't emit this repeated token, move to next frame
-                                break;
-                            }
-                        }
-
+                        // Emit valid token and update last_token
                         decoded.push(token);
                         self.state.last_token = token;
                     }
