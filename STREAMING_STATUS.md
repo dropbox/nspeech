@@ -85,53 +85,60 @@ MLKDream_16k.wav (987s audio):
 
 ## What's Needed for Production
 
-### 1. State Management (Complete with Quality Protections)
+### 1. State Management (Principled Approach from NeMo)
 
-**Problem**: LSTM state degrades over time, causing:
+**Problem**: LSTM predictor state corruption causes:
+- Blank token regions in output
 - Garbage tokens (Cyrillic, `<unk>` markers)
-- Repetition loops ("MAMA MAMA MAMA", "it's a little bit...")
-- Quality degradation in longer audio
+- Quality degradation during streaming
 
-**Solutions Implemented** ✅:
+**Root Cause**: Updating LSTM state on blank predictions corrupts the decoder.
 
-a. **Garbage Token Detection** - Filter non-ASCII corruption
+**Solution** (Based on NVIDIA NeMo RNN-T) ✅:
+
+**a. Blank Token State Rollback** - The critical fix
+   ```rust
+   // Save state BEFORE predictor forward pass
+   let saved_states = self.state.predictor_states.clone();
+   let (pred_out, new_states) = self.model.predictor.forward(...)?;
+
+   if token == blank_id {
+       // ROLLBACK: Restore previous state
+       self.state.predictor_states = saved_states;
+   } else {
+       // Only update state on non-blank tokens
+       self.state.predictor_states = Some(new_states);
+   }
+   ```
+
+   **Why this works**: Blank predictions don't carry semantic information.
+   Advancing LSTM state on blanks corrupts the language model context.
+
+   **Reference**: NeMo `rnnt_greedy_decoding.py` lines 939-947:
+   ```python
+   # Copy previous hidden state for samples predicting blanks
+   hidden_prime = self.decoder.batch_copy_states(
+       hidden_prime, hidden, blank_indices
+   )
+   ```
+
+**b. Garbage Token Detection** - Filter non-ASCII corruption
    - Detects Cyrillic characters (U+0400-U+04FF)
    - Detects `<unk>` markers
    - Resets LSTM after 5 consecutive garbage tokens
 
-b. **Silence Detection** - Reset after silent chunks
-   - Detects >90% blank ratio
-   - Prevents state drift during pauses
+**c. Silence Detection** - Reset after silent chunks
+   - Detects >95% blank ratio
+   - Prevents state drift during long pauses
 
-c. **Repetition Detection** - Catch LSTM loops
-   - Same token 4x in a row (e.g., "MAMA MAMA MAMA")
-   - 8-token sequence repetition (longer loops)
-   - Tracks across chunks for comprehensive detection
-
-d. **Larger Chunks (3.0s)** - More encoder context
+**d. Larger Chunks (3.0s)** - More encoder context
    - Tested: 1.0s (insufficient), 2.0s/2.5s (moderate), 3.0s (best)
-   - Encoder benefits outweigh LSTM drift concerns
+   - Encoder benefits outweigh concerns
 
-**Current Implementation**:
-```rust
-// Maintain LSTM state across chunks
-let encoder_out = self.model.encoder.forward(features, false)?;
-let chunk_tokens = self.decode_chunk(&encoder_out, enc_frames)?;
-
-// Adaptive reset on silence (>90% blanks)
-if blank_ratio > 0.9 {
-    self.state.predictor_states = None;
-    self.state.last_token = blank_id;
-    self.state.recent_tokens.clear();
-}
-
-// Garbage and repetition detection in decode_chunk()
-// - Filter non-ASCII tokens
-// - Detect same token 4x
-// - Detect 8-token sequence repetition
-```
-
-**Results**: Clean output with no Cyrillic, minimal repetition, recognizable content.
+**Results**:
+- dots.wav: Clean, coherent sentences throughout
+- No blank regions
+- "But it was very, very clear looking backwards ten years ago..."
 
 ### 2. True Frame-Level Streaming (Lower Priority)
 
@@ -161,23 +168,23 @@ For <100ms latency streaming with 40-80ms chunks:
 ### 3. Current Status and Next Steps
 
 **✅ Production-Ready Features**:
-1. Garbage token detection (no Cyrillic, no `<unk>`)
-2. Repetition loop detection (catches LSTM hallucinations)
+1. **Proper blank token handling** (NeMo-based state rollback)
+2. Garbage token detection (no Cyrillic, no `<unk>`)
 3. Silence-aware state reset
 4. Optimal chunk size (3.0s) for quality/latency balance
-5. Cross-chunk state tracking
 
 **Quality Achieved**:
-- dots.wav (35s): Very good, recognizable phrases
-- MLKDream (16min): Good, recognizable content from MLK speech
+- dots.wav (35s): Excellent - clean coherent sentences
+- Example: "But it was very, very clear looking backwards ten years ago.
+           You can't connect the dots looking forward..."
+- No blank regions (fixed with proper blank handling)
 - No Cyrillic corruption
-- Minimal repetition loops
 
 **Optional Future Improvements**:
-1. **Confidence thresholding** - Filter low-confidence tokens
-2. **Phrase-level repetition detection** - Catch remaining "you're not going to..." patterns
-3. **Dynamic chunk sizing** - Adjust based on content (silence, speech density)
-4. **Beginning quality** - Address cold start with blank LSTM state
+1. **LCS-based chunk deduplication** - Remove overlap using Longest Common Subsequence (NeMo approach)
+2. **Frame-level masking** - Guard outputs beyond audio boundary
+3. **Confidence thresholding** - Filter low-confidence tokens
+4. **Dynamic chunk sizing** - Adjust based on content
 
 **For True Streaming (Harder Path)**:
 1. Implement attention caching in `MultiHeadSelfAttention`
