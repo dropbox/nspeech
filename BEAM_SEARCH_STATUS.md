@@ -66,8 +66,39 @@ cargo run --example transcribe_tdt --release -- dots.wav
 ~/bin/jrpython nemo_baseline_tdt.py dots.wav
 ```
 
-## Conclusion
+## Resolution (FIXED!)
 
-Beam search implementation is functional but incomplete. The real issue is that our TDT model produces incorrect outputs on jfk.wav regardless of decoding strategy, while NeMo works perfectly.
+**Root cause identified:** Feature extraction mismatch!
 
-This suggests the problem is in **feature extraction, encoder, or model loading**, not in decoding.
+The issue was NOT in beam search or decoding. The problem was in `src/parakeet/features.rs`:
+
+1. **Wrong normalization:** We were doing per-utterance mean normalization, but NeMo uses **per-feature normalization** (each mel bin normalized to mean=0, std=1)
+2. **Wrong window:** We were using periodic Hann window, but NeMo uses **symmetric Hann window**
+
+### Fix Applied
+
+- Changed to per-feature normalization (normalize each of 128 mel bins independently)
+- Changed to symmetric Hann window: `w[n] = 0.5 - 0.5 * cos(2π*n/(N-1))`
+
+### Results After Fix
+
+| File | Before | After | Status |
+|------|--------|-------|--------|
+| dots.wav | 186 tokens | 187 tokens | ✅ Still works |
+| jfk.wav | 0 tokens | 38 tokens | ✅ **FIXED! Perfect transcription!** |
+
+**jfk.wav transcription:**
+```
+And so, my fellow Americans, ask not what your country can do for you,
+ask what you can do for your country.
+```
+
+**Feature statistics now match NeMo:**
+- Rust: mean=-0.000005, std=1.000, range=[-5.7, 10.1] ✅
+- NeMo: mean=0.000000, std=0.999, range=[-5.6, 10.1] ✅
+
+**Encoder statistics now match NeMo:**
+- Rust: mean=-0.000032, std=0.0201, range=[-0.149, 0.152] ✅
+- NeMo: mean=-0.000037, std=0.0206, range=[-0.152, 0.153] ✅
+
+See `TDT_FIX_SUMMARY.md` for complete details.

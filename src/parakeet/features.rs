@@ -133,10 +133,47 @@ impl ParakeetFeatureExtractor {
             }
         }
 
-        // Apply per-utterance mean normalization (required by Parakeet)
-        let mean = feats.iter().sum::<f32>() / feats.len() as f32;
-        for val in feats.iter_mut() {
-            *val -= mean;
+        // Apply per-feature normalization (NeMo's normalize='per_feature')
+        // Normalize each mel bin (feature dimension) independently to mean=0, std=1
+        let num_features = self.feature_size;
+
+        if frames > 0 {
+            // Calculate mean and std for each feature dimension
+            let mut means = vec![0.0f32; num_features];
+            let mut stds = vec![0.0f32; num_features];
+
+            // Calculate means
+            for t in 0..frames {
+                for f in 0..num_features {
+                    means[f] += feats[t * num_features + f];
+                }
+            }
+            for mean in means.iter_mut() {
+                *mean /= frames as f32;
+            }
+
+            // Calculate standard deviations
+            for t in 0..frames {
+                for f in 0..num_features {
+                    let diff = feats[t * num_features + f] - means[f];
+                    stds[f] += diff * diff;
+                }
+            }
+            for std in stds.iter_mut() {
+                *std = (*std / frames as f32).sqrt();
+                // Avoid division by zero
+                if *std < 1e-10 {
+                    *std = 1.0;
+                }
+            }
+
+            // Normalize: (x - mean) / std for each feature
+            for t in 0..frames {
+                for f in 0..num_features {
+                    let idx = t * num_features + f;
+                    feats[idx] = (feats[idx] - means[f]) / stds[f];
+                }
+            }
         }
 
         (frames, feats)
@@ -157,8 +194,8 @@ fn preemphasis(x: &[f32], coef: f32) -> Vec<f32> {
     y
 }
 
-/// Hann window, periodic=true: w[n]=0.5-0.5*cos(2*pi*n/N)
-/// This matches PyTorch's torch.hann_window() default (periodic=True)
+/// Hann window, symmetric: w[n]=0.5-0.5*cos(2*pi*n/(N-1))
+/// This matches NeMo's default (symmetric Hann window)
 fn hann_window(n: usize) -> Vec<f32> {
     if n == 0 {
         return vec![];
@@ -166,7 +203,7 @@ fn hann_window(n: usize) -> Vec<f32> {
     if n == 1 {
         return vec![1.0];
     }
-    let denom = n as f32;
+    let denom = (n - 1) as f32;
     (0..n)
         .map(|i| 0.5 - 0.5 * (2.0 * PI * (i as f32) / denom).cos())
         .collect()
