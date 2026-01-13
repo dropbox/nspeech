@@ -19,6 +19,13 @@ use hf_hub::api::sync::Api;
 use std::path::Path;
 use std::collections::HashMap;
 
+/// Token with timestamp information from TDT alignment
+#[derive(Debug, Clone)]
+pub struct TokenWithTimestamp {
+    pub token: u32,
+    pub frame: usize,  // Encoder frame where this token was emitted
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TransducerConfig {
     pub vocab_size: usize,  // Predictor vocab size
@@ -385,6 +392,170 @@ impl TransducerModel {
             .map_err(|e| anyhow!("Failed to decode tokens: {}", e))?;
 
         Ok(new_text)
+    }
+
+    /// Greedy decoding with timestamps: Returns tokens with their frame-level alignment
+    ///
+    /// For each encoder timestep, predict the most likely token until blank is emitted.
+    /// Each token is tagged with the encoder frame where it was produced.
+    pub fn greedy_decode_with_timestamps(&self, encoder_out: &Tensor) -> Result<Vec<TokenWithTimestamp>> {
+        let (batch_size, time_steps, _enc_dim) = encoder_out.dims3()?;
+
+        if batch_size != 1 {
+            return Err(anyhow!("Greedy decode currently only supports batch_size=1"));
+        }
+
+        let mut decoded = Vec::new();
+        let mut pred_states = None;
+
+        // Start with blank token
+        let mut last_token = self.config.blank_id as u32;
+
+        // Decode all timesteps
+        println!("  Decoding {} timesteps...", time_steps);
+
+        for t in 0..time_steps {
+            if t % 50 == 0 {
+                println!("  Progress: {}/{} timesteps, {} tokens decoded", t, time_steps, decoded.len());
+            }
+
+            // Inner loop: keep predicting until blank
+            let mut inner_steps = 0;
+            const MAX_INNER_STEPS: usize = 50;
+
+            loop {
+                inner_steps += 1;
+                if inner_steps > MAX_INNER_STEPS {
+                    println!("    WARNING: Hit max inner steps at timestep {}, forcing blank", t);
+                    break;
+                }
+
+                // Get encoder output at current timestep: [1, 1, enc_dim]
+                let enc_t = encoder_out.narrow(1, t, 1)?;
+
+                // Predictor input: previous token [1, 1]
+                let pred_input = Tensor::new(&[last_token], encoder_out.device())?
+                    .unsqueeze(0)?;
+
+                // Run predictor
+                let (pred_out, new_states) = self.predictor.forward(&pred_input, pred_states.as_ref())?;
+                pred_states = Some(new_states);
+
+                // Joint network
+                let logits = self.joint.forward(&enc_t, &pred_out)?;
+                let logits = logits.squeeze(0)?.squeeze(0)?.squeeze(0)?;
+                let logits_f32 = logits.to_dtype(DType::F32)?;
+
+                // Mask out padding tokens 8193-8197
+                let mut masked_logits = logits_f32.clone();
+                for i in 8193..8198 {
+                    let mask_tensor = Tensor::new(&[-1e9_f32], masked_logits.device())?;
+                    masked_logits = masked_logits.slice_assign(&[i..i+1], &mask_tensor)?;
+                }
+                let log_probs_masked = candle_nn::ops::log_softmax(&masked_logits, D::Minus1)?;
+                let token_tensor = log_probs_masked.argmax(D::Minus1)?;
+                let token = token_tensor.to_scalar::<u32>()?;
+
+                if token == self.config.blank_id as u32 {
+                    // Blank: move to next timestep
+                    break;
+                } else if token >= self.config.vocab_size as u32 {
+                    // Special token, treat as blank
+                    break;
+                } else {
+                    // Valid token: emit with timestamp
+                    decoded.push(TokenWithTimestamp {
+                        token,
+                        frame: t,  // Store the encoder frame
+                    });
+                    last_token = token;
+                }
+            }
+        }
+
+        Ok(decoded)
+    }
+
+    /// Add punctuation based on frame gaps between tokens
+    ///
+    /// Uses the TDT model's natural frame-level alignment to detect pauses:
+    /// - Comma for short pauses (5-9 frames = 400-720ms)
+    /// - Period for longer pauses (10+ frames = 800ms+)
+    ///
+    /// # Frame Timing
+    /// - Mel frame: 10ms (160 samples / 16kHz)
+    /// - Encoder frame: 80ms (8x downsampling)
+    /// - So 5 frames = 400ms, 10 frames = 800ms
+    pub fn add_punctuation_from_timestamps(&self, tokens_with_ts: &[TokenWithTimestamp]) -> Result<String> {
+        if tokens_with_ts.is_empty() {
+            return Ok(String::new());
+        }
+
+        let tokenizer = self.tokenizer.as_ref()
+            .ok_or_else(|| anyhow!("Tokenizer not loaded. Call load_tokenizer() first."))?;
+
+        // Configuration for punctuation insertion
+        const COMMA_PAUSE_FRAMES: usize = 5;   // 400ms pause
+        const PERIOD_PAUSE_FRAMES: usize = 10;  // 800ms pause
+
+        // Group tokens into phrases based on pause locations
+        // This allows proper subword decoding while inserting punctuation
+        let mut phrases: Vec<Vec<u32>> = Vec::new();
+        let mut current_phrase: Vec<u32> = Vec::new();
+        let mut punctuation_marks: Vec<&str> = Vec::new();
+        let mut prev_frame = tokens_with_ts[0].frame;
+
+        for (i, token_with_ts) in tokens_with_ts.iter().enumerate() {
+            let frame_gap = if i > 0 {
+                token_with_ts.frame.saturating_sub(prev_frame)
+            } else {
+                0
+            };
+
+            // Check if we should end current phrase and add punctuation
+            if frame_gap >= PERIOD_PAUSE_FRAMES {
+                // Long pause - end phrase with period
+                if !current_phrase.is_empty() {
+                    phrases.push(current_phrase.clone());
+                    punctuation_marks.push(". ");
+                    current_phrase.clear();
+                }
+            } else if frame_gap >= COMMA_PAUSE_FRAMES {
+                // Short pause - end phrase with comma
+                if !current_phrase.is_empty() {
+                    phrases.push(current_phrase.clone());
+                    punctuation_marks.push(", ");
+                    current_phrase.clear();
+                }
+            }
+
+            current_phrase.push(token_with_ts.token);
+            prev_frame = token_with_ts.frame;
+        }
+
+        // Add final phrase
+        if !current_phrase.is_empty() {
+            phrases.push(current_phrase);
+            punctuation_marks.push("");  // No punctuation after last phrase (we'll add period at end)
+        }
+
+        // Decode each phrase and join with punctuation
+        let mut result = String::new();
+        for (phrase_tokens, punct) in phrases.iter().zip(punctuation_marks.iter()) {
+            let phrase_text = tokenizer.decode(phrase_tokens, true)
+                .map_err(|e| anyhow!("Failed to decode phrase: {}", e))?;
+
+            result.push_str(phrase_text.trim());
+            result.push_str(punct);
+        }
+
+        // Add final period if not already present
+        let trimmed = result.trim();
+        if !trimmed.is_empty() && !trimmed.ends_with('.') && !trimmed.ends_with('?') && !trimmed.ends_with('!') {
+            result.push('.');
+        }
+
+        Ok(result)
     }
 
     /// Greedy decoding: Simple left-to-right decoding without beam search

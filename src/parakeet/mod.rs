@@ -20,6 +20,7 @@ pub use fast_conformer::{
 // Re-export Transducer (TDT) types and functions
 pub use transducer::{
     TransducerConfig, TransducerModel, PredictionNetwork, JointNetwork,
+    TokenWithTimestamp,
     load_parakeet_tdt_from_hf, load_parakeet_tdt_from_local,
 };
 

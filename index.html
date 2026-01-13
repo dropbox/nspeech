@@ -1,0 +1,1195 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>🎙️ Transcribe Demos — Push-to-Talk + Streaming</title>
+  <style>
+    :root{
+      --bg0:#0b1020;
+      --bg1:#0f1630;
+      --stroke: rgba(255,255,255,.10);
+      --stroke2: rgba(255,255,255,.14);
+      --text: rgba(255,255,255,.92);
+      --muted: rgba(255,255,255,.70);
+      --muted2: rgba(255,255,255,.55);
+      --good: #2ee59d;
+      --warn: #ffcc66;
+      --bad:  #ff5c7a;
+      --shadow: 0 18px 60px rgba(0,0,0,.45);
+      --radius: 18px;
+      --radius2: 14px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+    }
+
+    *{ box-sizing: border-box; }
+    html, body { height: 100%; }
+    body{
+      margin:0;
+      font-family: var(--sans);
+      color: var(--text);
+      background:
+        radial-gradient(1200px 700px at 15% -10%, rgba(124,92,255,.35), transparent 60%),
+        radial-gradient(1000px 600px at 95% 10%, rgba(34,211,238,.22), transparent 55%),
+        radial-gradient(900px 600px at 50% 100%, rgba(46,229,157,.18), transparent 60%),
+        linear-gradient(180deg, var(--bg0), var(--bg1));
+    }
+
+    .wrap{
+      max-width: 1240px;
+      margin: 28px auto 48px;
+      padding: 0 16px;
+    }
+
+    header{
+      display:flex;
+      align-items:flex-start;
+      justify-content:space-between;
+      gap: 18px;
+      margin-bottom: 14px;
+    }
+
+    .title{
+      display:flex;
+      flex-direction:column;
+      gap:8px;
+    }
+    h1{
+      margin:0;
+      font-size: 24px;
+      letter-spacing: .2px;
+      line-height: 1.2;
+    }
+    .subtitle{
+      margin:0;
+      color: var(--muted);
+      font-size: 13.5px;
+      line-height: 1.35;
+    }
+
+    .pillrow{
+      display:flex;
+      gap:10px;
+      flex-wrap:wrap;
+      justify-content:flex-end;
+      align-items:center;
+      margin-top: 2px;
+    }
+    .pill{
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      padding: 8px 10px;
+      border: 1px solid var(--stroke);
+      background: rgba(0,0,0,.18);
+      border-radius: 999px;
+      font-size: 12.5px;
+      color: var(--muted);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+    }
+    .pill b{ color: var(--text); font-weight: 650; }
+    .kbd{
+      font-family: var(--mono);
+      font-size: 11.5px;
+      padding: 2px 6px;
+      border: 1px solid var(--stroke2);
+      border-radius: 8px;
+      background: rgba(255,255,255,.06);
+      color: var(--text);
+    }
+
+    /* Single-page layout: two cards side-by-side */
+    .twoCol{
+      display:grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      align-items: start;
+    }
+    @media (max-width: 980px){
+      .twoCol{ grid-template-columns: 1fr; }
+      header{ flex-direction:column; align-items:flex-start; }
+      .pillrow{ justify-content:flex-start; }
+    }
+
+    .card{
+      background: linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,.05));
+      border: 1px solid var(--stroke);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      position: relative;
+      min-height: 610px; /* keep both the same visual length */
+    }
+
+    .card::before{
+      content:"";
+      position:absolute;
+      inset:0;
+      pointer-events:none;
+      background: radial-gradient(700px 280px at 20% 0%, rgba(124,92,255,.18), transparent 60%),
+                  radial-gradient(700px 280px at 90% 10%, rgba(34,211,238,.14), transparent 60%);
+      opacity:.9;
+    }
+
+    .card > *{ position: relative; }
+
+    .cardHead{
+      padding: 14px 14px 10px;
+      border-bottom: 1px solid var(--stroke);
+      display:flex;
+      align-items:flex-start;
+      justify-content:space-between;
+      gap: 10px;
+    }
+    .cardHead h2{
+      margin:0;
+      font-size: 15px;
+      letter-spacing: .2px;
+    }
+    .cardHead .hint{
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 12.25px;
+      line-height: 1.35;
+    }
+
+    .content{
+      padding: 12px 14px 14px;
+      display:flex;
+      flex-direction:column;
+      gap: 12px;
+    }
+
+    .row{
+      display:flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items:center;
+    }
+
+    .btn{
+      cursor:pointer;
+      border: 1px solid var(--stroke2);
+      background: rgba(255,255,255,.10);
+      color: var(--text);
+      border-radius: 12px;
+      padding: 10px 12px;
+      font-weight: 650;
+      letter-spacing: .2px;
+      transition: transform .06s ease, background .12s ease, border-color .12s ease, opacity .12s ease;
+      display:inline-flex;
+      align-items:center;
+      gap: 8px;
+      user-select:none;
+    }
+    .btn:hover{ background: rgba(255,255,255,.14); border-color: rgba(255,255,255,.20); }
+    .btn:active{ transform: translateY(1px); }
+    .btn[disabled]{ opacity:.45; cursor:not-allowed; transform:none; }
+    .btn.primary{
+      background: linear-gradient(180deg, rgba(124,92,255,.95), rgba(124,92,255,.65));
+      border-color: rgba(124,92,255,.55);
+      box-shadow: 0 10px 30px rgba(124,92,255,.22);
+    }
+    .btn.primary:hover{ background: linear-gradient(180deg, rgba(124,92,255,1), rgba(124,92,255,.70)); }
+    .btn.danger{
+      background: linear-gradient(180deg, rgba(255,92,122,.85), rgba(255,92,122,.55));
+      border-color: rgba(255,92,122,.55);
+      box-shadow: 0 10px 30px rgba(255,92,122,.18);
+    }
+    .btn.ghost{
+      background: rgba(255,255,255,.06);
+    }
+
+    .field{
+      display:flex;
+      flex-direction:column;
+      gap:6px;
+      min-width: 150px;
+      flex: 1;
+    }
+    .field label{
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: .2px;
+    }
+    .field input{
+      padding: 10px 11px;
+      border-radius: 12px;
+      border: 1px solid var(--stroke);
+      background: rgba(0,0,0,.18);
+      color: var(--text);
+      outline:none;
+      transition: border-color .12s ease, background .12s ease;
+      font-family: var(--sans);
+      width: 100%;
+    }
+    .field input:focus{
+      border-color: rgba(34,211,238,.55);
+      background: rgba(0,0,0,.24);
+    }
+    input[type="number"]{ width: 140px; }
+
+    .status{
+      display:flex;
+      align-items:center;
+      gap: 10px;
+      padding: 10px 12px;
+      border: 1px solid var(--stroke);
+      border-radius: 14px;
+      background: rgba(0,0,0,.16);
+      flex: 1;
+      min-width: 260px;
+    }
+    .dot{
+      width: 10px; height: 10px; border-radius: 999px;
+      background: rgba(255,255,255,.35);
+      box-shadow: 0 0 0 4px rgba(255,255,255,.08);
+    }
+    .dot.good{ background: var(--good); box-shadow: 0 0 0 4px rgba(46,229,157,.16); }
+    .dot.warn{ background: var(--warn); box-shadow: 0 0 0 4px rgba(255,204,102,.18); }
+    .dot.bad { background: var(--bad);  box-shadow: 0 0 0 4px rgba(255,92,122,.18); }
+    .status .txt{ font-weight: 650; }
+    .status .sub{ color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+    .statusCol{ display:flex; flex-direction:column; gap: 2px; }
+
+    .meter{
+      display:flex;
+      align-items:center;
+      gap:10px;
+    }
+    .bar{
+      flex:1;
+      height: 10px;
+      border-radius: 999px;
+      border: 1px solid var(--stroke);
+      background: rgba(0,0,0,.18);
+      overflow:hidden;
+      min-width: 160px;
+    }
+    .fill{
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, rgba(34,211,238,.75), rgba(124,92,255,.85), rgba(46,229,157,.70));
+      border-radius: 999px;
+      transition: width .08s linear;
+    }
+    .meter .db{
+      font-family: var(--mono);
+      color: var(--muted);
+      font-size: 12px;
+      min-width: 64px;
+      text-align:right;
+    }
+
+    .panel{
+      border: 1px solid var(--stroke);
+      background: rgba(0,0,0,.14);
+      border-radius: var(--radius2);
+      padding: 12px;
+      display:flex;
+      flex-direction:column;
+      gap: 10px;
+    }
+    .panel.tight{ padding: 10px; }
+    .panelTitle{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap: 10px;
+    }
+    .panelTitle span{
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .panelTitle b{ font-size: 13px; letter-spacing:.2px; }
+
+    .pre{
+      font-family: var(--mono);
+      font-size: 12.25px;
+      line-height: 1.45;
+      padding: 12px;
+      border-radius: var(--radius2);
+      border: 1px solid var(--stroke);
+      background: rgba(0,0,0,.20);
+      white-space: pre-wrap;
+      min-height: 120px;
+      max-height: 220px;
+      overflow:auto;
+    }
+    .pre.tight{
+      min-height: 90px;     /* squeeze debug */
+      max-height: 140px;    /* squeeze debug */
+      padding: 10px;
+      font-size: 12px;
+    }
+
+    .tiny{
+      color: var(--muted2);
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .badge{
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      padding: 6px 10px;
+      border: 1px solid var(--stroke);
+      border-radius: 999px;
+      background: rgba(0,0,0,.12);
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .badge .dotSm{
+      width: 7px; height: 7px; border-radius: 999px; background: rgba(255,255,255,.35);
+    }
+
+    .toast{
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      background: rgba(0,0,0,.55);
+      border: 1px solid var(--stroke);
+      color: var(--text);
+      padding: 10px 12px;
+      border-radius: 14px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      max-width: 520px;
+      display:none;
+      z-index: 50;
+    }
+    .toast.show{ display:block; }
+    .toast .small{ color: var(--muted); font-size: 12px; margin-top: 4px; }
+
+    a{ color: rgba(34,211,238,.95); text-decoration: none; }
+    a:hover{ text-decoration: underline; }
+  </style>
+</head>
+
+<body>
+<div class="wrap">
+  <header>
+    <div class="title">
+      <h1>🎙️ Transcribe Demos</h1>
+      <p class="subtitle">
+        Two modes, one endpoint (<span class="kbd">POST /transcribe</span>): <b>Push-to-talk</b> for deliberate clips, and <b>Streaming</b> for live partials.
+      </p>
+    </div>
+    <div class="pillrow">
+      <div class="pill"><span class="kbd">Space</span> hold-to-talk (push)</div>
+      <div class="pill"><span class="kbd">Esc</span> stop (stream)</div>
+      <div class="pill"><b>Endpoint:</b> <span id="globalEndpointLabel" class="kbd">/transcribe</span></div>
+    </div>
+  </header>
+
+  <!-- Hidden but functional endpoint input used by JS -->
+  <input id="apiUrl" type="hidden" value="/transcribe" />
+
+  <!-- Two cards side-by-side. Streaming on the LEFT -->
+  <div class="twoCol">
+
+    <!-- STREAMING (LEFT) -->
+    <section class="card" id="streamCard">
+      <div class="cardHead">
+        <div>
+          <h2>🟦 Streaming transcription</h2>
+          <div class="hint">Continuously uploads a rolling buffer and overwrites the “current line” with partial results; commits lines as windows advance.</div>
+        </div>
+        <span class="badge"><span class="dotSm" id="streamStateDot"></span><span id="streamStateBadge">Idle</span></span>
+      </div>
+
+      <div class="content">
+        <div class="row">
+          <button class="btn primary" id="streamStartBtn">▶️ Start streaming</button>
+          <button class="btn danger" id="streamStopBtn" disabled>⏹️ Stop</button>
+          <button class="btn ghost" id="streamClearBtn" title="Clear transcript & debug.">🧹 Clear</button>
+        </div>
+
+        <div class="panel tight">
+          <div class="panelTitle">
+            <b>Stream config</b>
+            <span>Applies on Start</span>
+          </div>
+          <div class="row">
+            <div class="field">
+              <label for="blockDuration">Block duration (s)</label>
+              <input type="number" id="blockDuration" step="0.05" min="0.05" value="0.75" />
+            </div>
+            <div class="field">
+              <label for="maxBufferSecs">Max buffer (s)</label>
+              <input type="number" id="maxBufferSecs" step="0.5" min="0.5" value="10.0" />
+            </div>
+            <div class="field">
+              <label for="overlapSecs">Overlap (s)</label>
+              <input type="number" id="overlapSecs" step="0.05" min="0" value="0.25" />
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panelTitle">
+            <b>Live level</b>
+            <span id="streamLevelHint">Not streaming</span>
+          </div>
+          <div class="meter">
+            <div class="bar"><div class="fill" id="streamLevelFill"></div></div>
+            <div class="db" id="streamDb">-∞ dB</div>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="status">
+            <div class="dot" id="streamStatusDot"></div>
+            <div class="statusCol">
+              <div class="txt" id="streamStatus">Idle</div>
+              <div class="sub" id="streamSub">Press Start to begin streaming.</div>
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <div class="panelTitle" style="margin-bottom:8px;"><b>Transcript</b><span id="streamRespMeta">—</span></div>
+          <pre class="pre" id="streamOut"></pre>
+        </div>
+
+        <div>
+          <div class="panelTitle" style="margin-bottom:8px;"><b>Debug</b><span>last payload stats</span></div>
+          <pre class="pre tight" id="streamDbg"></pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- PUSH-TO-TALK (RIGHT) -->
+    <section class="card" id="pushCard">
+      <div class="cardHead">
+        <div>
+          <h2>🟣 Push-to-talk transcription</h2>
+          <div class="hint">Hold <span class="kbd">Space</span> or click <b>Start</b>. Release / click <b>Stop</b> to upload and get the final transcript.</div>
+        </div>
+        <span class="badge"><span class="dotSm" id="pushStateDot"></span><span id="pushStateBadge">Idle</span></span>
+      </div>
+
+      <div class="content">
+        <div class="row">
+          <button class="btn primary" id="pushStartBtn">⏺️ Start</button>
+          <button class="btn danger" id="pushStopBtn" disabled>⏹️ Stop & transcribe</button>
+          <button class="btn ghost" id="pushClearBtn" title="Clear response & latency.">🧹 Clear</button>
+        </div>
+
+        <div class="panel">
+          <div class="panelTitle">
+            <b>Live level</b>
+            <span id="pushLevelHint">Not recording</span>
+          </div>
+          <div class="meter">
+            <div class="bar"><div class="fill" id="pushLevelFill"></div></div>
+            <div class="db" id="pushDb">-∞ dB</div>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="status">
+            <div class="dot" id="pushStatusDot"></div>
+            <div class="statusCol">
+              <div class="txt" id="pushStatus">Idle</div>
+              <div class="sub" id="pushSub">Ready when you are.</div>
+            </div>
+          </div>
+
+          <div class="panel" style="min-width:240px;">
+            <div class="panelTitle"><b>Latency</b><span>Stop → response</span></div>
+            <div style="font-family:var(--mono); font-size: 18px;" id="pushLatency">-</div>
+          </div>
+        </div>
+
+        <div>
+          <div class="panelTitle" style="margin-bottom:8px;"><b>Response</b><span id="pushRespMeta">—</span></div>
+          <pre class="pre" id="pushOut"></pre>
+        </div>
+
+        <div class="tiny">
+          Tip: <span class="kbd">Space</span> hold-to-talk works when you're not focused in an input.
+        </div>
+      </div>
+    </section>
+
+  </div>
+
+  <div class="tiny" style="margin-top:14px;">
+    Served from static HTML (e.g. <span class="kbd">python3 -m http.server 5173 --bind 127.0.0.1</span>). Mic permissions require HTTPS or localhost.
+  </div>
+</div>
+
+<div class="toast" id="toast">
+  <div id="toastMsg"></div>
+  <div class="small" id="toastSub"></div>
+</div>
+
+<script>
+(() => {
+  const TARGET_SR = 16000;
+
+  // ---------------------------
+  // Shared (endpoint)
+  // ---------------------------
+  const apiUrlEl = document.getElementById("apiUrl");
+  const globalEndpointLabel = document.getElementById("globalEndpointLabel");
+
+  const toastEl = document.getElementById("toast");
+  const toastMsg = document.getElementById("toastMsg");
+  const toastSub = document.getElementById("toastSub");
+  let toastTimer = null;
+
+  function showToast(msg, sub="") {
+    toastMsg.textContent = msg;
+    toastSub.textContent = sub;
+    toastEl.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toastEl.classList.remove("show"), 2800);
+  }
+
+  function clamp01(x){ return Math.max(0, Math.min(1, x)); }
+
+  globalEndpointLabel.textContent = apiUrlEl.value || "/transcribe";
+
+  // ---------------------------
+  // Audio helpers (shared)
+  // ---------------------------
+  function flattenFloatChunks(chunks) {
+    let total = 0;
+    for (const c of chunks) total += c.length;
+    const out = new Float32Array(total);
+    let off = 0;
+    for (const c of chunks) { out.set(c, off); off += c.length; }
+    return out;
+  }
+
+  function floatToInt16(float32) {
+    const out = new Int16Array(float32.length);
+    for (let i = 0; i < float32.length; i++) {
+      let s = Math.max(-1, Math.min(1, float32[i]));
+      out[i] = s < 0 ? (s * 0x8000) : (s * 0x7FFF);
+    }
+    return out;
+  }
+
+  function writeString(view, offset, str) {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  }
+
+  function encodeWavFromInt16(int16, sr) {
+    const numChannels = 1;
+    const bytesPerSample = 2;
+    const blockAlign = numChannels * bytesPerSample;
+    const byteRate = sr * blockAlign;
+    const dataSize = int16.length * bytesPerSample;
+
+    const buffer = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(buffer);
+
+    writeString(view, 0, "RIFF");
+    view.setUint32(4, 36 + dataSize, true);
+    writeString(view, 8, "WAVE");
+
+    writeString(view, 12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, numChannels, true);
+    view.setUint32(24, sr, true);
+    view.setUint32(28, byteRate, true);
+    view.setUint16(32, blockAlign, true);
+    view.setUint16(34, 16, true);
+
+    writeString(view, 36, "data");
+    view.setUint32(40, dataSize, true);
+
+    let off = 44;
+    for (let i = 0; i < int16.length; i++, off += 2) {
+      view.setInt16(off, int16[i], true);
+    }
+    return new Blob([view], { type: "audio/wav" });
+  }
+
+  async function resampleTo16kHz(monoFloat32, srcSr) {
+    if (srcSr === TARGET_SR) return monoFloat32;
+
+    const srcLen = monoFloat32.length;
+    const audioBuffer = new AudioBuffer({ length: srcLen, numberOfChannels: 1, sampleRate: srcSr });
+    audioBuffer.copyToChannel(monoFloat32, 0);
+
+    const targetLen = Math.round(srcLen * (TARGET_SR / srcSr));
+    const offline = new OfflineAudioContext(1, targetLen, TARGET_SR);
+
+    const src = offline.createBufferSource();
+    src.buffer = audioBuffer;
+    src.connect(offline.destination);
+    src.start(0);
+
+    const rendered = await offline.startRendering();
+    return rendered.getChannelData(0);
+  }
+
+  // Always WAV (PCM16 mono @16k). Field name is always "file".
+  async function postTranscribe(int16, modeLabel="audio") {
+    const form = new FormData();
+    const wavBlob = encodeWavFromInt16(int16, TARGET_SR);
+    const wavFile = new File([wavBlob], `${modeLabel}_16k_mono.wav`, { type: "audio/wav" });
+    form.append("file", wavFile);
+
+    const resp = await fetch(apiUrlEl.value || "/transcribe", { method: "POST", body: form });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
+    return await resp.json();
+  }
+
+  function rmsDb(float32) {
+    let sum = 0;
+    for (let i = 0; i < float32.length; i++) {
+      const v = float32[i];
+      sum += v * v;
+    }
+    const rms = Math.sqrt(sum / Math.max(1, float32.length));
+    return 20 * Math.log10(Math.max(1e-8, rms));
+  }
+  function dbToPct(db){
+    // map -60..0 dB to 0..1
+    return clamp01((db + 60) / 60);
+  }
+
+  // ---------------------------
+  // PUSH-TO-TALK
+  // ---------------------------
+  const pushStartBtn = document.getElementById("pushStartBtn");
+  const pushStopBtn  = document.getElementById("pushStopBtn");
+  const pushClearBtn = document.getElementById("pushClearBtn");
+  const pushOut = document.getElementById("pushOut");
+  const pushLatency = document.getElementById("pushLatency");
+  const pushStatus = document.getElementById("pushStatus");
+  const pushSub = document.getElementById("pushSub");
+  const pushStatusDot = document.getElementById("pushStatusDot");
+  const pushStateDot = document.getElementById("pushStateDot");
+  const pushStateBadge = document.getElementById("pushStateBadge");
+  const pushLevelFill = document.getElementById("pushLevelFill");
+  const pushDbEl = document.getElementById("pushDb");
+  const pushLevelHint = document.getElementById("pushLevelHint");
+  const pushRespMeta = document.getElementById("pushRespMeta");
+
+  let push = {
+    audioContext: null,
+    mediaStream: null,
+    sourceNode: null,
+    processorNode: null,
+    buffers: [],
+    recording: false,
+    inputSampleRate: 48000,
+    tStopClicked: null
+  };
+
+  function pushSetState(kind, text) {
+    pushStateDot.style.background = kind === "good" ? "var(--good)"
+                            : kind === "warn" ? "var(--warn)"
+                            : kind === "bad" ? "var(--bad)"
+                            : "rgba(255,255,255,.35)";
+    pushStateBadge.textContent = text;
+  }
+  function pushSetStatus(kind, title, sub) {
+    pushStatusDot.className = "dot " + (kind || "");
+    pushStatus.textContent = title;
+    pushSub.textContent = sub || "";
+  }
+  function pushResetMeter(){
+    pushLevelFill.style.width = "0%";
+    pushDbEl.textContent = "-∞ dB";
+    pushLevelHint.textContent = "Not recording";
+  }
+
+  async function pushStartCapture() {
+    pushOut.textContent = "";
+    pushRespMeta.textContent = "—";
+    pushLatency.textContent = "-";
+    push.buffers = [];
+
+    pushSetState("warn", "Requesting mic…");
+    pushSetStatus("warn", "Requesting microphone…", "Allow mic access to start recording.");
+    pushLevelHint.textContent = "Starting…";
+
+    push.mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    push.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    push.inputSampleRate = push.audioContext.sampleRate;
+
+    // ScriptProcessor kept to match prior behavior
+    push.sourceNode = push.audioContext.createMediaStreamSource(push.mediaStream);
+    push.processorNode = push.audioContext.createScriptProcessor(4096, 1, 1);
+
+    push.recording = true;
+    push.processorNode.onaudioprocess = (e) => {
+      if (!push.recording) return;
+      const input = e.inputBuffer.getChannelData(0);
+      push.buffers.push(new Float32Array(input));
+
+      const db = rmsDb(input);
+      const pct = dbToPct(db);
+      pushLevelFill.style.width = `${Math.round(pct * 100)}%`;
+      pushDbEl.textContent = `${db.toFixed(1)} dB`;
+    };
+
+    push.sourceNode.connect(push.processorNode);
+    push.processorNode.connect(push.audioContext.destination);
+
+    pushSetState("good", "Recording");
+    pushSetStatus("good", "Recording…", `Capturing PCM @ ${push.inputSampleRate} Hz (channel 0)`);
+    pushLevelHint.textContent = "Speak normally";
+
+    pushStartBtn.disabled = true;
+    pushStopBtn.disabled = false;
+  }
+
+  async function pushStopCaptureAndSend() {
+    push.tStopClicked = performance.now();
+    pushLatency.textContent = "…";
+    pushSetState("warn", "Uploading…");
+    pushSetStatus("warn", "Stopping…", "Finalizing audio and uploading.");
+    push.recording = false;
+
+    try { if (push.processorNode) push.processorNode.disconnect(); } catch {}
+    try { if (push.sourceNode) push.sourceNode.disconnect(); } catch {}
+    try { if (push.mediaStream) push.mediaStream.getTracks().forEach(t => t.stop()); } catch {}
+
+    if (push.audioContext && push.audioContext.state !== "closed") {
+      try { await push.audioContext.close(); } catch {}
+    }
+
+    push.processorNode = null;
+    push.sourceNode = null;
+    push.mediaStream = null;
+    push.audioContext = null;
+
+    pushSetStatus("warn", "Resampling…", "Converting to 16kHz mono and preparing upload.");
+
+    const mono = flattenFloatChunks(push.buffers);
+    const mono16k = await resampleTo16kHz(mono, push.inputSampleRate);
+    const int16 = floatToInt16(mono16k);
+
+    try {
+      pushSetStatus("warn", "Uploading…", `Sending WAV • ${(int16.length/TARGET_SR).toFixed(2)}s`);
+      const data = await postTranscribe(int16, "push");
+
+      const tDone = performance.now();
+      pushLatency.textContent = `${((tDone - push.tStopClicked)/1000).toFixed(2)} s`;
+
+      const txt = (data.text ?? "").trim();
+      pushOut.textContent = txt || JSON.stringify(data, null, 2);
+      pushRespMeta.textContent = txt ? `text • ${txt.length} chars` : "json";
+      pushSetState("good", "Done");
+      pushSetStatus("good", "Done", "Ready for another take.");
+      showToast("Push-to-talk complete ✅", pushLatency.textContent);
+
+    } catch (err) {
+      console.error(err);
+      pushLatency.textContent = "error";
+      pushOut.textContent = String(err);
+      pushRespMeta.textContent = "error";
+      pushSetState("bad", "Error");
+      pushSetStatus("bad", "Error", "Check server logs and endpoint configuration.");
+      showToast("Push-to-talk failed ❌", String(err).slice(0,120));
+    } finally {
+      pushStartBtn.disabled = false;
+      pushStopBtn.disabled = true;
+      pushResetMeter();
+    }
+  }
+
+  pushStartBtn.addEventListener("click", async () => {
+    try { await pushStartCapture(); }
+    catch (err) {
+      console.error(err);
+      pushSetState("bad", "Error");
+      pushSetStatus("bad", "Error", String(err));
+      pushOut.textContent = String(err);
+      showToast("Mic error ❌", String(err).slice(0,120));
+      pushStartBtn.disabled = false;
+      pushStopBtn.disabled = true;
+      pushResetMeter();
+    }
+  });
+
+  pushStopBtn.addEventListener("click", async () => {
+    pushStopBtn.disabled = true;
+    pushStartBtn.disabled = false;
+    await pushStopCaptureAndSend();
+  });
+
+  pushClearBtn.addEventListener("click", () => {
+    pushOut.textContent = "";
+    pushLatency.textContent = "-";
+    pushRespMeta.textContent = "—";
+    pushSetState("", "Idle");
+    pushSetStatus("", "Idle", "Ready when you are.");
+    pushResetMeter();
+  });
+
+  // Hold-to-talk with Space
+  let spaceDown = false;
+  window.addEventListener("keydown", async (e) => {
+    if (e.code !== "Space") return;
+    const tag = (document.activeElement && document.activeElement.tagName) || "";
+    if (tag === "INPUT" || tag === "TEXTAREA") return;
+
+    if (spaceDown) return;
+    spaceDown = true;
+    e.preventDefault();
+
+    if (!pushStartBtn.disabled) {
+      try { await pushStartCapture(); } catch {}
+    }
+  });
+
+  window.addEventListener("keyup", async (e) => {
+    if (e.code !== "Space") return;
+    const tag = (document.activeElement && document.activeElement.tagName) || "";
+    if (tag === "INPUT" || tag === "TEXTAREA") return;
+
+    if (!spaceDown) return;
+    spaceDown = false;
+    e.preventDefault();
+
+    if (!pushStopBtn.disabled) {
+      pushStopBtn.disabled = true;
+      pushStartBtn.disabled = false;
+      await pushStopCaptureAndSend();
+    }
+  });
+
+  // ---------------------------
+  // STREAMING
+  // ---------------------------
+  const streamStartBtn = document.getElementById("streamStartBtn");
+  const streamStopBtn  = document.getElementById("streamStopBtn");
+  const streamClearBtn = document.getElementById("streamClearBtn");
+
+  const blockDurationEl = document.getElementById("blockDuration");
+  const maxBufferSecsEl = document.getElementById("maxBufferSecs");
+  const overlapSecsEl = document.getElementById("overlapSecs");
+
+  const streamOut = document.getElementById("streamOut");
+  const streamDbg = document.getElementById("streamDbg");
+  const streamStatus = document.getElementById("streamStatus");
+  const streamSub = document.getElementById("streamSub");
+  const streamStatusDot = document.getElementById("streamStatusDot");
+
+  const streamStateDot = document.getElementById("streamStateDot");
+  const streamStateBadge = document.getElementById("streamStateBadge");
+
+  const streamLevelFill = document.getElementById("streamLevelFill");
+  const streamDbEl = document.getElementById("streamDb");
+  const streamLevelHint = document.getElementById("streamLevelHint");
+  const streamRespMeta = document.getElementById("streamRespMeta");
+
+  const SAMPLE_RATE = 16000;
+
+  let BLOCK_DURATION = 0.50;
+  let MAX_BUFFER_IN_SECS = 5.0;
+  let OVERLAP_SECS = 0.25;
+
+  let OVERLAP = Math.floor(SAMPLE_RATE * OVERLAP_SECS);
+  let MAX_BUFFER = Math.floor(SAMPLE_RATE * MAX_BUFFER_IN_SECS);
+
+  function streamSetBadge(kind, text){
+    streamStateDot.style.background = kind === "good" ? "var(--good)"
+                            : kind === "warn" ? "var(--warn)"
+                            : kind === "bad" ? "var(--bad)"
+                            : "rgba(255,255,255,.35)";
+    streamStateBadge.textContent = text;
+  }
+  function streamSetStatus(kind, title, sub) {
+    streamStatusDot.className = "dot " + (kind || "");
+    streamStatus.textContent = title;
+    streamSub.textContent = sub || "";
+  }
+
+  function applyStreamConfigFromUI() {
+    const bd = parseFloat(blockDurationEl.value);
+    const mb = parseFloat(maxBufferSecsEl.value);
+    const ov = parseFloat(overlapSecsEl.value);
+
+    BLOCK_DURATION = Number.isFinite(bd) && bd > 0 ? bd : 0.50;
+    MAX_BUFFER_IN_SECS = Number.isFinite(mb) && mb > 0 ? mb : 5.0;
+    OVERLAP_SECS = Number.isFinite(ov) && ov >= 0 ? ov : 0.25;
+
+    if (OVERLAP_SECS > MAX_BUFFER_IN_SECS) OVERLAP_SECS = MAX_BUFFER_IN_SECS;
+
+    OVERLAP = Math.floor(SAMPLE_RATE * OVERLAP_SECS);
+    MAX_BUFFER = Math.floor(SAMPLE_RATE * MAX_BUFFER_IN_SECS);
+  }
+
+  let committedLines = [];
+  let currentLine = "";
+
+  function renderTranscript() {
+    const all = committedLines.slice();
+    all.push(currentLine);
+    streamOut.textContent = all.join("\n").trimEnd();
+    const totalChars = streamOut.textContent.length;
+    streamRespMeta.textContent = totalChars ? `${committedLines.length} lines committed • ${totalChars} chars` : "—";
+  }
+
+  let audioContext = null;
+  let mediaStream = null;
+  let sourceNode = null;
+  let workletNode = null;
+  let inputSampleRate = 48000;
+
+  let floatChunks = [];
+  let recording = false;
+
+  let buffer16k = new Int16Array(0);
+  let samples_since_commit = 0;
+
+  let tickTimer = null;
+  let inFlight = false;
+  let pendingPayload = null;
+
+  const workletProcessorCode = `
+    class PCMCollector extends AudioWorkletProcessor {
+      process(inputs) {
+        const input = inputs[0];
+        if (input && input[0]) this.port.postMessage(input[0]);
+        return true;
+      }
+    }
+    registerProcessor('pcm-collector', PCMCollector);
+  `;
+
+  async function setupStreamAudio() {
+    streamSetBadge("warn", "Requesting mic…");
+    streamSetStatus("warn", "Requesting microphone…", "Allow mic access to begin streaming.");
+    streamLevelHint.textContent = "Starting…";
+
+    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    inputSampleRate = audioContext.sampleRate;
+
+    const blob = new Blob([workletProcessorCode], { type: "application/javascript" });
+    const url = URL.createObjectURL(blob);
+    await audioContext.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url);
+
+    sourceNode = audioContext.createMediaStreamSource(mediaStream);
+    workletNode = new AudioWorkletNode(audioContext, "pcm-collector");
+
+    workletNode.port.onmessage = (event) => {
+      if (!recording) return;
+      const chunk = new Float32Array(event.data);
+      floatChunks.push(chunk);
+
+      const db = rmsDb(chunk);
+      const pct = dbToPct(db);
+      streamLevelFill.style.width = `${Math.round(pct*100)}%`;
+      streamDbEl.textContent = `${db.toFixed(1)} dB`;
+    };
+
+    sourceNode.connect(workletNode);
+  }
+
+  function teardownStreamAudio() {
+    try { if (workletNode) workletNode.disconnect(); } catch {}
+    try { if (sourceNode) sourceNode.disconnect(); } catch {}
+    if (mediaStream) {
+      try { mediaStream.getTracks().forEach(t => t.stop()); } catch {}
+    }
+    workletNode = null;
+    sourceNode = null;
+    mediaStream = null;
+  }
+
+  async function closeStreamContext() {
+    if (audioContext && audioContext.state !== "closed") {
+      try { await audioContext.close(); } catch {}
+    }
+    audioContext = null;
+  }
+
+  function bufferAppendKeepLast(buf, chunk, maxLen) {
+    const total = buf.length + chunk.length;
+    if (total <= maxLen) {
+      const out = new Int16Array(total);
+      out.set(buf, 0);
+      out.set(chunk, buf.length);
+      return out;
+    }
+    const out = new Int16Array(maxLen);
+    const keepFromOld = Math.max(0, maxLen - chunk.length);
+    if (keepFromOld > 0) out.set(buf.subarray(buf.length - keepFromOld), 0);
+    out.set(chunk.subarray(chunk.length - Math.min(chunk.length, maxLen)), keepFromOld);
+    return out;
+  }
+
+  function commitTrim(buf, lastChunkLen) {
+    const keep = Math.min(buf.length, lastChunkLen + OVERLAP);
+    return buf.subarray(buf.length - keep);
+  }
+
+  async function enqueueSend(payloadInt16) {
+    if (inFlight) {
+      pendingPayload = payloadInt16; // latest-only
+      return;
+    }
+    inFlight = true;
+
+    try {
+      const data = await postTranscribe(payloadInt16, "stream");
+      const text = (data.text ?? "").trim();
+
+      if (text) {
+        currentLine = text;
+        renderTranscript();
+      }
+
+      streamDbg.textContent =
+        `mode=wav\n` +
+        `BLOCK_DURATION=${BLOCK_DURATION}s (tick)\n` +
+        `MAX_BUFFER=${MAX_BUFFER_IN_SECS}s  OVERLAP=${OVERLAP_SECS}s\n` +
+        `payload_samples=${payloadInt16.length} (~${(payloadInt16.length/SAMPLE_RATE).toFixed(2)}s)\n`;
+
+    } catch (e) {
+      console.error(e);
+      streamSetBadge("bad", "Error");
+      streamSetStatus("bad", "Error", String(e));
+      currentLine = String(e);
+      renderTranscript();
+      showToast("Streaming error ❌", String(e).slice(0,120));
+    } finally {
+      inFlight = false;
+      if (pendingPayload) {
+        const next = pendingPayload;
+        pendingPayload = null;
+        enqueueSend(next);
+      }
+    }
+  }
+
+  async function tick() {
+    if (!recording) return;
+    if (floatChunks.length === 0) return;
+
+    const chunks = floatChunks;
+    floatChunks = [];
+
+    const mono = flattenFloatChunks(chunks);
+    const mono16k = await resampleTo16kHz(mono, inputSampleRate);
+    const chunk16k_i16 = floatToInt16(mono16k);
+
+    buffer16k = bufferAppendKeepLast(buffer16k, chunk16k_i16, MAX_BUFFER);
+    samples_since_commit += chunk16k_i16.length;
+
+    if (samples_since_commit >= MAX_BUFFER) {
+      samples_since_commit = 0;
+      buffer16k = commitTrim(buffer16k, chunk16k_i16.length);
+
+      if (currentLine.trim()) committedLines.push(currentLine.trim());
+      currentLine = "";
+      renderTranscript();
+    }
+
+    enqueueSend(new Int16Array(buffer16k));
+  }
+
+  async function streamStart() {
+    applyStreamConfigFromUI();
+
+    committedLines = [];
+    currentLine = "";
+    renderTranscript();
+
+    streamDbg.textContent = "";
+    buffer16k = new Int16Array(0);
+    samples_since_commit = 0;
+    floatChunks = [];
+    pendingPayload = null;
+    inFlight = false;
+
+    await setupStreamAudio();
+    recording = true;
+
+    streamSetBadge("good", "Streaming");
+    streamSetStatus("good", "Listening… (streaming)", "Uploading rolling audio buffer for partial transcription.");
+    streamLevelHint.textContent = "Speak naturally";
+    streamStartBtn.disabled = true;
+    streamStopBtn.disabled = false;
+
+    if (tickTimer) clearInterval(tickTimer);
+    tickTimer = setInterval(() => { tick(); }, Math.round(BLOCK_DURATION * 1000));
+  }
+
+  async function streamStop() {
+    recording = false;
+    streamSetBadge("warn", "Stopping…");
+    streamSetStatus("warn", "Stopping…", "Tearing down audio capture.");
+    streamLevelHint.textContent = "Stopping…";
+
+    if (tickTimer) clearInterval(tickTimer);
+    tickTimer = null;
+
+    teardownStreamAudio();
+    await closeStreamContext();
+
+    streamStartBtn.disabled = false;
+    streamStopBtn.disabled = true;
+    streamSetBadge("", "Stopped");
+    streamSetStatus("", "Stopped.", "Press Start to stream again.");
+    streamLevelFill.style.width = "0%";
+    streamDbEl.textContent = "-∞ dB";
+    streamLevelHint.textContent = "Not streaming";
+  }
+
+  streamStartBtn.addEventListener("click", () => {
+    streamStart().catch(err => {
+      console.error(err);
+      streamSetBadge("bad", "Error");
+      streamSetStatus("bad", "Error", String(err));
+      currentLine = String(err);
+      renderTranscript();
+      showToast("Streaming start failed ❌", String(err).slice(0,120));
+    });
+  });
+
+  streamStopBtn.addEventListener("click", () => {
+    streamStop().catch(err => {
+      console.error(err);
+      streamSetBadge("bad", "Error");
+      streamSetStatus("bad", "Error", String(err));
+      currentLine = String(err);
+      renderTranscript();
+      showToast("Streaming stop failed ❌", String(err).slice(0,120));
+    });
+  });
+
+  streamClearBtn.addEventListener("click", () => {
+    committedLines = [];
+    currentLine = "";
+    renderTranscript();
+    streamDbg.textContent = "";
+    streamRespMeta.textContent = "—";
+    streamSetBadge("", "Idle");
+    streamSetStatus("", "Idle", "Press Start to begin streaming.");
+    streamLevelFill.style.width = "0%";
+    streamDbEl.textContent = "-∞ dB";
+    streamLevelHint.textContent = "Not streaming";
+  });
+
+  // Esc stops streaming
+  window.addEventListener("keydown", (e) => {
+    if (e.code === "Escape" && !streamStopBtn.disabled) {
+      e.preventDefault();
+      streamStopBtn.click();
+    }
+  });
+
+})();
+</script>
+</body>
+</html>
