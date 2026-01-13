@@ -347,7 +347,7 @@ fn main() -> Result<()> {
             total_tokens += token_count;
 
             println!("  Tokens: {}", token_count);
-            println!("  Text: {}\n", text.trim());
+            println!("  \x1b[1;36mText: {}\x1b[0m\n", text.trim());
 
             all_transcriptions.push((start_time, end_time, text.trim().to_string()));
         }
@@ -366,7 +366,7 @@ fn main() -> Result<()> {
         total_tokens += token_count;
 
         println!("  Tokens: {}", token_count);
-        println!("  Text: {}\n", text.trim());
+        println!("  \x1b[1;36mText: {}\x1b[0m\n", text.trim());
 
         all_transcriptions.push((start_time, end_time, text.trim().to_string()));
     }
