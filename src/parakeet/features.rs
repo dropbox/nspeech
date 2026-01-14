@@ -19,6 +19,7 @@ pub struct ParakeetFeatureExtractor {
     pub win_length: usize,    // 400
     pub preemphasis: f32,     // 0.97
     pub padding_value: f32,   // 0.0 (only for later padding if batching)
+    pub normalize: bool,      // true = per_feature normalization, false = no normalization
 
     window: Vec<f32>,
     mel_filters: Vec<Vec<f32>>, // [feature_size][n_fft/2+1]
@@ -26,12 +27,20 @@ pub struct ParakeetFeatureExtractor {
 }
 
 impl ParakeetFeatureExtractor {
+    /// Create feature extractor with per-feature normalization (default)
     pub fn new(feature_size: usize) -> Self {
+        Self::new_with_config(feature_size, true)
+    }
+
+    /// Create feature extractor with configurable normalization
+    /// normalize=true: per-feature normalization (for standard TDT model)
+    /// normalize=false: no normalization (for streaming TDT model)
+    pub fn new_with_config(feature_size: usize, normalize: bool) -> Self {
         let sampling_rate = 16_000usize;
         let hop_length = 160usize;
         let n_fft = 512usize;
         let win_length = 400usize;
-        let preemphasis = 0.97f32;
+        let preemphasis = 0.97f32;  // Re-enabled - NeMo uses preemphasis
         let padding_value = 0.0f32;
 
         let window = hann_window(win_length);
@@ -49,6 +58,7 @@ impl ParakeetFeatureExtractor {
             win_length,
             preemphasis,
             padding_value,
+            normalize,
             window,
             mel_filters,
             fft,
@@ -133,45 +143,48 @@ impl ParakeetFeatureExtractor {
             }
         }
 
-        // Apply per-feature normalization (NeMo's normalize='per_feature')
-        // Normalize each mel bin (feature dimension) independently to mean=0, std=1
-        let num_features = self.feature_size;
+        // Apply per-feature normalization only if enabled
+        // NeMo's normalize='per_feature': Normalize each mel bin independently to mean=0, std=1
+        // NeMo's normalize='NA': Skip normalization entirely
+        if self.normalize {
+            let num_features = self.feature_size;
 
-        if frames > 0 {
-            // Calculate mean and std for each feature dimension
-            let mut means = vec![0.0f32; num_features];
-            let mut stds = vec![0.0f32; num_features];
+            if frames > 0 {
+                // Calculate mean and std for each feature dimension
+                let mut means = vec![0.0f32; num_features];
+                let mut stds = vec![0.0f32; num_features];
 
-            // Calculate means
-            for t in 0..frames {
-                for f in 0..num_features {
-                    means[f] += feats[t * num_features + f];
+                // Calculate means
+                for t in 0..frames {
+                    for f in 0..num_features {
+                        means[f] += feats[t * num_features + f];
+                    }
                 }
-            }
-            for mean in means.iter_mut() {
-                *mean /= frames as f32;
-            }
-
-            // Calculate standard deviations
-            for t in 0..frames {
-                for f in 0..num_features {
-                    let diff = feats[t * num_features + f] - means[f];
-                    stds[f] += diff * diff;
+                for mean in means.iter_mut() {
+                    *mean /= frames as f32;
                 }
-            }
-            for std in stds.iter_mut() {
-                *std = (*std / frames as f32).sqrt();
-                // Avoid division by zero
-                if *std < 1e-10 {
-                    *std = 1.0;
-                }
-            }
 
-            // Normalize: (x - mean) / std for each feature
-            for t in 0..frames {
-                for f in 0..num_features {
-                    let idx = t * num_features + f;
-                    feats[idx] = (feats[idx] - means[f]) / stds[f];
+                // Calculate standard deviations
+                for t in 0..frames {
+                    for f in 0..num_features {
+                        let diff = feats[t * num_features + f] - means[f];
+                        stds[f] += diff * diff;
+                    }
+                }
+                for std in stds.iter_mut() {
+                    *std = (*std / frames as f32).sqrt();
+                    // Avoid division by zero
+                    if *std < 1e-10 {
+                        *std = 1.0;
+                    }
+                }
+
+                // Normalize: (x - mean) / std for each feature
+                for t in 0..frames {
+                    for f in 0..num_features {
+                        let idx = t * num_features + f;
+                        feats[idx] = (feats[idx] - means[f]) / stds[f];
+                    }
                 }
             }
         }
@@ -194,8 +207,8 @@ fn preemphasis(x: &[f32], coef: f32) -> Vec<f32> {
     y
 }
 
-/// Hann window, symmetric: w[n]=0.5-0.5*cos(2*pi*n/(N-1))
-/// This matches NeMo's default (symmetric Hann window)
+/// Hann window, periodic: w[n]=0.5-0.5*cos(2*pi*n/N)
+/// This matches PyTorch/NeMo's default (periodic, NOT symmetric)
 fn hann_window(n: usize) -> Vec<f32> {
     if n == 0 {
         return vec![];
@@ -203,7 +216,7 @@ fn hann_window(n: usize) -> Vec<f32> {
     if n == 1 {
         return vec![1.0];
     }
-    let denom = (n - 1) as f32;
+    let denom = n as f32;  // Periodic window uses N, not N-1
     (0..n)
         .map(|i| 0.5 - 0.5 * (2.0 * PI * (i as f32) / denom).cos())
         .collect()
