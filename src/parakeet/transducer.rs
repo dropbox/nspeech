@@ -1270,7 +1270,8 @@ fn remap_nemo_tensor_name(nemo_name: &str) -> String {
 pub struct HfTransducerConfig {
     pub encoder_config: HfEncoderConfig,
     pub vocab_size: usize,
-    pub blank_id: usize,
+    #[serde(default)]
+    pub blank_id: Option<usize>,  // Defaults to vocab_size if not present
     #[serde(default)]
     pub joint_vocab_size: Option<usize>,
     pub predictor_config: HfPredictorConfig,
@@ -1296,7 +1297,7 @@ impl TransducerConfig {
     pub fn from_hf(hf: &HfTransducerConfig) -> Self {
         Self {
             vocab_size: hf.vocab_size,
-            blank_id: hf.blank_id,
+            blank_id: hf.blank_id.unwrap_or(hf.vocab_size),  // Default: last position in vocab
             joint_vocab_size: hf.joint_vocab_size,
             pred_hidden: hf.predictor_config.pred_hidden,
             pred_rnn_layers: hf.predictor_config.pred_rnn_layers,
@@ -1354,7 +1355,7 @@ pub fn load_parakeet_tdt_from_local<P: AsRef<Path>>(
         subsampling_factor: enc.subsampling_factor,
         scale_input: enc.scale_input.unwrap_or(true),
         vocab_size: hf_cfg.vocab_size,
-        blank_id: hf_cfg.blank_id,
+        blank_id: hf_cfg.blank_id.unwrap_or(hf_cfg.vocab_size),
     };
 
     // Load model weights
@@ -1485,7 +1486,7 @@ pub fn load_parakeet_tdt_from_hf(
         subsampling_factor: enc.subsampling_factor,
         scale_input: enc.scale_input.unwrap_or(true),
         vocab_size: hf_cfg.vocab_size,
-        blank_id: hf_cfg.blank_id,
+        blank_id: hf_cfg.blank_id.unwrap_or(hf_cfg.vocab_size),
     };
 
     // Load model weights
@@ -1620,7 +1621,7 @@ pub fn load_parakeet_tdt_from_gguf_local<P: AsRef<Path>>(
         subsampling_factor: enc.subsampling_factor,
         scale_input: enc.scale_input.unwrap_or(true),
         vocab_size: hf_cfg.vocab_size,
-        blank_id: hf_cfg.blank_id,
+        blank_id: hf_cfg.blank_id.unwrap_or(hf_cfg.vocab_size),
     };
 
     // Load tokenizer from embedded asset
@@ -1914,7 +1915,7 @@ pub fn load_parakeet_streaming_tdt_from_local<P: AsRef<Path>>(
         subsampling_factor: enc.subsampling_factor,
         scale_input: enc.scale_input.unwrap_or(true),
         vocab_size: hf_cfg.vocab_size,
-        blank_id: hf_cfg.blank_id,
+        blank_id: hf_cfg.blank_id.unwrap_or(hf_cfg.vocab_size),
     };
 
     let vb = VarBuilder::from_tensors(tensors, dtype, device);
