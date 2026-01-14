@@ -314,20 +314,115 @@ impl MultiHeadSelfAttention {
         Ok(out)
     }
 
+    /// Forward pass with K/V caching for streaming inference
+    pub fn forward_with_cache(
+        &self,
+        xs: &Tensor,
+        pos: &Tensor,
+        attn_mask: Option<&Tensor>,
+        train: bool,
+        cache: &mut super::streaming_encoder::AttentionCache,
+    ) -> Result<Tensor> {
+        let (b, t, d) = xs.dims3()?;
+
+        // Project Q, K, V from current chunk
+        let q = self.q_proj.forward(xs)?;
+        let k_new = self.k_proj.forward(xs)?;
+        let v_new = self.v_proj.forward(xs)?;
+
+        // Reshape new K/V to [B, num_heads, seq_len, head_dim]
+        let k_new = k_new.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        let v_new = v_new.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+
+        // Update cache FIRST (this concatenates and trims if needed)
+        cache.append(k_new.clone(), v_new.clone())?;
+
+        // Get K/V from cache (clone to avoid borrow issues)
+        let k = cache.get_keys().unwrap().clone();
+        let v = cache.get_values().unwrap().clone();
+
+        // Get actual key length AFTER cache update and trim
+        let (_, _, k_len, _) = k.dims4()?;
+
+        // Reshape Q
+        let q = q.reshape((b, t, self.num_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+
+        // Compute relative position encodings (pos already computed for total_frames)
+        let pos2 = pos.reshape((b * pos.dims()[1], d))?;
+        let k_rel = pos2
+            .matmul(&self.rel_k_weight.transpose(D::Minus2, D::Minus1)?)?
+            .reshape((b, pos.dims()[1], d))?;
+        let k_rel = k_rel
+            .reshape((b, pos.dims()[1], self.num_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        // Compute attention with biases
+        let bu = self.bias_u.unsqueeze(0)?.unsqueeze(2)?;
+        let bv = self.bias_v.unsqueeze(0)?.unsqueeze(2)?;
+        let q_bias_u = q.broadcast_add(&bu)?;
+        let q_bias_v = q.broadcast_add(&bv)?;
+
+        // Content-based attention
+        let attn_scores_c = q_bias_u.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
+
+        // Position-based attention
+        let mut attn_scores_r = q_bias_v.matmul(&k_rel.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
+        attn_scores_r = self.rel_shift(&attn_scores_r)?;
+
+        // CRITICAL FIX: Narrow to k_len (full key length), not query length
+        // This matches NeMo's: matrix_bd[:, :, :, :matrix_ac.size(-1)]
+        attn_scores_r = attn_scores_r.narrow(D::Minus1, 0, k_len)?;
+
+        let mut attn_scores = (attn_scores_c + attn_scores_r)?;
+
+        if let Some(mask) = attn_mask {
+            attn_scores = (attn_scores + mask)?;
+        }
+
+        let scale = (self.head_dim as f64).sqrt() as f32;
+        let scale_t = Tensor::from_slice(&[scale], (), xs.device())?.to_dtype(xs.dtype())?;
+        let scale_t = scale_t.broadcast_as(attn_scores.shape())?;
+        attn_scores = (attn_scores / scale_t)?;
+
+        // Softmax in F32 for stability
+        let original_dtype = attn_scores.dtype();
+        let needs_upcast = original_dtype == DType::F16 || original_dtype == DType::BF16;
+        let attn_scores_f32 = if needs_upcast {
+            attn_scores.to_dtype(DType::F32)?
+        } else {
+            attn_scores
+        };
+        let attn_weights_f32 = candle_nn::ops::softmax(&attn_scores_f32, D::Minus1)?;
+        let attn_weights = if needs_upcast {
+            attn_weights_f32.to_dtype(original_dtype)?
+        } else {
+            attn_weights_f32
+        };
+
+        let attn_weights = self.dropout.forward(&attn_weights, train)?;
+        let context = attn_weights.matmul(&v)?;
+        let context = context.transpose(1, 2)?.reshape((b, t, d))?;
+        let out = self.o_proj.forward(&context)?;
+        Ok(out)
+    }
+
     fn rel_shift(&self, x: &Tensor) -> Result<Tensor> {
-        // x: [B,H,T,2T-1] -> [B,H,T,T] by shifting relative positions
+        // Transformer-XL relative position shift
+        // Input: [B,H,query_len,pos_len] where pos_len = 2*total_frames-1
+        // Output: [B,H,query_len,pos_len] with shifted positions
+        // Caller narrows to key_len to match content attention
         let (b, h, t, p) = x.dims4()?;
-        // Pad with zeros on the left: [B,H,T,2T-1] -> [B,H,T,2T]
+        // Pad with zeros on the left: [B,H,T,P] -> [B,H,T,P+1]
         let zeros = Tensor::zeros((b, h, t, 1), x.dtype(), x.device())?;
-        let x = Tensor::cat(&[zeros, x.clone()], 3)?;  // [B,H,T,2T]
-        // Reshape to [B,H,2T,T]
+        let x = Tensor::cat(&[zeros, x.clone()], 3)?;
+        // Reshape to [B,H,P+1,T]
         let x = x.reshape((b, h, p + 1, t))?;
-        // Remove first row: [B,H,2T,T] -> [B,H,2T-1,T]
+        // Remove first row: [B,H,P+1,T] -> [B,H,P,T]
         let x = x.narrow(D::Minus2, 1, p)?;
-        // Reshape back to [B,H,T,2T-1]
+        // Reshape back to [B,H,T,P]
         let x = x.reshape((b, h, t, p))?;
-        // Take only first T columns: [B,H,T,2T-1] -> [B,H,T,T]
-        let x = x.narrow(D::Minus1, 0, t)?;
+        // Return full matrix - caller narrows to key length
         Ok(x)
     }
 }
@@ -392,6 +487,59 @@ impl ConvModule {
         let gated = candle_nn::ops::sigmoid(&b)?;
         let xs = (a * gated)?;
         let xs = self.dw.forward(&xs)?;
+        let xs = self.bn.forward_t(&xs, train)?;
+        let xs = xs.silu()?;
+        let xs = self.pw2.forward(&xs)?;
+        let xs = self.dropout.forward(&xs, train)?;
+        let xs = xs.transpose(1, 2)?;
+        Ok(xs)
+    }
+
+    /// Forward with convolution padding cache for streaming
+    pub fn forward_with_cache(
+        &self,
+        xs: &Tensor,
+        train: bool,
+        cache: &mut super::streaming_encoder::ConvCache,
+    ) -> Result<Tensor> {
+        let (_b, t, d) = xs.dims3()?;
+        if d != self.d_model {
+            return Err(anyhow!(
+                "conv module expected d_model {}, got {}",
+                self.d_model,
+                d
+            ));
+        }
+
+        let xs = xs.transpose(1, 2)?;
+        let xs = self.pw1.forward(&xs)?;
+        let a = xs.narrow(1, 0, d)?;
+        let b = xs.narrow(1, d, d)?;
+        let gated = candle_nn::ops::sigmoid(&b)?;
+        let xs = (a * gated)?;
+
+        // Depthwise conv with caching
+        let xs_for_conv = if let Some(cached_padding) = cache.get_padding() {
+            Tensor::cat(&[cached_padding, &xs], 2)?
+        } else {
+            xs.clone()
+        };
+
+        let xs_conv = self.dw.forward(&xs_for_conv)?;
+
+        // Extract output for current chunk
+        let (_, _, conv_out_len) = xs_conv.dims3()?;
+        let padding_size = cache.kernel_size.saturating_sub(1);
+
+        let xs = if cache.get_padding().is_some() && conv_out_len > t {
+            xs_conv.narrow(2, padding_size, t)?
+        } else {
+            xs_conv
+        };
+
+        // Update cache
+        cache.update(&xs)?;
+
         let xs = self.bn.forward_t(&xs, train)?;
         let xs = xs.silu()?;
         let xs = self.pw2.forward(&xs)?;
@@ -852,6 +1000,49 @@ impl FastConformerBlock {
         Ok(y_out)
     }
 
+    /// Forward pass with cache support for streaming
+    pub fn forward_with_cache(
+        &self,
+        xs: &Tensor,
+        pos: &Tensor,
+        attn_mask: Option<&Tensor>,
+        train: bool,
+        att_cache: Option<&mut super::streaming_encoder::AttentionCache>,
+        conv_cache: Option<&mut super::streaming_encoder::ConvCache>,
+    ) -> Result<Tensor> {
+        // FF1 with 0.5 scaling factor
+        let ln_ff1_out = self.ln_ff1.forward(xs)?;
+        let y_ff1 = self.ff1.forward(&ln_ff1_out, train)?;
+        let y_ff1_scaled = (y_ff1 * 0.5)?;
+        let mut y = (xs + &y_ff1_scaled)?;
+
+        // Attention with cache support
+        let ln_mha_out = self.ln_mha.forward(&y)?;
+        let y_attn = if let Some(cache) = att_cache {
+            self.self_attn.forward_with_cache(&ln_mha_out, pos, attn_mask, train, cache)?
+        } else {
+            self.self_attn.forward(&ln_mha_out, pos, attn_mask, train)?
+        };
+        y = (&y + y_attn)?;
+
+        // Conv with cache support
+        let y_conv_input = self.ln_conv.forward(&y)?;
+        let y_conv = if let Some(cache) = conv_cache {
+            self.conv_module.forward_with_cache(&y_conv_input, train, cache)?
+        } else {
+            self.conv_module.forward(&y_conv_input, train)?
+        };
+        y = (&y + y_conv)?;
+
+        // FF2 with 0.5 scaling factor
+        let y_ff2 = self.ff2.forward(&self.ln_ff2.forward(&y)?, train)?;
+        let y_ff2_scaled = (y_ff2 * 0.5)?;
+        y = (&y + y_ff2_scaled)?;
+
+        let y_out = self.ln_out.forward(&y)?;
+        Ok(y_out)
+    }
+
 }
 
 pub struct FastConformerEncoder {
@@ -911,6 +1102,87 @@ impl FastConformerEncoder {
         for blk in self.blocks.iter() {
             h = blk.forward_with_pos(&h, &pos, None, train)?;
         }
+        Ok(h)
+    }
+
+    /// Forward pass with streaming cache support
+    pub fn forward_with_cache(
+        &self,
+        xs: &Tensor,
+        train: bool,
+        caches: Option<&mut super::streaming_encoder::StreamingEncoderCache>,
+    ) -> Result<Tensor> {
+        let device = xs.device();
+        let (_, _, input_dim) = xs.dims3()?;
+
+        // Apply subsampling if needed
+        let xs = if input_dim == self.cfg.d_model {
+            xs.clone()
+        } else {
+            self.subsampling.forward(xs)?
+        };
+
+        let (b, t, d) = xs.dims3()?;
+        if d != self.cfg.d_model {
+            return Err(anyhow!(
+                "encoder expected d_model {}, got {}",
+                self.cfg.d_model,
+                d
+            ));
+        }
+
+        // Scale input if configured
+        let xs = if self.cfg.scale_input {
+            let scale = (self.cfg.d_model as f64).sqrt() as f32;
+            let scale_t = Tensor::from_slice(&[scale], (), device)?.to_dtype(xs.dtype())?;
+            let scale_t = scale_t.broadcast_as(xs.shape())?;
+            (xs * scale_t)?
+        } else {
+            xs
+        };
+
+        // Compute relative positional encoding for ACTUAL key sequence (after trim)
+        // Since cache.append() trims to max_cache_size, we need to compute position for:
+        //   min(cached + current, max_cache_size)
+        let total_frames = if let Some(caches) = &caches {
+            let cached = caches.attention_caches.get(0)
+                .and_then(|c| c.get_keys())
+                .map(|k| k.dims4().ok().map(|(_, _, t, _)| t))
+                .flatten()
+                .unwrap_or(0);
+            let max_cache = caches.attention_caches.get(0)
+                .map(|c| c.max_cache_size)
+                .unwrap_or(0);
+            // After append+trim, cache size will be min(cached + current, max_cache)
+            if max_cache > 0 {
+                (cached + t).min(max_cache)
+            } else {
+                cached + t
+            }
+        } else {
+            t
+        };
+        let pos = relative_positional_encoding(b, total_frames, d, device, xs.dtype())?;
+        let pos = self.pos_dropout_positions.forward(&pos, train)?;
+
+        let mut h = self.pos_dropout.forward(&xs, train)?;
+
+        // Process through all blocks with caching
+        if let Some(caches) = caches {
+            for (i, blk) in self.blocks.iter().enumerate() {
+                let att_cache = &mut caches.attention_caches[i];
+                let conv_cache = &mut caches.conv_caches[i];
+                h = blk.forward_with_cache(&h, &pos, None, train, Some(att_cache), Some(conv_cache))?;
+            }
+            // Update total frames processed
+            caches.total_frames += t;
+        } else {
+            // No caching - standard forward
+            for blk in self.blocks.iter() {
+                h = blk.forward_with_cache(&h, &pos, None, train, None, None)?;
+            }
+        }
+
         Ok(h)
     }
 
