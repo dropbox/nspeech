@@ -10,19 +10,26 @@
 
 use anyhow::Result;
 use speech::parakeet::{
-    get_device, load_parakeet_tdt_from_gguf_local,
+    get_device, load_parakeet_tdt_from_local,
     ParakeetFeatureExtractor,
     streaming_encoder::StreamingEncoderCache,
 };
 use candle_core::DType;
 
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.len() < 2 {
+        eprintln!("Usage: {} <audio.wav>", args[0]);
+        return Ok(());
+    }
+
     let device = get_device()?;
     println!("Device: {:?}\n", device);
 
-    // Load STANDARD TDT model (for comparison)
-    println!("Loading STANDARD TDT model...");
-    let model = load_parakeet_tdt_from_gguf_local("assets", &device)?;
+    // Load TDT model with BF16 safetensors (full precision)
+    println!("Loading TDT model (BF16 safetensors)...");
+    let mut model = load_parakeet_tdt_from_local(".cache/parakeet-tdt", &device)?;
     println!("✓ Model loaded");
     println!("  Vocab size: {}", model.config.vocab_size);
     println!("  Blank ID: {}", model.config.blank_id);
@@ -31,9 +38,16 @@ fn main() -> Result<()> {
     println!("  Num heads: {}", model.encoder.cfg.num_heads);
     println!("  Conv kernel size: {}\n", model.encoder.cfg.conv_kernel_size);
 
+    // Load tokenizer
+    println!("Loading tokenizer...");
+    model.load_tokenizer(".cache/parakeet-tdt")?;
+    println!("✓ Tokenizer loaded\n");
+
     // Load audio
     println!("Loading audio...");
-    let mut reader = hound::WavReader::open("dots.wav")?;
+
+    let audio_path = &args[1];
+    let mut reader = hound::WavReader::open(&audio_path)?;
     let audio_samples: Vec<f32> = reader
         .samples::<i16>()
         .map(|s| s.map(|v| v as f32 / i16::MAX as f32))
