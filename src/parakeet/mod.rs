@@ -20,9 +20,15 @@ pub use fast_conformer::{
 // Re-export Transducer (TDT) types and functions
 pub use transducer::{
     TransducerConfig, TransducerModel, PredictionNetwork, JointNetwork,
-    TokenWithTimestamp,
-    load_parakeet_tdt_from_hf, load_parakeet_tdt_from_local, load_parakeet_tdt_from_gguf_local,
-    TDT_CONFIG, TDT_MODEL, TDT_MODEL_Q8_0_GGUF, TDT_TOKENIZER, TDT_TOKENIZER_JSON, // Re-export TDT assets
+    TokenWithTimestamp, BeamStreamingState, StreamingBeamHypothesis,
+    load_parakeet_tdt_from_hf, load_parakeet_tdt_from_local, //load_parakeet_tdt_from_gguf_local,
+    load_parakeet_streaming_tdt_from_local,  // BF16 safetensors
+    //load_parakeet_streaming_tdt_from_gguf_local,  // Cache-aware streaming variant (quantized)
+    TDT_CONFIG, TDT_MODEL, TDT_TOKENIZER, TDT_TOKENIZER_JSON, // Re-export TDT assets
+    //TDT_CONFIG, TDT_MODEL, TDT_MODEL_Q8_0_GGUF, TDT_TOKENIZER, TDT_TOKENIZER_JSON, // Re-export TDT assets
+    STREAMING_TDT_CONFIG, STREAMING_TDT_MODEL, // Streaming TDT assets
+    //STREAMING_TDT_CONFIG, STREAMING_TDT_MODEL, STREAMING_TDT_MODEL_Q8_0_GGUF,  // Streaming TDT assets
+    STREAMING_TDT_TOKENIZER, STREAMING_TDT_TOKENIZER_JSON,
 };
 
 // Re-export Streaming Transducer types

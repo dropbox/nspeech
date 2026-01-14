@@ -157,14 +157,22 @@ pub struct Transcription {
 
 /// Inner state for transcription stream
 struct SpeechInner {
-    transcriber: parakeet::StreamingTransducer,
+    vad_stream: silero::VadStream,
+    tdt_model: parakeet::TransducerModel,
     feat_extractor: parakeet::ParakeetFeatureExtractor,
     device: candle_core::Device,
 
-    // Accumulated samples and timing
-    accumulated_samples: Vec<f32>,
+    // VAD state
+    current_segment: Vec<f32>,
+    current_segment_start: Option<f64>,
+    pre_buffer: std::collections::VecDeque<f32>,
+    silence_frames: usize,
+    was_speech_last_frame: bool,
     total_samples_processed: usize,
-    last_transcription_time: f64,
+
+    // Configuration
+    speech_threshold: f32,
+    period_pause_frames: usize,  // Frames of silence to trigger segment end
 
     // Debug WAV writer
     debug_wav_writer: Option<WavWriter<std::io::BufWriter<std::fs::File>>>,
@@ -172,6 +180,7 @@ struct SpeechInner {
 
 impl SpeechInner {
     fn new(
+        vad: silero::SileroVad,
         model: parakeet::TransducerModel,
         device: candle_core::Device,
     ) -> Result<Self> {
@@ -187,26 +196,37 @@ impl SpeechInner {
             }
         };
 
-        info!("TDT streaming mode: enabled (automatic alignment, no VAD needed)");
+        info!("TDT + VAD streaming mode: enabled (VAD segmentation + TDT transcription)");
 
-        // Create streaming transcriber with config optimized for Node.js use
-        let config = parakeet::StreamingConfig {
-            chunk_samples: 16000,    // 1.0s chunks for reasonable latency
-            overlap_samples: 4800,   // 0.3s overlap
-            emit_partial: true,
-        };
-        let transcriber = parakeet::StreamingTransducer::new(model, config);
+        // Create VAD stream
+        let vad_stream = silero::VadStream::new(vad, &device)
+            .map_err(|e| napi::Error::from_reason(format!("VAD stream error: {}", e)))?;
 
-        // Feature extractor for TDT (128 mel bins)
-        let feat_extractor = parakeet::ParakeetFeatureExtractor::new(128);
+        // Feature extractor for TDT (80 mel bins for standard TDT model)
+        let feat_extractor = parakeet::ParakeetFeatureExtractor::new(80);
+
+        // Pre-buffer: 1 second of audio
+        let pre_buffer_samples = 16000;
+        let pre_buffer = std::collections::VecDeque::with_capacity(pre_buffer_samples);
+
+        // Configuration
+        let speech_threshold = 0.1;  // Low threshold for better capture
+        let period_pause_ms = 500.0;  // 500ms silence = segment end
+        let period_pause_frames = (period_pause_ms / 10.0) as usize;  // 10ms per VAD frame
 
         Ok(Self {
-            transcriber,
+            vad_stream,
+            tdt_model: model,
             feat_extractor,
             device: device.clone(),
-            accumulated_samples: Vec::new(),
+            current_segment: Vec::new(),
+            current_segment_start: None,
+            pre_buffer,
+            silence_frames: 0,
+            was_speech_last_frame: false,
             total_samples_processed: 0,
-            last_transcription_time: 0.0,
+            speech_threshold,
+            period_pause_frames,
             debug_wav_writer,
         })
     }
@@ -225,115 +245,129 @@ impl SpeechInner {
     where
         F: Fn(Transcription),
     {
-        use candle_core::DType;
+        // Push samples to VAD stream - it will process them in chunks and return probabilities
+        let speech_probs = self.vad_stream.push(samples)
+            .map_err(|e| napi::Error::from_reason(format!("VAD error: {}", e)))?;
 
-        // Accumulate samples
-        self.accumulated_samples.extend_from_slice(samples);
-        let chunk_size = 16000; // 1.0s chunks
+        // Process in 10ms chunks (160 samples) with corresponding VAD probabilities
+        const CHUNK_SIZE: usize = 160;
+        let mut offset = 0;
+        let mut prob_idx = 0;
 
-        // Process complete chunks
-        while self.accumulated_samples.len() >= chunk_size {
-            let chunk: Vec<f32> = self.accumulated_samples.drain(..chunk_size).collect();
+        while offset + CHUNK_SIZE <= samples.len() && prob_idx < speech_probs.len() {
+            let chunk = &samples[offset..offset + CHUNK_SIZE];
+            let speech_prob = speech_probs[prob_idx];
+            let is_speech = speech_prob >= self.speech_threshold;
 
-            // Extract features
-            let features = self.feat_extractor.extract_to_tensor(&chunk, &self.device)
-                .map_err(|e| napi::Error::from_reason(format!("Feature extraction error: {}", e)))?;
+            // Update pre-buffer
+            self.pre_buffer.extend(chunk.iter().copied());
+            if self.pre_buffer.len() > 16000 {  // Keep 1s
+                self.pre_buffer.drain(0..(self.pre_buffer.len() - 16000));
+            }
 
-            // Convert to BF16 if on GPU
-            let features = if !self.device.is_cpu() {
-                features.to_dtype(DType::BF16)
-                    .map_err(|e| napi::Error::from_reason(format!("DType conversion error: {}", e)))?
-            } else {
-                features
-            };
-
-            // Process through streaming transcriber
-            let _new_tokens = self.transcriber.process_features(&features)
-                .map_err(|e| napi::Error::from_reason(format!("Transcription error: {}", e)))?;
-
-            // Decode incrementally
-            match self.transcriber.decode_text_incremental() {
-                Ok((new_text, _)) => {
-                    if !new_text.is_empty() {
-                        // Calculate timing
-                        let start_time = self.last_transcription_time;
-                        let end_time = self.total_samples_processed as f64 / 16000.0;
-
-                        info!("Generated transcription: \"{}\" ({:.2}s-{:.2}s)",
-                              new_text.trim(), start_time, end_time);
-
-                        callback(Transcription {
-                            text: new_text.trim().to_string(),
-                            raw_text: new_text.trim().to_string(),
-                            start_time,
-                            end_time,
-                        });
-
-                        self.last_transcription_time = end_time;
-                    }
+            if is_speech {
+                // Start new segment if needed
+                if self.current_segment.is_empty() {
+                    // Add pre-buffer to catch start of speech
+                    self.current_segment.extend(self.pre_buffer.iter().copied());
+                    self.current_segment_start = Some(
+                        (self.total_samples_processed - self.pre_buffer.len()) as f64 / 16000.0
+                    );
+                    info!("Speech started at {:.2}s", self.current_segment_start.unwrap());
                 }
-                Err(e) => {
-                    info!("Decode error: {}", e);
+
+                // Add current chunk
+                self.current_segment.extend_from_slice(chunk);
+                self.silence_frames = 0;
+            } else if !self.current_segment.is_empty() {
+                // In silence but have active segment
+                self.current_segment.extend_from_slice(chunk);
+                self.silence_frames += 1;
+
+                // Check if pause long enough to end segment
+                if self.silence_frames >= self.period_pause_frames {
+                    if let Some(transcription) = self.transcribe_segment()? {
+                        info!("Transcription: \"{}\" ({:.2}s-{:.2}s)",
+                              transcription.text, transcription.start_time, transcription.end_time);
+                        callback(transcription);
+                    }
+
+                    // Reset for next segment
+                    self.current_segment.clear();
+                    self.current_segment_start = None;
+                    self.silence_frames = 0;
                 }
             }
 
-            self.total_samples_processed += chunk_size;
+            self.was_speech_last_frame = is_speech;
+            self.total_samples_processed += CHUNK_SIZE;
+            offset += CHUNK_SIZE;
+            prob_idx += 1;
         }
 
         Ok(())
+    }
+
+    fn transcribe_segment(&mut self) -> Result<Option<Transcription>> {
+        use candle_core::DType;
+
+        if self.current_segment.len() < 4000 {  // Skip very short segments (< 250ms)
+            return Ok(None);
+        }
+
+        let start_time = self.current_segment_start.unwrap_or(0.0);
+        let end_time = start_time + (self.current_segment.len() as f64 / 16000.0);
+
+        // Extract features
+        let features = self.feat_extractor.extract_to_tensor(&self.current_segment, &self.device)
+            .map_err(|e| napi::Error::from_reason(format!("Feature extraction error: {}", e)))?;
+
+        // Convert to BF16 if on GPU
+        let features = if !self.device.is_cpu() {
+            features.to_dtype(DType::BF16)
+                .map_err(|e| napi::Error::from_reason(format!("DType conversion error: {}", e)))?
+        } else {
+            features
+        };
+
+        // Run TDT greedy decode
+        let tokens = self.tdt_model.greedy_decode(&features)
+            .map_err(|e| napi::Error::from_reason(format!("TDT decode error: {}", e)))?;
+
+        if tokens.is_empty() {
+            return Ok(None);
+        }
+
+        // Decode tokens to text
+        let text = self.tdt_model.decode_tokens(&tokens)
+            .map_err(|e| napi::Error::from_reason(format!("Token decode error: {}", e)))?;
+
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(Transcription {
+            text: text.trim().to_string(),
+            raw_text: text.trim().to_string(),
+            start_time,
+            end_time,
+        }))
     }
 
     fn flush<F>(&mut self, callback: &F) -> Result<()>
     where
         F: Fn(Transcription),
     {
-        use candle_core::DType;
-
-        // Process any remaining accumulated samples
-        if !self.accumulated_samples.is_empty() {
-            let chunk = self.accumulated_samples.clone();
-            self.accumulated_samples.clear();
-
-            // Extract features
-            let features = self.feat_extractor.extract_to_tensor(&chunk, &self.device)
-                .map_err(|e| napi::Error::from_reason(format!("Feature extraction error: {}", e)))?;
-
-            // Convert to BF16 if on GPU
-            let features = if !self.device.is_cpu() {
-                features.to_dtype(DType::BF16)
-                    .map_err(|e| napi::Error::from_reason(format!("DType conversion error: {}", e)))?
-            } else {
-                features
-            };
-
-            // Process through streaming transcriber
-            let _new_tokens = self.transcriber.process_features(&features)
-                .map_err(|e| napi::Error::from_reason(format!("Transcription error: {}", e)))?;
-
-            self.total_samples_processed += chunk.len();
-        }
-
-        // Get final transcription
-        match self.transcriber.decode_text() {
-            Ok(final_text) => {
-                if !final_text.is_empty() {
-                    let start_time = self.last_transcription_time;
-                    let end_time = self.total_samples_processed as f64 / 16000.0;
-
-                    info!("Flush: Final transcription: \"{}\" ({:.2}s-{:.2}s)",
-                          final_text.trim(), start_time, end_time);
-
-                    callback(Transcription {
-                        text: final_text.trim().to_string(),
-                        raw_text: final_text.trim().to_string(),
-                        start_time,
-                        end_time,
-                    });
-                }
+        // Transcribe any remaining segment
+        if !self.current_segment.is_empty() {
+            if let Some(transcription) = self.transcribe_segment()? {
+                info!("Flush transcription: \"{}\" ({:.2}s-{:.2}s)",
+                      transcription.text, transcription.start_time, transcription.end_time);
+                callback(transcription);
             }
-            Err(e) => {
-                info!("Flush decode error: {}", e);
-            }
+
+            self.current_segment.clear();
+            self.current_segment_start = None;
         }
 
         Ok(())
@@ -371,6 +405,12 @@ impl Speech {
         let device = parakeet::get_device()
             .map_err(|e| napi::Error::from_reason(format!("Device error: {}", e))).unwrap();
 
+        info!("Loading Silero VAD...");
+        // Load VAD model for speech detection
+        let vad = silero::SileroVad::load(&assets, &device)
+            .map_err(|e| napi::Error::from_reason(format!("Failed to load VAD: {}", e))).unwrap();
+        info!("✓ VAD loaded");
+
         info!("Loading Parakeet TDT model...");
         // Load TDT model from assets directory
         let mut model = parakeet::load_parakeet_tdt_from_local(
@@ -384,10 +424,11 @@ impl Speech {
         model.load_tokenizer(&assets)
             .map_err(|e| napi::Error::from_reason(format!("Failed to load tokenizer: {}", e))).unwrap();
 
-        info!("Models loaded successfully");
+        info!("Models loaded successfully (VAD + TDT)");
 
-        // Create inner state with TDT streaming
+        // Create inner state with VAD + TDT streaming
         let inner = SpeechInner::new(
+            vad,
             model,
             device,
         ).unwrap();

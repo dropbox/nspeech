@@ -1,26 +1,13 @@
-/// Cache-Aware Streaming Transcription
+/// Test streaming model with correct chunk configuration
 ///
-/// This implements true cache-aware streaming with:
-/// - Attention K/V caching across chunks
-/// - Convolution state caching
-/// - Greedy decoding with predictor state maintenance
-/// - Zero redundant computations
-///
-/// **Performance**: Achieves 84% of NeMo reference quality (189 tokens vs 225 tokens)
-///
-/// **Model**: Uses nvidia/parakeet-tdt-0.6b (standard TDT model)
-/// - 4.5-second chunks (optimal for quality - tested empirically)
-/// - 70-frame cache (5.6s of past context)
-/// - 128 mel bins
-/// - vocab_size=8192, blank_id=8192
-///
-/// **Note**: nvidia/nemotron-speech-streaming-en-0.6b (streaming-specific model)
-/// is not working yet due to blank token domination issue (joint network predicts
-/// blank with 99% confidence). See STREAMING_MODEL_INVESTIGATION.md for details.
+/// Uses nvidia/nemotron-speech-streaming-en-0.6b with:
+/// - 1.04s chunks (as designed, from att_context_size [70, 13])
+/// - 136 mel bins
+/// - vocab_size=1024, blank_id=1024
 
 use anyhow::Result;
 use speech::parakeet::{
-    get_device, load_parakeet_tdt_from_local,
+    get_device, load_parakeet_streaming_tdt_from_local,
     ParakeetFeatureExtractor,
     streaming_encoder::StreamingEncoderCache,
 };
@@ -37,25 +24,22 @@ fn main() -> Result<()> {
     let device = get_device()?;
     println!("Device: {:?}\n", device);
 
-    // Load TDT model with BF16 safetensors (full precision)
-    println!("Loading TDT model (BF16 safetensors)...");
-    let mut model = load_parakeet_tdt_from_local(".cache/parakeet-tdt", &device)?;
+    // Load Streaming TDT model (BF16 safetensors)
+    println!("Loading Streaming TDT model (BF16 safetensors)...");
+    let mut model = load_parakeet_streaming_tdt_from_local(".cache/parakeet-streaming-tdt", &device)?;
     println!("✓ Model loaded");
     println!("  Vocab size: {}", model.config.vocab_size);
     println!("  Blank ID: {}", model.config.blank_id);
-    println!("  Encoder layers: {}", model.encoder.cfg.num_layers);
-    println!("  d_model: {}", model.encoder.cfg.d_model);
-    println!("  Num heads: {}", model.encoder.cfg.num_heads);
-    println!("  Conv kernel size: {}\n", model.encoder.cfg.conv_kernel_size);
+    println!("  Encoder d_model: {}", model.encoder.cfg.d_model);
+    println!("  Feature dimension: {}\n", model.encoder.cfg.feat_in);
 
     // Load tokenizer
     println!("Loading tokenizer...");
-    model.load_tokenizer(".cache/parakeet-tdt")?;
+    model.load_tokenizer(".cache/parakeet-streaming-tdt")?;
     println!("✓ Tokenizer loaded\n");
 
     // Load audio
     println!("Loading audio...");
-
     let audio_path = &args[1];
     let mut reader = hound::WavReader::open(&audio_path)?;
     let audio_samples: Vec<f32> = reader
@@ -66,26 +50,21 @@ fn main() -> Result<()> {
     let duration = audio_samples.len() as f64 / 16000.0;
     println!("✓ Audio loaded: {:.2}s ({} samples)\n", duration, audio_samples.len());
 
-    // Streaming configuration based on NeMo's att_context_size=[70, 13]
-    // This means: left_context=70 frames, right_context=13 frames
-    // After 8x subsampling: 13 frames * 80ms = 1040ms chunks
-    // At mel level: 13 * 8 = 104 mel frames per chunk
-    // In samples: 104 frames * 160 samples/hop = 16,640 samples
+    // Streaming configuration based on att_context_size=[70, 13]
+    // 13 encoder frames * 8 subsampling * 160 samples/hop = 16,640 samples ≈ 1.04s
+    let chunk_size_samples = 16640;  // 1.04s chunks
+    let max_cache_frames = 70;  // Left context from att_context_size
 
-    // OPTIMAL: 4-5 second chunks for best quality (tested empirically)
-    // Below 3.5s chunks, quality collapses due to unfavorable cache:current ratio
-    let chunk_duration_s = 4.5; // seconds
-    let chunk_size_samples = (chunk_duration_s * 16000.0) as usize;
-    let max_cache_frames = 70; // NeMo's left context
-
-    println!("=== Cache-Aware Streaming Configuration ===");
+    println!("=== Streaming Configuration ===");
     println!("  Chunk size: {} samples ({:.2}s)", chunk_size_samples, chunk_size_samples as f64 / 16000.0);
     println!("  Max cache frames: {} (past context)", max_cache_frames);
-    println!("  Cache duration: ~{:.1}s\n", max_cache_frames as f64 * 0.08);
+    println!("  Expected encoder frames per chunk: ~13\n");
 
-    // Feature extractor
+    // Feature extractor (136 mel bins for streaming model)
+    // CRITICAL: Streaming model uses normalize='NA' (no normalization)
     let num_mel_bins = model.encoder.cfg.feat_in;
-    let feat_extractor = ParakeetFeatureExtractor::new(num_mel_bins);
+    println!("Using {} mel bins for feature extraction (NO NORMALIZATION)", num_mel_bins);
+    let feat_extractor = ParakeetFeatureExtractor::new_with_config(num_mel_bins, false);
 
     // Initialize streaming cache
     let batch_size = 1;
@@ -101,7 +80,6 @@ fn main() -> Result<()> {
         DType::F32
     };
 
-    println!("Initializing encoder cache...");
     let mut encoder_cache = StreamingEncoderCache::with_capacity(
         num_layers,
         batch_size,
@@ -113,7 +91,6 @@ fn main() -> Result<()> {
         &device,
         dtype,
     )?;
-    println!("✓ Cache initialized\n");
 
     // Streaming state for greedy decoder
     let mut pred_states = None;
@@ -122,7 +99,7 @@ fn main() -> Result<()> {
     let mut decoded_count = 0;
 
     // Process audio in chunks
-    println!("=== Streaming Transcription ===\n");
+    println!("\n=== Streaming Transcription ===\n");
     let mut offset = 0;
     let mut chunk_num = 0;
 
@@ -144,24 +121,30 @@ fn main() -> Result<()> {
             features
         };
 
-        // Run encoder with cache (zero redundant computation!)
+        // Run encoder with cache
         let encoder_out = model.encoder.forward_with_cache(&features, false, Some(&mut encoder_cache))?;
 
-        // Run streaming greedy decode with maintained predictor state
+        // Check encoder output dimensions
+        if chunk_num == 1 {
+            let (_, enc_frames, _) = encoder_out.dims3()?;
+            println!("(encoder produced {} frames) ", enc_frames);
+        }
+
+        // Run streaming greedy decode
         let (new_tokens, new_states, new_last_token) = model.greedy_decode_streaming(
             &encoder_out,
             pred_states,
             last_token,
         )?;
 
-        // Update decoder state for next chunk
+        // Update decoder state
         pred_states = new_states;
         last_token = new_last_token;
 
         // Accumulate tokens
         all_tokens.extend_from_slice(&new_tokens);
 
-        // Decode and print new text incrementally
+        // Decode incrementally
         if !new_tokens.is_empty() {
             let new_text = model.decode_tokens_incremental(&all_tokens, decoded_count)?;
             if !new_text.is_empty() {
@@ -170,9 +153,9 @@ fn main() -> Result<()> {
             }
             decoded_count = all_tokens.len();
         }
-        println!(); // Newline after each chunk
+        println!();
 
-        // Move to next chunk (no overlap - cache handles continuity)
+        // Move to next chunk
         offset += chunk_size_samples;
     }
 
@@ -180,7 +163,7 @@ fn main() -> Result<()> {
     println!("  Audio duration: {:.2}s", duration);
     println!("  Total chunks: {}", chunk_num);
     println!("  Total tokens: {}", all_tokens.len());
-    println!("  First 10 token IDs: {:?}", &all_tokens[..all_tokens.len().min(10)]);
+    println!("  First 20 token IDs: {:?}", &all_tokens[..all_tokens.len().min(20)]);
 
     // Full transcription
     let full_text = model.decode_tokens(&all_tokens)?;
@@ -188,8 +171,8 @@ fn main() -> Result<()> {
     println!("{}", full_text);
 
     println!("\n=== Quality Comparison ===");
-    println!("  NeMo reference (streaming model): 225 tokens");
-    println!("  Cache-aware streaming (greedy): {} tokens ({:.1}%)", all_tokens.len(), all_tokens.len() as f32 / 225.0 * 100.0);
+    println!("  NeMo reference: 225 tokens");
+    println!("  Our streaming: {} tokens ({:.1}%)", all_tokens.len(), all_tokens.len() as f32 / 225.0 * 100.0);
 
     // Cache statistics
     if let Some(first_cache) = encoder_cache.attention_caches.first() {
