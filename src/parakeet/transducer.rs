@@ -379,10 +379,19 @@ impl TransducerModel {
     ///
     /// Tries to load either tokenizer.json (HuggingFace format) or
     /// tokenizer.model (SentencePiece format).
+    /// First tries embedded assets, then falls back to filesystem.
     pub fn load_tokenizer<P: AsRef<Path>>(&mut self, dir: P) -> Result<()> {
         let dir = dir.as_ref();
+        let dir_pathbuf = dir.to_path_buf();
 
-        // Try HuggingFace tokenizer.json first (easier to load)
+        // Try loading from embedded assets first
+        if let Ok(tok_bytes) = TDT_TOKENIZER_JSON.bytes(&dir_pathbuf) {
+            self.tokenizer = Some(Tokenizer::from_bytes(tok_bytes)
+                .map_err(|e| anyhow!("Failed to parse embedded TDT_TOKENIZER_JSON: {}", e))?);
+            return Ok(());
+        }
+
+        // Fall back to filesystem: Try HuggingFace tokenizer.json
         let json_path = dir.join("tokenizer.json");
         if json_path.exists() {
             self.tokenizer = Some(Tokenizer::from_file(&json_path)
@@ -400,7 +409,7 @@ impl TransducerModel {
         }
 
         Err(anyhow!(
-            "No tokenizer found in {:?} (tried tokenizer.json and tokenizer.model)",
+            "No tokenizer found (tried embedded assets and {:?})",
             dir
         ))
     }
@@ -1331,12 +1340,25 @@ pub fn load_parakeet_tdt_from_local<P: AsRef<Path>>(
     dir: P,
     device: &Device,
 ) -> Result<TransducerModel> {
-    let dir = dir.as_ref();
-    let config_path = dir.join("config.json");
+    use std::io::{Error, ErrorKind};
 
-    // TEMPORARY: Load directly from filesystem to debug
-    let cfg_json = std::fs::read_to_string(&config_path)?;
-    let hf_cfg: HfTransducerConfig = serde_json::from_str(&cfg_json)?;
+    let dir = dir.as_ref();
+    let dir_pathbuf = dir.to_path_buf();
+
+    // Load config from embedded asset
+    println!("  Loading config from embedded assets...");
+    let cfg_bytes = TDT_CONFIG.bytes(&dir_pathbuf).map_err(|_| {
+        Error::new(
+            ErrorKind::Other,
+            "failed to get decompressed bytes for TDT_CONFIG",
+        )
+    })?;
+    let hf_cfg: HfTransducerConfig = serde_json::from_slice(cfg_bytes).map_err(|e| {
+        Error::new(
+            ErrorKind::Other,
+            format!("failed to parse TDT_CONFIG as JSON: {e}"),
+        )
+    })?;
     let tdt_cfg = TransducerConfig::from_hf(&hf_cfg);
 
     // Manually construct encoder config from TDT config structure
@@ -1367,10 +1389,18 @@ pub fn load_parakeet_tdt_from_local<P: AsRef<Path>>(
 
     println!("Loading TDT model with {:?} dtype", dtype);
 
-    // TEMPORARY: Load directly from filesystem to debug
-    println!("  Loading model weights from filesystem...");
-    let weights_path = dir.join("model.safetensors");
-    let tensors_raw: HashMap<String, Tensor> = candle_core::safetensors::load(&weights_path, device)?;
+    // Load model weights from embedded asset
+    println!("  Loading model weights from embedded assets...");
+    let model_bytes = TDT_MODEL.bytes(&dir_pathbuf).map_err(|_| {
+        Error::new(
+            ErrorKind::Other,
+            "failed to get decompressed bytes for TDT_MODEL",
+        )
+    })?;
+
+    // Load safetensors from memory
+    let tensors_raw: HashMap<String, Tensor> =
+        candle_core::safetensors::load_buffer(model_bytes, device)?;
 
     println!("  Loading and remapping NeMo tensors...");
 
