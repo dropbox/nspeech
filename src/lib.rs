@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, Mutex, mpsc},
 };
 
-use log::{info, LevelFilter, Log, Metadata, Record};
+use log::{info, warn, LevelFilter, Log, Metadata, Record};
 use napi::bindgen_prelude::{Function, Unknown};
 use napi::threadsafe_function::{ThreadsafeFunctionCallMode, ThreadsafeCallContext};
 use once_cell::sync::OnceCell;
@@ -157,8 +157,8 @@ pub struct Transcription {
 
 /// Inner state for transcription stream
 struct SpeechInner {
-    vad_stream: silero::VadStream,
-    tdt_model: parakeet::TransducerModel,
+    vad_stream: Option<silero::VadStream>,
+    tdt_model: Option<parakeet::TransducerModel>,
     feat_extractor: parakeet::ParakeetFeatureExtractor,
     device: candle_core::Device,
 
@@ -180,10 +180,10 @@ struct SpeechInner {
 
 impl SpeechInner {
     fn new(
-        vad: silero::SileroVad,
-        model: parakeet::TransducerModel,
+        vad: Option<silero::SileroVad>,
+        model: Option<parakeet::TransducerModel>,
         device: candle_core::Device,
-    ) -> Result<Self> {
+    ) -> Self {
         // Create debug WAV writer
         let debug_wav_writer = match Self::create_debug_wav_writer() {
             Ok(writer) => {
@@ -198,9 +198,14 @@ impl SpeechInner {
 
         info!("TDT + VAD streaming mode: enabled (VAD segmentation + TDT transcription)");
 
-        // Create VAD stream
-        let vad_stream = silero::VadStream::new(vad, &device)
-            .map_err(|e| napi::Error::from_reason(format!("VAD stream error: {}", e)))?;
+        // Create VAD stream if VAD was loaded successfully
+        let vad_stream = vad.and_then(|v| match silero::VadStream::new(v, &device) {
+            Ok(stream) => Some(stream),
+            Err(e) => {
+                warn!("VAD stream could not be created: {}", e);
+                None
+            }
+        });
 
         // Feature extractor for TDT (80 mel bins for standard TDT model)
         let feat_extractor = parakeet::ParakeetFeatureExtractor::new(80);
@@ -214,7 +219,7 @@ impl SpeechInner {
         let period_pause_ms = 500.0;  // 500ms silence = segment end
         let period_pause_frames = (period_pause_ms / 10.0) as usize;  // 10ms per VAD frame
 
-        Ok(Self {
+        Self {
             vad_stream,
             tdt_model: model,
             feat_extractor,
@@ -228,7 +233,7 @@ impl SpeechInner {
             speech_threshold,
             period_pause_frames,
             debug_wav_writer,
-        })
+        }
     }
 
     fn create_debug_wav_writer() -> std::result::Result<WavWriter<std::io::BufWriter<std::fs::File>>, hound::Error> {
@@ -245,8 +250,14 @@ impl SpeechInner {
     where
         F: Fn(Transcription),
     {
+        // Check if VAD stream is available
+        let vad_stream = match self.vad_stream.as_mut() {
+            Some(stream) => stream,
+            None => return Ok(()), // Fail silently if VAD not available
+        };
+
         // Push samples to VAD stream - it will process them in chunks and return probabilities
-        let speech_probs = self.vad_stream.push(samples)
+        let speech_probs = vad_stream.push(samples)
             .map_err(|e| napi::Error::from_reason(format!("VAD error: {}", e)))?;
 
         // Process in 10ms chunks (160 samples) with corresponding VAD probabilities
@@ -311,6 +322,12 @@ impl SpeechInner {
     fn transcribe_segment(&mut self) -> Result<Option<Transcription>> {
         use candle_core::DType;
 
+        // Check if TDT model is available
+        let tdt_model = match self.tdt_model.as_ref() {
+            Some(model) => model,
+            None => return Ok(None), // Fail silently if model not available
+        };
+
         if self.current_segment.len() < 4000 {  // Skip very short segments (< 250ms)
             return Ok(None);
         }
@@ -331,7 +348,7 @@ impl SpeechInner {
         };
 
         // Run TDT greedy decode
-        let tokens = self.tdt_model.greedy_decode(&features)
+        let tokens = tdt_model.greedy_decode(&features)
             .map_err(|e| napi::Error::from_reason(format!("TDT decode error: {}", e)))?;
 
         if tokens.is_empty() {
@@ -339,7 +356,7 @@ impl SpeechInner {
         }
 
         // Decode tokens to text
-        let text = self.tdt_model.decode_tokens(&tokens)
+        let text = tdt_model.decode_tokens(&tokens)
             .map_err(|e| napi::Error::from_reason(format!("Token decode error: {}", e)))?;
 
         if text.trim().is_empty() {
@@ -402,36 +419,58 @@ impl Speech {
         let assets = PathBuf::from(assets);
 
         // Get device
-        let device = parakeet::get_device()
-            .map_err(|e| napi::Error::from_reason(format!("Device error: {}", e))).unwrap();
+        let device = match parakeet::get_device() {
+            Ok(device) => device,
+            Err(e) => {
+                warn!("Device could not be initialized: {}", e);
+                // Use CPU as fallback
+                candle_core::Device::Cpu
+            }
+        };
 
         info!("Loading Silero VAD...");
         // Load VAD model for speech detection
-        let vad = silero::SileroVad::load(&assets, &device)
-            .map_err(|e| napi::Error::from_reason(format!("Failed to load VAD: {}", e))).unwrap();
-        info!("✓ VAD loaded");
+        let vad = match silero::SileroVad::load(&assets, &device) {
+            Ok(vad) => {
+                info!("✓ VAD loaded");
+                Some(vad)
+            }
+            Err(e) => {
+                warn!("Failed to load VAD: {}", e);
+                None
+            }
+        };
 
         info!("Loading Parakeet TDT model...");
         // Load TDT model from assets directory
-        let mut model = parakeet::load_parakeet_tdt_from_local(
-            &assets,
-            &device,
-        )
-        .map_err(|e| napi::Error::from_reason(format!("Failed to load TDT model: {}", e))).unwrap();
+        let model = match parakeet::load_parakeet_tdt_from_local(&assets, &device) {
+            Ok(mut model) => {
+                info!("Loading tokenizer...");
+                match model.load_tokenizer(&assets) {
+                    Ok(_) => {
+                        info!("✓ TDT model and tokenizer loaded");
+                        Some(model)
+                    }
+                    Err(e) => {
+                        warn!("Failed to load tokenizer: {}", e);
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to load TDT model: {}", e);
+                None
+            }
+        };
 
-        info!("Loading tokenizer...");
-        // Load tokenizer
-        model.load_tokenizer(&assets)
-            .map_err(|e| napi::Error::from_reason(format!("Failed to load tokenizer: {}", e))).unwrap();
-
-        info!("Models loaded successfully (VAD + TDT)");
+        if vad.is_some() && model.is_some() {
+            info!("Models loaded successfully (VAD + TDT)");
+        } else {
+            warn!("Some models failed to load - transcription will not work");
+        }
 
         // Create inner state with VAD + TDT streaming
-        let inner = SpeechInner::new(
-            vad,
-            model,
-            device,
-        ).unwrap();
+        let inner = SpeechInner::new(vad, model, device);
 
         // Create threadsafe callback and wrap in Arc so it can be cloned for async tasks
         // Safety: We're intentionally leaking the callback reference to make it 'static
