@@ -13,6 +13,7 @@ use candle_core::{DType, Device, Module, Tensor, D};
 use candle_nn::{embedding, linear, rnn, Embedding, Linear, VarBuilder};
 use serde::Deserialize;
 use tokenizers::{Tokenizer, models::unigram::Unigram};
+use log::{info, warn, debug};
 
 use super::fast_conformer::{FastConformerConfig, FastConformerEncoder, HfEncoderConfig};
 use hf_hub::api::sync::Api;
@@ -473,11 +474,11 @@ impl TransducerModel {
         let mut last_token = self.config.blank_id as u32;
 
         // Decode all timesteps
-        println!("  Decoding {} timesteps...", time_steps);
+        debug!("  Decoding {} timesteps...", time_steps);
 
         for t in 0..time_steps {
             if t % 50 == 0 {
-                println!("  Progress: {}/{} timesteps, {} tokens decoded", t, time_steps, decoded.len());
+                debug!("  Progress: {}/{} timesteps, {} tokens decoded", t, time_steps, decoded.len());
             }
 
             // Inner loop: keep predicting until blank
@@ -493,7 +494,7 @@ impl TransducerModel {
                     pred_states = None;
                     last_token = self.config.blank_id as u32;
                     if t % 50 == 0 {
-                        println!("    WARNING: Hit max inner steps at timestep {}, resetting state", t);
+                        warn!("    WARNING: Hit max inner steps at timestep {}, resetting state", t);
                     }
                     break;
                 }
@@ -567,7 +568,7 @@ impl TransducerModel {
             }
         }
 
-        println!("  Decoded {} tokens total", decoded.len());
+        debug!("  Decoded {} tokens total", decoded.len());
         Ok(decoded)
     }
 
@@ -938,15 +939,15 @@ impl TransducerModel {
         // Start with blank token from config (should be 0 for this model)
         let mut last_token = self.config.blank_id as u32;
 
-        eprintln!("[DECODE] Starting greedy decode (blank_id={}, vocab_size={})",
+        debug!("[DECODE] Starting greedy decode (blank_id={}, vocab_size={})",
                  self.config.blank_id, self.config.vocab_size);
 
         // Decode all timesteps now that special tokens are handled correctly
-        println!("  Decoding {} timesteps...", time_steps);
+        debug!("  Decoding {} timesteps...", time_steps);
 
         for t in 0..time_steps {
             if t % 50 == 0 {
-                println!("  Progress: {}/{} timesteps, {} tokens decoded", t, time_steps, decoded.len());
+                debug!("  Progress: {}/{} timesteps, {} tokens decoded", t, time_steps, decoded.len());
             }
 
             // Inner loop: keep predicting until blank
@@ -964,7 +965,7 @@ impl TransducerModel {
                     pred_states = None;
                     last_token = self.config.blank_id as u32;
                     if t % 50 == 0 {
-                        println!("    WARNING: Hit max inner steps at timestep {}, resetting state", t);
+                        warn!("    WARNING: Hit max inner steps at timestep {}, resetting state", t);
                     }
                     break;
                 }
@@ -1015,28 +1016,28 @@ impl TransducerModel {
 
                 // Debug first 3 timesteps
                 if t < 3 {
-                    eprintln!("[DECODE t={} inner={}] Token selected: {} (blank={}, vocab_size={})",
+                    debug!("[DECODE t={} inner={}] Token selected: {} (blank={}, vocab_size={})",
                              t, inner_steps, token, self.config.blank_id, self.config.vocab_size);
                     if inner_steps == 1 {
                         match log_probs_masked.to_vec1() {
                             Ok(top_logits) => {
                                 let mut indexed: Vec<(usize, f32)> = top_logits.iter().copied().enumerate().collect();
                                 indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-                                eprintln!("  Top 5 predictions:");
+                                debug!("  Top 5 predictions:");
                                 for (idx, score) in indexed.iter().take(5) {
-                                    eprintln!("    Token {}: {:.3}", idx, score);
+                                    debug!("    Token {}: {:.3}", idx, score);
                                 }
                                 // Check if token 800 is in top 20
                                 let token_800_rank = indexed.iter().position(|(idx, _)| *idx == 800);
                                 if let Some(rank) = token_800_rank {
                                     let score = indexed[rank].1;
-                                    eprintln!("  Token 800 (NeMo's first): rank {}, score {:.3}", rank + 1, score);
+                                    debug!("  Token 800 (NeMo's first): rank {}, score {:.3}", rank + 1, score);
                                 } else {
-                                    eprintln!("  Token 800 not in top predictions");
+                                    debug!("  Token 800 not in top predictions");
                                 }
                             }
                             Err(e) => {
-                                eprintln!("  ERROR extracting logits: {}", e);
+                                warn!("  ERROR extracting logits: {}", e);
                             }
                         }
                     }
@@ -1049,7 +1050,7 @@ impl TransducerModel {
                         if repetition_count >= 3 {
                             // Force blank to break repetition loop
                             if t % 50 == 0 {
-                                println!("    Detected repetition of token {}, forcing blank", token);
+                                debug!("    Detected repetition of token {}, forcing blank", token);
                             }
                             break;
                         }
@@ -1067,7 +1068,7 @@ impl TransducerModel {
                 if token == self.config.blank_id as u32 {
                     // Blank: move to next timestep
                     if t < 3 {
-                        eprintln!("[DECODE t={}] Emitted blank, moving to next timestep", t);
+                        debug!("[DECODE t={}] Emitted blank, moving to next timestep", t);
                     }
                     break;
                 } else if token >= self.config.vocab_size as u32 {
@@ -1081,7 +1082,7 @@ impl TransducerModel {
             }
         }
 
-        println!("  Decoded {} tokens total", decoded.len());
+        debug!("  Decoded {} tokens total", decoded.len());
         Ok(decoded)
     }
 
@@ -1096,7 +1097,7 @@ impl TransducerModel {
             return Err(anyhow!("Beam decode currently only supports batch_size=1"));
         }
 
-        println!("  Beam decoding (beam_size={}) {} timesteps...", beam_size, time_steps);
+        debug!("  Beam decoding (beam_size={}) {} timesteps...", beam_size, time_steps);
 
         // Initialize beam with single hypothesis
         let init_state = self.predictor.init_states(1, encoder_out.device())?;
@@ -1113,7 +1114,7 @@ impl TransducerModel {
         for t in 0..time_steps {
             /*
             if t % 50 == 0 {
-                println!("  Progress: {}/{} timesteps, beam size: {}, completed: {}",
+                debug!("  Progress: {}/{} timesteps, beam size: {}, completed: {}",
                          t, time_steps, beam.len(), completed.len());
             }
             */
@@ -1236,7 +1237,7 @@ impl TransducerModel {
         let best = completed.first()
             .ok_or_else(|| anyhow!("No hypotheses generated"))?;
 
-        println!("  Decoded {} tokens with beam search (score: {:.2})", best.tokens.len(), best.score);
+        debug!("  Decoded {} tokens with beam search (score: {:.2})", best.tokens.len(), best.score);
         Ok(best.tokens.clone())
     }
 }
@@ -1346,7 +1347,7 @@ pub fn load_parakeet_tdt_from_local<P: AsRef<Path>>(
     let dir_pathbuf = dir.to_path_buf();
 
     // Load config from embedded asset
-    println!("  Loading config from embedded assets...");
+    info!("  Loading config from embedded assets...");
     let cfg_bytes = TDT_CONFIG.bytes(&dir_pathbuf).map_err(|_| {
         Error::new(
             ErrorKind::Other,
@@ -1387,10 +1388,10 @@ pub fn load_parakeet_tdt_from_local<P: AsRef<Path>>(
         DType::BF16  // Use BF16 on GPU (matches training dtype)
     };
 
-    println!("Loading TDT model with {:?} dtype", dtype);
+    info!("Loading TDT model with {:?} dtype", dtype);
 
     // Load model weights from embedded asset
-    println!("  Loading model weights from embedded assets...");
+    info!("  Loading model weights from embedded assets...");
     let model_bytes = TDT_MODEL.bytes(&dir_pathbuf).map_err(|_| {
         Error::new(
             ErrorKind::Other,
@@ -1402,14 +1403,14 @@ pub fn load_parakeet_tdt_from_local<P: AsRef<Path>>(
     let tensors_raw: HashMap<String, Tensor> =
         candle_core::safetensors::load_buffer(model_bytes, device)?;
 
-    println!("  Loading and remapping NeMo tensors...");
+    info!("  Loading and remapping NeMo tensors...");
 
     // Remap tensor names from NeMo format to our expected format
     let mut tensors = HashMap::new();
     for (nemo_name, tensor) in tensors_raw {
         let our_name = remap_nemo_tensor_name(&nemo_name);
         if our_name != nemo_name {
-            println!("    {} -> {}", nemo_name, our_name);
+            debug!("    {} -> {}", nemo_name, our_name);
         }
         // Convert tensors to target dtype
         let tensor_converted = if tensor.dtype() != dtype {
@@ -1526,10 +1527,10 @@ pub fn load_parakeet_tdt_from_hf(
         DType::BF16  // Use BF16 on GPU (matches training dtype)
     };
 
-    println!("Loading TDT model from HF with {:?} dtype", dtype);
+    info!("Loading TDT model from HF with {:?} dtype", dtype);
 
     // Load safetensors and remap NeMo tensor names to our expected format
-    println!("  Loading and remapping NeMo tensors...");
+    info!("  Loading and remapping NeMo tensors...");
     let tensors_raw: HashMap<String, Tensor> = candle_core::safetensors::load(&weights_path, device)?;
 
     // Remap tensor names from NeMo format to our expected format
@@ -1617,10 +1618,10 @@ pub fn load_parakeet_tdt_from_gguf_local<P: AsRef<Path>>(
 
     let assets = dir.as_ref().to_path_buf();
 
-    println!("Loading TDT model with Q8_0 quantization (recommended, compressed)");
+    info!("Loading TDT model with Q8_0 quantization (recommended, compressed)");
 
     // Load config from embedded asset
-    println!("  Loading config from assets...");
+    info!("  Loading config from assets...");
     let cfg_bytes = TDT_CONFIG.bytes(&assets).map_err(|_| {
         Error::new(
             ErrorKind::Other,
@@ -1655,7 +1656,7 @@ pub fn load_parakeet_tdt_from_gguf_local<P: AsRef<Path>>(
     };
 
     // Load tokenizer from embedded asset
-    println!("  Loading tokenizer from assets...");
+    info!("  Loading tokenizer from assets...");
     let tok_bytes = TDT_TOKENIZER_JSON.bytes(&assets).map_err(|_| {
         Error::new(
             ErrorKind::Other,
@@ -1666,7 +1667,7 @@ pub fn load_parakeet_tdt_from_gguf_local<P: AsRef<Path>>(
         .map_err(|e| Error::new(ErrorKind::Other, format!("failed to parse TDT_TOKENIZER_JSON: {e}")))?;
 
     // Load GGUF from embedded asset (already decompressed by embed_zst_asset macro)
-    println!("  Loading GGUF file from assets...");
+    info!("  Loading GGUF file from assets...");
     let gguf_bytes = TDT_MODEL_Q8_0_GGUF.bytes(&assets).map_err(|_| {
         Error::new(
             ErrorKind::Other,
@@ -1676,7 +1677,7 @@ pub fn load_parakeet_tdt_from_gguf_local<P: AsRef<Path>>(
 
     // For quantized models, we need to dequantize to FP32/BF16 for inference
     // TDT uses LSTM which doesn't support quantized operations yet
-    println!("  Dequantizing GGUF to tensors...");
+    info!("  Dequantizing GGUF to tensors...");
 
     // Determine target dtype
     let dtype = if device.is_cpu() {
@@ -1685,7 +1686,7 @@ pub fn load_parakeet_tdt_from_gguf_local<P: AsRef<Path>>(
         DType::BF16  // Use BF16 on GPU (matches training dtype)
     };
 
-    println!("    Target dtype: {:?}", dtype);
+    debug!("    Target dtype: {:?}", dtype);
 
     // Load GGUF and dequantize tensors
     let gguf_file = candle_core::quantized::gguf_file::Content::read(&mut std::io::Cursor::new(gguf_bytes))?;
@@ -1758,17 +1759,17 @@ pub fn load_parakeet_tdt_from_gguf_local<P: AsRef<Path>>(
         }
     }
 
-    println!("    ✓ Dequantized {} tensors", tensors.len());
-    println!("    ✓ Added zero biases and batch norm stats for NeMo compatibility");
+    info!("    ✓ Dequantized {} tensors", tensors.len());
+    info!("    ✓ Added zero biases and batch norm stats for NeMo compatibility");
 
     let vb = VarBuilder::from_tensors(tensors, dtype, device);
 
     // Build encoder
-    println!("  Building encoder...");
+    info!("  Building encoder...");
     let encoder = FastConformerEncoder::new(encoder_cfg.clone(), vb.pp("encoder"))?;
 
     // Build full transducer model
-    println!("  Building transducer model...");
+    info!("  Building transducer model...");
     let mut model = TransducerModel::new(
         encoder,
         tdt_cfg,
@@ -1779,7 +1780,7 @@ pub fn load_parakeet_tdt_from_gguf_local<P: AsRef<Path>>(
     // Store tokenizer
     model.tokenizer = Some(tokenizer);
 
-    println!("  ✓ TDT model loaded successfully (quantized)");
+    info!("  ✓ TDT model loaded successfully (quantized)");
 
     Ok(model)
 }
@@ -1819,13 +1820,13 @@ pub fn load_parakeet_streaming_tdt_from_local<P: AsRef<Path>>(
         DType::BF16
     };
 
-    println!("Loading Streaming TDT model (BF16 safetensors)");
-    println!("  Device: {:?}, dtype: {:?}", device, dtype);
+    info!("Loading Streaming TDT model (BF16 safetensors)");
+    debug!("  Device: {:?}, dtype: {:?}", device, dtype);
 
     // Load safetensors
     let weights_path = dir.join("model.safetensors");
     let tensors_raw: HashMap<String, Tensor> = candle_core::safetensors::load(&weights_path, device)?;
-    println!("  Loaded {} tensors from safetensors", tensors_raw.len());
+    debug!("  Loaded {} tensors from safetensors", tensors_raw.len());
 
     // Remap tensor names and detect actual parameters
     let mut tensors = HashMap::new();
@@ -1910,7 +1911,7 @@ pub fn load_parakeet_streaming_tdt_from_local<P: AsRef<Path>>(
     let feat_in = if let Some(flatten_dim) = actual_flatten_dim {
         let features_per_channel = flatten_dim / enc.subsampling_conv_channels;
         let calculated = features_per_channel * enc.subsampling_factor;
-        println!("  Detected feat_in: {} (config says {})", calculated, enc.num_mel_bins);
+        debug!("  Detected feat_in: {} (config says {})", calculated, enc.num_mel_bins);
         calculated
     } else {
         enc.num_mel_bins
@@ -1920,14 +1921,14 @@ pub fn load_parakeet_streaming_tdt_from_local<P: AsRef<Path>>(
     let mut tdt_cfg_adjusted = tdt_cfg.clone();
     if let Some(detected_vocab) = actual_joint_vocab {
         if detected_vocab != tdt_cfg.vocab_size {
-            println!("  Detected joint vocab: {} (config says {})", detected_vocab, tdt_cfg.vocab_size);
+            debug!("  Detected joint vocab: {} (config says {})", detected_vocab, tdt_cfg.vocab_size);
             tdt_cfg_adjusted.joint_vocab_size = Some(detected_vocab);
 
             // CRITICAL FIX: Config has wrong blank_id=0
             // NeMo uses blank_idx=1024 (last position in vocab)
             // Predictor embedding has 1025 entries [0-1024], where 1024 is blank
             tdt_cfg_adjusted.blank_id = detected_vocab - 1;  // 1025 - 1 = 1024
-            println!("  Fixed blank_id: {} (config says {})", tdt_cfg_adjusted.blank_id, tdt_cfg.blank_id);
+            debug!("  Fixed blank_id: {} (config says {})", tdt_cfg_adjusted.blank_id, tdt_cfg.blank_id);
         }
     }
 
@@ -1950,10 +1951,10 @@ pub fn load_parakeet_streaming_tdt_from_local<P: AsRef<Path>>(
 
     let vb = VarBuilder::from_tensors(tensors, dtype, device);
 
-    println!("  Building encoder...");
+    info!("  Building encoder...");
     let encoder = FastConformerEncoder::new(encoder_cfg.clone(), vb.pp("encoder"))?;
 
-    println!("  Building transducer model...");
+    info!("  Building transducer model...");
     let mut model = TransducerModel::new(
         encoder,
         tdt_cfg_adjusted,
@@ -1976,7 +1977,7 @@ pub fn load_parakeet_streaming_tdt_from_local<P: AsRef<Path>>(
         return Err(anyhow!("No tokenizer found in {:?}", dir));
     }
 
-    println!("  ✓ Streaming TDT model loaded successfully (BF16)");
+    info!("  ✓ Streaming TDT model loaded successfully (BF16)");
 
     Ok(model)
 }
@@ -2013,10 +2014,10 @@ pub fn load_parakeet_streaming_tdt_from_gguf_local<P: AsRef<Path>>(
 
     let assets = dir.as_ref().to_path_buf();
 
-    println!("Loading Streaming TDT model with Q8_0 quantization (cache-aware, compressed)");
+    info!("Loading Streaming TDT model with Q8_0 quantization (cache-aware, compressed)");
 
     // Load config from embedded asset
-    println!("  Loading config from assets...");
+    info!("  Loading config from assets...");
     let cfg_bytes = STREAMING_TDT_CONFIG.bytes(&assets).map_err(|_| {
         Error::new(
             ErrorKind::Other,
@@ -2038,7 +2039,7 @@ pub fn load_parakeet_streaming_tdt_from_gguf_local<P: AsRef<Path>>(
     let streaming_config = hf_cfg.streaming_config.clone();
     if let Some(ref config) = streaming_config {
         if let Some(att_context_sizes) = config.get("att_context_size") {
-            println!("  ✓ Cache-aware model with configurable chunk sizes:");
+            info!("  ✓ Cache-aware model with configurable chunk sizes:");
             if let Some(sizes) = att_context_sizes.as_array() {
                 for size_arr in sizes {
                     if let Some(arr) = size_arr.as_array() {
@@ -2046,7 +2047,7 @@ pub fn load_parakeet_streaming_tdt_from_gguf_local<P: AsRef<Path>>(
                             let left = arr[0].as_i64().unwrap_or(0);
                             let right = arr[1].as_i64().unwrap_or(0);
                             let chunk_ms = (right + 1) * 80; // Each frame is 80ms after 8x subsampling
-                            println!("    [{}, {}] = {}ms chunks", left, right, chunk_ms);
+                            debug!("    [{}, {}] = {}ms chunks", left, right, chunk_ms);
                         }
                     }
                 }
@@ -2055,7 +2056,7 @@ pub fn load_parakeet_streaming_tdt_from_gguf_local<P: AsRef<Path>>(
     }
 
     // Load tokenizer from embedded asset
-    println!("  Loading tokenizer from assets...");
+    info!("  Loading tokenizer from assets...");
     let tok_bytes = STREAMING_TDT_TOKENIZER_JSON.bytes(&assets).map_err(|_| {
         Error::new(
             ErrorKind::Other,
@@ -2066,7 +2067,7 @@ pub fn load_parakeet_streaming_tdt_from_gguf_local<P: AsRef<Path>>(
         .map_err(|e| Error::new(ErrorKind::Other, format!("failed to parse STREAMING_TDT_TOKENIZER_JSON: {e}")))?;
 
     // Load GGUF from embedded asset (already decompressed by embed_zst_asset macro)
-    println!("  Loading GGUF file from assets...");
+    info!("  Loading GGUF file from assets...");
     let gguf_bytes = STREAMING_TDT_MODEL_Q8_0_GGUF.bytes(&assets).map_err(|_| {
         Error::new(
             ErrorKind::Other,
@@ -2076,7 +2077,7 @@ pub fn load_parakeet_streaming_tdt_from_gguf_local<P: AsRef<Path>>(
 
     // For quantized models, we need to dequantize to FP32/BF16 for inference
     // TDT uses LSTM which doesn't support quantized operations yet
-    println!("  Dequantizing GGUF to tensors...");
+    info!("  Dequantizing GGUF to tensors...");
 
     // Determine target dtype
     let dtype = if device.is_cpu() {
@@ -2085,7 +2086,7 @@ pub fn load_parakeet_streaming_tdt_from_gguf_local<P: AsRef<Path>>(
         DType::BF16  // Use BF16 on GPU (matches training dtype)
     };
 
-    println!("    Target dtype: {:?}", dtype);
+    debug!("    Target dtype: {:?}", dtype);
 
     // Load GGUF and dequantize tensors
     let gguf_file = candle_core::quantized::gguf_file::Content::read(&mut std::io::Cursor::new(gguf_bytes))?;
@@ -2158,8 +2159,8 @@ pub fn load_parakeet_streaming_tdt_from_gguf_local<P: AsRef<Path>>(
         }
     }
 
-    println!("    ✓ Dequantized {} tensors", tensors.len());
-    println!("    ✓ Added zero biases and batch norm stats for NeMo compatibility");
+    info!("    ✓ Dequantized {} tensors", tensors.len());
+    info!("    ✓ Added zero biases and batch norm stats for NeMo compatibility");
 
     // Construct encoder config with corrected feat_in (calculated from actual tensor dimensions)
     // The NeMo streaming model uses feat_in=136 but config says 128
@@ -2168,18 +2169,18 @@ pub fn load_parakeet_streaming_tdt_from_gguf_local<P: AsRef<Path>>(
         let dims = info.shape.dims();
         if dims.len() == 2 {
             actual_flatten_dim = Some(dims[1]);
-            println!("  Detected actual flatten_dim from model: {}", dims[1]);
+            debug!("  Detected actual flatten_dim from model: {}", dims[1]);
         }
     }
 
     let feat_in = if let Some(flatten_dim) = actual_flatten_dim {
         let features_per_channel = flatten_dim / enc_config_ref.subsampling_conv_channels;
         let calculated_feat_in = features_per_channel * enc_config_ref.subsampling_factor;
-        println!("  Calculated feat_in from actual dimensions: {}", calculated_feat_in);
-        println!("  Config says feat_in: {} (ignoring, using calculated value)", enc_config_ref.num_mel_bins);
+        debug!("  Calculated feat_in from actual dimensions: {}", calculated_feat_in);
+        debug!("  Config says feat_in: {} (ignoring, using calculated value)", enc_config_ref.num_mel_bins);
         calculated_feat_in
     } else {
-        println!("  Using config feat_in: {}", enc_config_ref.num_mel_bins);
+        debug!("  Using config feat_in: {}", enc_config_ref.num_mel_bins);
         enc_config_ref.num_mel_bins
     };
 
@@ -2190,7 +2191,7 @@ pub fn load_parakeet_streaming_tdt_from_gguf_local<P: AsRef<Path>>(
         let dims = info.shape.dims();
         if dims.len() == 2 {
             actual_joint_vocab = Some(dims[0]);
-            println!("  Detected actual joint vocab size from model: {}", dims[0]);
+            debug!("  Detected actual joint vocab size from model: {}", dims[0]);
         }
     }
 
@@ -2200,9 +2201,9 @@ pub fn load_parakeet_streaming_tdt_from_gguf_local<P: AsRef<Path>>(
     let mut tdt_cfg_adjusted = tdt_cfg.clone();
     if let Some(detected_vocab) = actual_joint_vocab {
         if detected_vocab != tdt_cfg.vocab_size && detected_vocab != tdt_cfg.joint_vocab_size.unwrap_or(tdt_cfg.vocab_size) {
-            println!("  Config says vocab_size: {}, joint_vocab_size: {:?}",
+            debug!("  Config says vocab_size: {}, joint_vocab_size: {:?}",
                      tdt_cfg.vocab_size, tdt_cfg.joint_vocab_size);
-            println!("  Detected vocab size from model (including blank): {}", detected_vocab);
+            debug!("  Detected vocab size from model (including blank): {}", detected_vocab);
             // Subtract 1 because PredictionNetwork will add it back (it expects vocab_size without blank)
             tdt_cfg_adjusted.vocab_size = detected_vocab - 1;
             tdt_cfg_adjusted.joint_vocab_size = Some(detected_vocab);
@@ -2229,11 +2230,11 @@ pub fn load_parakeet_streaming_tdt_from_gguf_local<P: AsRef<Path>>(
     let vb = VarBuilder::from_tensors(tensors, dtype, device);
 
     // Build encoder
-    println!("  Building encoder...");
+    info!("  Building encoder...");
     let encoder = FastConformerEncoder::new(encoder_cfg.clone(), vb.pp("encoder"))?;
 
     // Build full transducer model
-    println!("  Building transducer model...");
+    info!("  Building transducer model...");
     let mut model = TransducerModel::new(
         encoder,
         tdt_cfg_adjusted,
@@ -2244,7 +2245,7 @@ pub fn load_parakeet_streaming_tdt_from_gguf_local<P: AsRef<Path>>(
     // Store tokenizer
     model.tokenizer = Some(tokenizer);
 
-    println!("  ✓ Streaming TDT model loaded successfully (cache-aware, quantized)");
+    info!("  ✓ Streaming TDT model loaded successfully (cache-aware, quantized)");
 
     Ok(model)
 }
