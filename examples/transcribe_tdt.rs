@@ -10,6 +10,7 @@
 
 use anyhow::Result;
 use speech::parakeet::{get_device, load_parakeet_tdt_from_local};
+use std::path::PathBuf;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -17,12 +18,7 @@ fn main() -> Result<()> {
     if args.len() < 2 {
         eprintln!("Usage: {} <audio.wav>", args[0]);
         eprintln!("\nThis example uses Parakeet TDT (Transducer) model.");
-        eprintln!("Expected files in .cache/parakeet-tdt/:");
-        eprintln!("  - config.json");
-        eprintln!("  - model.safetensors");
-        eprintln!("  - tokenizer.model or tokenizer.json");
-        eprintln!("\nTo download and convert the model:");
-        eprintln!("  python scripts/download_parakeet_tdt.py --cache .cache/parakeet-tdt");
+        eprintln!("Model files are embedded in the binary (no downloads needed).");
         return Ok(());
     }
 
@@ -35,9 +31,10 @@ fn main() -> Result<()> {
     // Get device
     let device = get_device()?;
 
-    // Load TDT model
+    // Load TDT model from embedded assets
+    let assets = PathBuf::from("assets");
     println!("Loading TDT model...");
-    let mut model = load_parakeet_tdt_from_local(".cache/parakeet-tdt", &device)?;
+    let mut model = load_parakeet_tdt_from_local(&assets, &device)?;
     println!("  Model: nvidia/parakeet-tdt-0.6b-v3");
     println!("  Architecture: Transducer (RNN-T)");
     println!("  Predictor: {} LSTM layers", model.config.pred_rnn_layers);
@@ -45,7 +42,7 @@ fn main() -> Result<()> {
 
     // Load tokenizer
     println!("Loading tokenizer...");
-    model.load_tokenizer(".cache/parakeet-tdt")?;
+    model.load_tokenizer(&assets)?;
     println!("  Tokenizer loaded\n");
 
     // Load audio and extract features

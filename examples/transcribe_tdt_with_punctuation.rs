@@ -14,6 +14,7 @@ use anyhow::Result;
 use speech::parakeet::{
     get_device, load_parakeet_tdt_from_local, ParakeetFeatureExtractor,
 };
+use std::path::PathBuf;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -34,9 +35,10 @@ fn main() -> Result<()> {
     let device = get_device()?;
     println!("Device: {:?}", device);
 
+    let assets = PathBuf::from("assets");
     println!("Loading TDT model...");
-    let mut model = load_parakeet_tdt_from_local(".cache/parakeet-tdt", &device)?;
-    model.load_tokenizer(".cache/parakeet-tdt")?;
+    let mut model = load_parakeet_tdt_from_local(&assets, &device)?;
+    model.load_tokenizer(&assets)?;
     println!("✓ Model loaded\n");
 
     // Load audio

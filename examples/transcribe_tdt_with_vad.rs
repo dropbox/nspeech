@@ -280,10 +280,10 @@ fn main() -> Result<()> {
     let vad_stream = VadStream::new(vad, &device)?;
     println!("✓ VAD loaded\n");
 
-    // Load Parakeet TDT model
+    // Load Parakeet TDT model (from embedded assets)
     println!("Loading Parakeet TDT model...");
-    let mut model = load_parakeet_tdt_from_local(".cache/parakeet-tdt", &device)?;
-    model.load_tokenizer(".cache/parakeet-tdt")?;
+    let mut model = load_parakeet_tdt_from_local(&assets, &device)?;
+    model.load_tokenizer(&assets)?;
     println!("✓ TDT model loaded\n");
 
     // Load audio
