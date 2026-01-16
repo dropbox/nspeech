@@ -209,7 +209,7 @@ impl SpeechInner {
             }
         });
 
-        // Feature extractor for TDT (128 mel bins for streaming TDT model)
+        // Feature extractor for TDT (128 mel bins for streaming TDT GGUF model)
         let feat_extractor = parakeet::ParakeetFeatureExtractor::new(128);
 
         // Pre-buffer: 1 second of audio
@@ -349,8 +349,12 @@ impl SpeechInner {
             features
         };
 
+        // Run encoder
+        let encoder_out = tdt_model.encoder.forward(&features, false)
+            .map_err(|e| napi::Error::from_reason(format!("Encoder error: {}", e)))?;
+
         // Run TDT greedy decode
-        let tokens = tdt_model.greedy_decode(&features)
+        let tokens = tdt_model.greedy_decode(&encoder_out)
             .map_err(|e| napi::Error::from_reason(format!("TDT decode error: {}", e)))?;
 
         if tokens.is_empty() {
@@ -444,7 +448,7 @@ impl Speech {
         };
 
         info!("Loading Parakeet TDT model (quantized GGUF, mmap)...");
-        // Load TDT model from assets directory (mmap for lowest memory)
+        // Load TDT model from assets directory (GGUF with 80 mel bins)
         let model = match parakeet::load_parakeet_tdt_from_gguf_mmap_local(&assets, &device) {
             Ok(mut model) => {
                 info!("Loading tokenizer...");
