@@ -47,3 +47,4 @@ tokenizer*.json
 tokenizer*.json.zst
 special_tokens_map.json
 special_tokens_map.json.zst
+index.node
