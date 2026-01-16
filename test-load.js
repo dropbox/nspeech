@@ -1,7 +1,60 @@
 #!/usr/bin/env node
 
 import { createRequire } from 'module';
+import fs from 'fs';
 const require = createRequire(import.meta.url);
+
+// Simple WAV file parser for 16-bit PCM mono
+function readWav(filename) {
+  const buffer = fs.readFileSync(filename);
+
+  // Parse WAV header
+  const riff = buffer.toString('ascii', 0, 4);
+  if (riff !== 'RIFF') {
+    throw new Error('Not a valid WAV file');
+  }
+
+  const wave = buffer.toString('ascii', 8, 12);
+  if (wave !== 'WAVE') {
+    throw new Error('Not a valid WAV file');
+  }
+
+  // Find data chunk
+  let offset = 12;
+  let dataOffset = 0;
+  let dataSize = 0;
+  let sampleRate = 0;
+  let channels = 0;
+  let bitsPerSample = 0;
+
+  while (offset < buffer.length) {
+    const chunkId = buffer.toString('ascii', offset, offset + 4);
+    const chunkSize = buffer.readUInt32LE(offset + 4);
+
+    if (chunkId === 'fmt ') {
+      channels = buffer.readUInt16LE(offset + 8 + 2);
+      sampleRate = buffer.readUInt32LE(offset + 8 + 4);
+      bitsPerSample = buffer.readUInt16LE(offset + 8 + 14);
+    } else if (chunkId === 'data') {
+      dataOffset = offset + 8;
+      dataSize = chunkSize;
+      break;
+    }
+
+    offset += 8 + chunkSize;
+  }
+
+  console.log(`WAV: ${sampleRate}Hz, ${channels} channel(s), ${bitsPerSample}-bit`);
+
+  // Read 16-bit PCM samples and convert to float64 [-1.0, 1.0]
+  const samples = [];
+  for (let i = dataOffset; i < dataOffset + dataSize; i += 2) {
+    const sample = buffer.readInt16LE(i);
+    samples.push(sample / 32768.0);  // Normalize to [-1.0, 1.0]
+  }
+
+  return { samples, sampleRate, channels };
+}
 
 try {
   console.log('Loading native module...');
@@ -9,9 +62,68 @@ try {
   console.log('Module loaded successfully!');
   console.log('Exports:', Object.keys(speech));
 
-  // Try to access Speech constructor
   if (speech.Speech) {
     console.log('Speech constructor found');
+
+    // Set up logging (suppress trace logs for cleaner output)
+    speech.setLogCallback((s) => {
+      if (s.level !== 'trace') {
+        console.log(`[${s.level}] ${s.message}`);
+      }
+    }, "info");
+
+    // Track transcription results
+    const transcriptions = [];
+
+    // Create Speech instance with callback
+    const transcriber = new speech.Speech("assets", (transcription) => {
+      console.log('\n=== TRANSCRIPTION ===');
+      console.log(`Text: ${transcription.text}`);
+      console.log(`Time: ${transcription.start_time.toFixed(2)}s - ${transcription.end_time.toFixed(2)}s`);
+      console.log('====================\n');
+      transcriptions.push(transcription);
+    });
+
+    console.log('Transcriber created, loading audio...');
+
+    // Read WAV file
+    const wavFile = process.argv[2] || 'dots.wav';
+    console.log(`Reading ${wavFile}...`);
+    const { samples, sampleRate } = readWav(wavFile);
+
+    console.log(`Loaded ${samples.length} samples (${(samples.length / sampleRate).toFixed(2)}s)`);
+
+    // Send audio in chunks (simulate streaming)
+    const chunkSize = 16000; // 1 second chunks at 16kHz
+    let sent = 0;
+
+    while (sent < samples.length) {
+      const end = Math.min(sent + chunkSize, samples.length);
+      const chunk = samples.slice(sent, end);
+      transcriber.input(chunk);
+      sent = end;
+
+      if (sent % (16000 * 5) === 0 || sent === samples.length) {
+        console.log(`Sent ${sent}/${samples.length} samples (${(sent / sampleRate).toFixed(1)}s)`);
+      }
+    }
+
+    console.log('All audio sent, flushing...');
+    transcriber.flush();
+
+    // Wait a bit for final transcriptions
+    setTimeout(() => {
+      console.log(`\nTotal transcriptions: ${transcriptions.length}`);
+      if (transcriptions.length > 0) {
+        const fullText = transcriptions.map(t => t.text).join(' ');
+        console.log('\n=== FULL TRANSCRIPT ===');
+        console.log(fullText);
+        console.log('=======================\n');
+      }
+
+      transcriber.shutdown();
+      console.log('✓ Test complete!');
+    }, 2000);
   }
 } catch (err) {
   console.error('Failed to load module:');

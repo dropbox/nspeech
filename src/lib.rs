@@ -209,8 +209,8 @@ impl SpeechInner {
             }
         });
 
-        // Feature extractor for TDT (80 mel bins for standard TDT model)
-        let feat_extractor = parakeet::ParakeetFeatureExtractor::new(80);
+        // Feature extractor for TDT (128 mel bins for streaming TDT model)
+        let feat_extractor = parakeet::ParakeetFeatureExtractor::new(128);
 
         // Pre-buffer: 1 second of audio
         let pre_buffer_samples = 16000;
