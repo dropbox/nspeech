@@ -283,9 +283,9 @@ impl SpeechInner {
                 if self.current_segment.is_empty() {
                     // Add pre-buffer to catch start of speech
                     self.current_segment.extend(self.pre_buffer.iter().copied());
-                    self.current_segment_start = Some(
-                        (self.total_samples_processed - self.pre_buffer.len()) as f64 / 16000.0
-                    );
+                    // Use saturating_sub to prevent underflow
+                    let start_sample = self.total_samples_processed.saturating_sub(self.pre_buffer.len());
+                    self.current_segment_start = Some(start_sample as f64 / 16000.0);
                     info!("Speech started at {:.2}s", self.current_segment_start.unwrap());
                 }
 
