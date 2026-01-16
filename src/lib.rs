@@ -443,9 +443,9 @@ impl Speech {
             }
         };
 
-        info!("Loading Parakeet TDT model...");
-        // Load TDT model from assets directory
-        let model = match parakeet::load_parakeet_tdt_from_local(&assets, &device) {
+        info!("Loading Parakeet TDT model (quantized GGUF, mmap)...");
+        // Load TDT model from assets directory (mmap for lowest memory)
+        let model = match parakeet::load_parakeet_tdt_from_gguf_mmap_local(&assets, &device) {
             Ok(mut model) => {
                 info!("Loading tokenizer...");
                 match model.load_tokenizer(&assets) {

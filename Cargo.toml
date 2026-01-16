@@ -12,7 +12,7 @@ name = "main"           # !Dash
 path = "src/main.rs"    # !Dash
 
 [features]
-default = ["qwen"]  # Quantized inference is default (faster)
+#default = ["qwen"]  # Quantized inference is default (faster)
 quantized = []            # Use quantized inference (QMatMul with Q8_0/Q4K weights)
 embed-assets = []         # Embed model assets in binary
 qwen = []                 # Enable Qwen3 text correction model (adds ~400MB to assets)
@@ -41,6 +41,7 @@ safetensors = "0.4"
 # For GGUF quantization and asset compression
 tempfile = "3.8"
 zstd = "0.13.3"
+memmap2 = "0.9"
 
 # NAPI bindings for Node.js
 napi = "3.2.2"

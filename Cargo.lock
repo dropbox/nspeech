@@ -2449,6 +2449,7 @@ dependencies = [
  "hf-hub 0.4.3",
  "hound",
  "log",
+ "memmap2",
  "napi",
  "napi-build",
  "napi-derive",
