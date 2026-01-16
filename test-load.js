@@ -48,10 +48,24 @@ function readWav(filename) {
 
   // Read 16-bit PCM samples and convert to float64 [-1.0, 1.0]
   const samples = [];
+  let minSample = Infinity;
+  let maxSample = -Infinity;
+  let minFloat = Infinity;
+  let maxFloat = -Infinity;
+
   for (let i = dataOffset; i < dataOffset + dataSize; i += 2) {
     const sample = buffer.readInt16LE(i);
-    samples.push(sample / 32768.0);  // Normalize to [-1.0, 1.0]
+    const floatSample = sample / 32768.0;
+    samples.push(floatSample);
+
+    minSample = Math.min(minSample, sample);
+    maxSample = Math.max(maxSample, sample);
+    minFloat = Math.min(minFloat, floatSample);
+    maxFloat = Math.max(maxFloat, floatSample);
   }
+
+  console.log(`Sample range (int16): [${minSample}, ${maxSample}]`);
+  console.log(`Sample range (float): [${minFloat.toFixed(6)}, ${maxFloat.toFixed(6)}]`);
 
   return { samples, sampleRate, channels };
 }
@@ -79,7 +93,9 @@ try {
     const transcriber = new speech.Speech("assets", (transcription) => {
       console.log('\n=== TRANSCRIPTION ===');
       console.log(`Text: ${transcription.text}`);
-      console.log(`Time: ${transcription.start_time.toFixed(2)}s - ${transcription.end_time.toFixed(2)}s`);
+      const startTime = transcription.startTime ?? transcription.start_time ?? 0;
+      const endTime = transcription.endTime ?? transcription.end_time ?? 0;
+      console.log(`Time: ${startTime.toFixed(2)}s - ${endTime.toFixed(2)}s`);
       console.log('====================\n');
       transcriptions.push(transcription);
     });
@@ -108,22 +124,29 @@ try {
       }
     }
 
-    console.log('All audio sent, flushing...');
-    transcriber.flush();
+    console.log('All audio sent, waiting for processing...');
+    console.log('(Worker processes at ~1x real-time, so 35s audio needs ~40s wait)');
 
-    // Wait a bit for final transcriptions
+    // Wait for worker thread to process all queued audio
+    // Worker processes at roughly real-time speed: 35s audio = ~40s processing
     setTimeout(() => {
-      console.log(`\nTotal transcriptions: ${transcriptions.length}`);
-      if (transcriptions.length > 0) {
-        const fullText = transcriptions.map(t => t.text).join(' ');
-        console.log('\n=== FULL TRANSCRIPT ===');
-        console.log(fullText);
-        console.log('=======================\n');
-      }
+      console.log('Flushing...');
+      transcriber.flush();
 
-      transcriber.shutdown();
-      console.log('✓ Test complete!');
-    }, 2000);
+        // Wait a bit more for final transcriptions
+        setTimeout(() => {
+          console.log(`\nTotal transcriptions: ${transcriptions.length}`);
+          if (transcriptions.length > 0) {
+            const fullText = transcriptions.map(t => t.text).join(' ');
+            console.log('\n=== FULL TRANSCRIPT ===');
+            console.log(fullText);
+            console.log('=======================\n');
+          }
+
+          transcriber.shutdown();
+          console.log('✓ Test complete!');
+        }, 2000);
+    }, 40000);  // Wait 40 seconds for worker to process all audio
   }
 } catch (err) {
   console.error('Failed to load module:');

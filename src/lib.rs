@@ -219,7 +219,7 @@ impl SpeechInner {
         // Configuration
         let speech_threshold = 0.1;  // Low threshold for better capture
         let period_pause_ms = 500.0;  // 500ms silence = segment end
-        let period_pause_frames = (period_pause_ms / 10.0) as usize;  // 10ms per VAD frame
+        let period_pause_frames = (period_pause_ms / 32.0) as usize;  // 32ms per VAD frame (512 samples @ 16kHz)
 
         Self {
             vad_stream,
@@ -262,15 +262,32 @@ impl SpeechInner {
         let speech_probs = vad_stream.push(samples)
             .map_err(|e| napi::Error::from_reason(format!("VAD error: {}", e)))?;
 
-        // Process in 10ms chunks (160 samples) with corresponding VAD probabilities
-        const CHUNK_SIZE: usize = 160;
+        // VAD processes in 512-sample chunks (32ms at 16kHz), so we must align with that
+        // Previously this was 160 samples (10ms), but that didn't match VAD's chunk size
+        const CHUNK_SIZE: usize = 512;  // Must match VAD chunk size!
         let mut offset = 0;
         let mut prob_idx = 0;
+
+        // Track speech detection stats for this batch
+        let mut speech_chunks = 0;
+        let mut total_chunks = 0;
 
         while offset + CHUNK_SIZE <= samples.len() && prob_idx < speech_probs.len() {
             let chunk = &samples[offset..offset + CHUNK_SIZE];
             let speech_prob = speech_probs[prob_idx];
             let is_speech = speech_prob >= self.speech_threshold;
+
+            total_chunks += 1;
+            if is_speech {
+                speech_chunks += 1;
+            }
+
+            // Log periodically to track VAD behavior (every ~16 seconds)
+            if total_chunks % 500 == 0 {
+                let current_time = self.total_samples_processed as f64 / 16000.0;
+                info!("VAD @ {:.1}s: prob={:.3}, is_speech={}, segment_active={}, silence_frames={}",
+                      current_time, speech_prob, is_speech, !self.current_segment.is_empty(), self.silence_frames);
+            }
 
             // Update pre-buffer
             self.pre_buffer.extend(chunk.iter().copied());
@@ -299,6 +316,9 @@ impl SpeechInner {
 
                 // Check if pause long enough to end segment
                 if self.silence_frames >= self.period_pause_frames {
+                    info!("Segment ended at {:.2}s after {} frames of silence",
+                          self.total_samples_processed as f64 / 16000.0, self.silence_frames);
+
                     if let Some(transcription) = self.transcribe_segment()? {
                         info!("Transcription: \"{}\" ({:.2}s-{:.2}s)",
                               transcription.text, transcription.start_time, transcription.end_time);
@@ -309,6 +329,7 @@ impl SpeechInner {
                     self.current_segment.clear();
                     self.current_segment_start = None;
                     self.silence_frames = 0;
+                    info!("Ready for next segment");
                 }
             }
 
@@ -317,6 +338,11 @@ impl SpeechInner {
             offset += CHUNK_SIZE;
             prob_idx += 1;
         }
+
+        // Log batch summary
+        info!("Batch processed: {} chunks ({} speech, {} silence), total time: {:.1}s",
+              total_chunks, speech_chunks, total_chunks - speech_chunks,
+              self.total_samples_processed as f64 / 16000.0);
 
         Ok(())
     }
@@ -330,12 +356,18 @@ impl SpeechInner {
             None => return Ok(None), // Fail silently if model not available
         };
 
+        let segment_duration_ms = (self.current_segment.len() as f64 / 16.0);
+
         if self.current_segment.len() < 4000 {  // Skip very short segments (< 250ms)
+            info!("Skipping short segment: {:.0}ms ({} samples)", segment_duration_ms, self.current_segment.len());
             return Ok(None);
         }
 
         let start_time = self.current_segment_start.unwrap_or(0.0);
         let end_time = start_time + (self.current_segment.len() as f64 / 16000.0);
+
+        info!("Transcribing segment: {:.2}s-{:.2}s ({:.1}s, {} samples)",
+              start_time, end_time, end_time - start_time, self.current_segment.len());
 
         // Extract features
         let features = self.feat_extractor.extract_to_tensor(&self.current_segment, &self.device)
@@ -381,6 +413,9 @@ impl SpeechInner {
     where
         F: Fn(Transcription),
     {
+        info!("Flush called: current_segment has {} samples, total processed: {:.2}s",
+              self.current_segment.len(), self.total_samples_processed as f64 / 16000.0);
+
         // Transcribe any remaining segment
         if !self.current_segment.is_empty() {
             if let Some(transcription) = self.transcribe_segment()? {
@@ -391,6 +426,8 @@ impl SpeechInner {
 
             self.current_segment.clear();
             self.current_segment_start = None;
+        } else {
+            info!("Flush: no remaining segment to transcribe");
         }
 
         Ok(())
@@ -500,20 +537,23 @@ impl Speech {
 
         let worker_thread = std::thread::spawn(move || {
             info!("Background worker thread started");
+            let mut work_items_processed = 0;
             loop {
                 let work_item = {
                     let rx = rx_clone.lock().unwrap();
                     match rx.recv() {
                         Ok(item) => item,
                         Err(_) => {
-                            info!("Worker: Channel closed, exiting");
+                            info!("Worker: Channel closed, exiting (processed {} items)", work_items_processed);
                             break;
                         }
                     }
                 };
 
+                work_items_processed += 1;
                 match work_item {
                     WorkItem::Samples(samples) => {
+                        info!("Worker: Processing samples chunk #{} ({} samples)", work_items_processed, samples.len());
                         let callback = Arc::clone(&callback_clone);
                         let callback_fn = |transcription: Transcription| {
                             info!("Callback: Emitting \"{}\", {:.3}s-{:.3}s",
@@ -559,8 +599,11 @@ impl Speech {
         let samples_f32: Vec<f32> = samples.iter().map(|&x| x as f32).collect();
 
         // Try to send to queue
-        match self.work_sender.try_send(WorkItem::Samples(samples_f32)) {
-            Ok(_) => Ok(()),
+        match self.work_sender.try_send(WorkItem::Samples(samples_f32.clone())) {
+            Ok(_) => {
+                info!("input: Queued {} samples successfully", samples_f32.len());
+                Ok(())
+            },
             Err(mpsc::TrySendError::Full(work_item)) => {
                 // Queue is full - we're falling behind
                 // Drain the queue to skip to current audio (non-blocking)
