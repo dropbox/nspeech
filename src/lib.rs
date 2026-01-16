@@ -61,6 +61,7 @@ pub fn set_log_callback(
     callback: Function<(LogEvent,), Unknown>,
     max_level: Option<String>,
 ) -> Result<()> {
+    println!("speech set_logger {:?}", max_level);
     // Safety: We're intentionally leaking the callback reference to make it 'static
     // This is okay because we only set the callback once and it lives for the duration of the program
     let callback_static: Function<'static, (LogEvent,), Unknown> =
@@ -75,6 +76,7 @@ pub fn set_log_callback(
 
     // Wrap the threadsafe function in a closure that we can store
     let _ = LOGFN.set(Box::new(move |evt: LogEvent| {
+        println!("speech got log event {}", evt.message);
         let _ = tsfn.call((evt,), ThreadsafeFunctionCallMode::NonBlocking);
     }));
 
