@@ -4,6 +4,15 @@ import { createRequire } from 'module';
 import fs from 'fs';
 const require = createRequire(import.meta.url);
 
+// Enable manual garbage collection
+// Run with: node --expose-gc test-load.js
+const gcAvailable = typeof global.gc === 'function';
+if (gcAvailable) {
+  console.log('✓ Manual GC enabled');
+} else {
+  console.log('⚠ Manual GC not available (run with: node --expose-gc test-load.js)');
+}
+
 // Simple WAV file parser for 16-bit PCM mono
 function readWav(filename) {
   const buffer = fs.readFileSync(filename);
@@ -98,6 +107,12 @@ try {
       console.log(`Time: ${startTime.toFixed(2)}s - ${endTime.toFixed(2)}s`);
       console.log('====================\n');
       transcriptions.push(transcription);
+
+      // Force garbage collection after each transcription to free beam search memory
+      if (gcAvailable) {
+        global.gc();
+        console.log('  [GC triggered]');
+      }
     });
 
     console.log('Transcriber created, loading audio...');

@@ -385,11 +385,9 @@ impl SpeechInner {
         let encoder_out = tdt_model.encoder.forward(&features, false)
             .map_err(|e| napi::Error::from_reason(format!("Encoder error: {}", e)))?;
 
-        // Run TDT greedy decode
-        // NOTE: Rust CLI uses beam_decode(beam_size=2) for higher quality, but beam search
-        // exceeds memory limits in Node.js. For production quality transcription, use the
-        // Rust CLI (examples/transcribe_tdt_with_vad.rs) which has perfect accuracy.
-        let tokens = tdt_model.greedy_decode(&encoder_out)
+        // Run TDT beam decode with beam_size=2 for quality
+        // Using explicit GC in Node.js to manage memory
+        let tokens = tdt_model.beam_decode(&encoder_out, 2)
             .map_err(|e| napi::Error::from_reason(format!("TDT decode error: {}", e)))?;
 
         if tokens.is_empty() {
