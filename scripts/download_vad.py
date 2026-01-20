@@ -21,7 +21,7 @@ import shutil
 import subprocess
 import sys
 import urllib.request
-
+from compress import compress_file
 
 # Updated URL - files moved from files/ to src/silero_vad/data/
 # Using direct safetensors format (no PyTorch conversion needed)
@@ -145,33 +145,6 @@ def convert_github_safetensors(input_path: pathlib.Path, output_path: pathlib.Pa
 
     size_mb = output_path.stat().st_size / (1024 * 1024)
     print(f"  ✓ Converted safetensors ({size_mb:.2f} MB)")
-
-
-def compress_file(input_path: pathlib.Path, output_path: pathlib.Path) -> None:
-    """Compress a file with zstd level 19."""
-    try:
-        result = subprocess.run(
-            ["zstd", "-19", "-f", str(input_path), "-o", str(output_path)],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-
-        compressed_size = output_path.stat().st_size / 1024
-        original_size = input_path.stat().st_size / 1024
-        ratio = (1 - compressed_size / original_size) * 100
-
-        print(f"  ✓ {input_path.name} → {output_path.name}")
-        print(f"    {original_size:.1f} KB → {compressed_size:.1f} KB ({ratio:.1f}% smaller)")
-
-    except subprocess.CalledProcessError as e:
-        print(f"  ✗ Compression failed: {e}")
-        raise
-    except FileNotFoundError:
-        print(f"  ✗ zstd command not found. Install with:")
-        print(f"    macOS:  brew install zstd")
-        print(f"    Ubuntu: sudo apt install zstd")
-        raise
 
 
 def main() -> None:

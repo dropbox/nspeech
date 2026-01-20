@@ -28,6 +28,7 @@ import subprocess
 import tarfile
 import tempfile
 from typing import Dict, Any
+from compress import compress_file
 
 try:
     from huggingface_hub import hf_hub_download
@@ -166,30 +167,6 @@ def convert_weights_to_safetensors(ckpt_path: pathlib.Path, output_path: pathlib
 
     size_mb = output_path.stat().st_size / (1024 * 1024)
     print(f"  ✓ Saved: {size_mb:.1f} MB")
-
-
-def compress_file(file_path: pathlib.Path, output_name: str = None) -> pathlib.Path:
-    """Compress file with zstd level 19."""
-    if output_name is None:
-        output_name = f"{file_path.name}.zst"
-
-    zst_path = file_path.parent / output_name
-
-    print(f"  Compressing {file_path.name}...")
-    subprocess.run(
-        ["zstd", "-19", "-f", str(file_path), "-o", str(zst_path)],
-        check=True,
-        capture_output=True,
-    )
-
-    orig_size = file_path.stat().st_size / (1024 * 1024)
-    comp_size = zst_path.stat().st_size / (1024 * 1024)
-    ratio = (comp_size / orig_size) * 100
-
-    print(f"  ✓ {file_path.name} -> {output_name}")
-    print(f"    {orig_size:.1f} MB → {comp_size:.1f} MB ({ratio:.1f}%)")
-
-    return zst_path
 
 
 def quantize_tdt_model(cache_dir: pathlib.Path, safetensors_path: pathlib.Path) -> pathlib.Path | None:
