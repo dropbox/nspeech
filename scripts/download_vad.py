@@ -2,8 +2,12 @@
 Download Silero VAD models, quantize to GGUF Q8_0, and compress for deployment.
 
 This script downloads the Silero VAD v4.0 model from GitHub in safetensors format,
-quantizes it to GGUF Q8_0 format for efficient inference, and compresses both versions
+quantizes it to GGUF Q8_0 format for reduced storage size, and compresses both versions
 for use in the speech recognition system.
+
+Note: The quantized GGUF provides **quantized storage** (6.2x smaller file size) but
+performs **FP32 inference** by dequantizing weights on load. The benefit is faster
+downloads and reduced disk usage, not runtime performance improvements.
 
 Usage:
   python scripts/download_vad.py
@@ -291,7 +295,8 @@ def main() -> None:
 
     print("\nYou can now run:")
     print("  cargo run --release --example transcribe_with_vad -- audio.wav")
-    print("\nThe quantized GGUF model (vad16_q8_0.gguf.zst) is used by default for 6.2x smaller size.")
+    print("\nThe quantized GGUF model (vad16_q8_0.gguf.zst) is used by default.")
+    print("Note: Provides 6.2x smaller storage size, but inference uses dequantized FP32.")
 
 
 if __name__ == "__main__":

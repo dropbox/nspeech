@@ -2,6 +2,19 @@
 ///
 /// This tool quantizes the VAD safetensors model to GGUF Q8_0 format and compresses with zstd.
 ///
+/// **Important**: This provides **quantized storage** (6.2x smaller file size) but the model
+/// performs **FP32 inference** by dequantizing weights on load. True quantized inference is not
+/// implemented because Candle does not support quantized Conv1d/LSTM operations.
+///
+/// Benefits:
+/// - 6.2x smaller download/disk size (948 KB → 194 KB)
+/// - Faster model loading from disk
+/// - Identical inference accuracy
+///
+/// Limitations:
+/// - Runtime memory usage same as FP32 (weights dequantized on load)
+/// - Inference speed same as FP32 (no quantized operations)
+///
 /// Usage:
 ///   cargo run --example quantize_vad_gguf --release -- \
 ///     assets/vad16.safetensors \

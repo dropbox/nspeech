@@ -489,10 +489,10 @@ impl Speech {
         };
 
         info!("Loading Silero VAD (quantized GGUF)...");
-        // Load VAD model for speech detection (Q8_0 quantized)
+        // Load VAD model for speech detection (Q8_0 quantized storage, FP32 inference)
         let vad = match silero::SileroVad::load_from_gguf(&assets, &device) {
             Ok(vad) => {
-                info!("✓ VAD loaded (Q8_0 quantized, 194 KB)");
+                info!("✓ VAD loaded (Q8_0 storage format, 194 KB)");
                 Some(vad)
             }
             Err(e) => {
