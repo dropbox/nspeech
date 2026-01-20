@@ -276,7 +276,7 @@ fn main() -> Result<()> {
 
     // Load Silero VAD
     println!("Loading Silero VAD...");
-    let vad = SileroVad::load(&assets, &device)?;
+    let vad = SileroVad::load_from_gguf(&assets, &device)?;
     let vad_stream = VadStream::new(vad, &device)?;
     println!("✓ VAD loaded\n");
 
