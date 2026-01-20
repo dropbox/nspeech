@@ -90,9 +90,7 @@ try {
 
     // Set up logging (suppress trace logs for cleaner output)
     speech.setLogCallback((s) => {
-      if (s.level !== 'trace') {
-        console.log(`[${s.level}] ${s.message}`);
-      }
+      console.log(`[${s.level}] ${s.message}`);
     }, "info");
 
     // Track transcription results
@@ -118,14 +116,15 @@ try {
     console.log('Transcriber created, loading audio...');
 
     // Read WAV file
-    const wavFile = process.argv[2] || 'dots.wav';
+    const wavFile = process.argv[2] || 'MLKDream_16k.wav';
     console.log(`Reading ${wavFile}...`);
     const { samples, sampleRate } = readWav(wavFile);
 
     console.log(`Loaded ${samples.length} samples (${(samples.length / sampleRate).toFixed(2)}s)`);
 
-    // Send audio in chunks (simulate streaming)
-    const chunkSize = 16000; // 1 second chunks at 16kHz
+    // Send audio in chunks (simulate streaming with optimal chunk size)
+    // 512 samples = 32ms at 16kHz, aligned with VAD processing
+    const chunkSize = 512; // Optimal chunk size for VAD + TDT
     let sent = 0;
 
     while (sent < samples.length) {
@@ -134,6 +133,7 @@ try {
       transcriber.input(chunk);
       sent = end;
 
+      // Report progress every 5 seconds
       if (sent % (16000 * 5) === 0 || sent === samples.length) {
         console.log(`Sent ${sent}/${samples.length} samples (${(sent / sampleRate).toFixed(1)}s)`);
       }

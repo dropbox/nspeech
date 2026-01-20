@@ -76,7 +76,6 @@ pub fn set_log_callback(
 
     // Wrap the threadsafe function in a closure that we can store
     let _ = LOGFN.set(Box::new(move |evt: LogEvent| {
-        println!("speech got log event {}", evt.message);
         let _ = tsfn.call((evt,), ThreadsafeFunctionCallMode::NonBlocking);
     }));
 
@@ -142,11 +141,6 @@ pub mod silero;
 
 // Streaming buffer module (shared between Node.js and CLI examples)
 pub mod streaming_buffer;
-
-// Qwen3 model for text correction (punctuation, capitalization)
-// Only available when "qwen" feature is enabled
-#[cfg(feature = "qwen")]
-pub mod qwen;
 
 /// Transcription result with timestamp
 #[napi(object)]
@@ -252,10 +246,14 @@ impl SpeechInner {
     where
         F: Fn(Transcription),
     {
+        info!("process_samples {}", samples.len());
         // Check if VAD stream is available
         let vad_stream = match self.vad_stream.as_mut() {
             Some(stream) => stream,
-            None => return Ok(()), // Fail silently if VAD not available
+            None => {
+                warn!("VAD not available");
+                return Ok(()); // Fail silently if VAD not available
+            }
         };
 
         // Push samples to VAD stream - it will process them in chunks and return probabilities
@@ -274,6 +272,15 @@ impl SpeechInner {
 
         while offset + CHUNK_SIZE <= samples.len() && prob_idx < speech_probs.len() {
             let chunk = &samples[offset..offset + CHUNK_SIZE];
+            /*
+            let mut min = 1000000.0;
+            let mut max = -1000000.0;
+            for &i in chunk {
+                min = if i < min { i } else { min };
+                max = if i > max { i } else { max };
+            }
+            info!("chunk min={} max={}", min, max);
+            */
             let speech_prob = speech_probs[prob_idx];
             let is_speech = speech_prob >= self.speech_threshold;
 
@@ -283,11 +290,11 @@ impl SpeechInner {
             }
 
             // Log periodically to track VAD behavior (every ~16 seconds)
-            if total_chunks % 500 == 0 {
+            //if total_chunks % 500 == 0 {
                 let current_time = self.total_samples_processed as f64 / 16000.0;
                 info!("VAD @ {:.1}s: prob={:.3}, is_speech={}, segment_active={}, silence_frames={}",
                       current_time, speech_prob, is_speech, !self.current_segment.is_empty(), self.silence_frames);
-            }
+            //}
 
             // Update pre-buffer
             self.pre_buffer.extend(chunk.iter().copied());
@@ -314,7 +321,10 @@ impl SpeechInner {
                 self.current_segment.extend_from_slice(chunk);
                 self.silence_frames += 1;
 
-                // Check if pause long enough to end segment
+                // Automatic pause-based transcription (only with "auto-transcribe-on-pause" feature)
+                // When disabled: segment accumulates until explicit flush() call
+                // When enabled: segment auto-transcribes after period_pause_frames of silence
+                #[cfg(feature = "auto-transcribe-on-pause")]
                 if self.silence_frames >= self.period_pause_frames {
                     info!("Segment ended at {:.2}s after {} frames of silence",
                           self.total_samples_processed as f64 / 16000.0, self.silence_frames);
@@ -424,11 +434,24 @@ impl SpeechInner {
                       transcription.text, transcription.start_time, transcription.end_time);
                 callback(transcription);
             }
-
-            self.current_segment.clear();
-            self.current_segment_start = None;
         } else {
             info!("Flush: no remaining segment to transcribe");
+        }
+
+        // Clear all state buffers to prevent audio bleed between utterances
+        self.current_segment.clear();
+        self.current_segment_start = None;
+        self.pre_buffer.clear();  // Critical: prevents previous utterance from bleeding into next
+        self.silence_frames = 0;
+        self.was_speech_last_frame = false;
+
+        // Reset VAD stream LSTM states to prevent context bleeding
+        if let Some(vad_stream) = self.vad_stream.as_mut() {
+            if let Err(e) = vad_stream.reset() {
+                warn!("Failed to reset VAD stream: {}", e);
+            } else {
+                info!("VAD stream reset successfully");
+            }
         }
 
         Ok(())

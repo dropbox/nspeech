@@ -16,6 +16,7 @@ path = "src/main.rs"    # !Dash
 quantized = []            # Use quantized inference (QMatMul with Q8_0/Q4K weights)
 embed-assets = []         # Embed model assets in binary
 qwen = []                 # Enable Qwen3 text correction model (adds ~400MB to assets)
+auto-transcribe-on-pause = []  # Automatically transcribe segments after detecting pause (non-default)
 
 [dependencies]
 anyhow = "1"

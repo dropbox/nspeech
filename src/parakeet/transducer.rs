@@ -1113,6 +1113,10 @@ impl TransducerModel {
 
         let mut completed = Vec::new();
 
+        // Pre-allocate candidates vector to avoid repeated allocations
+        // Worst case: beam_size hypotheses × MAX_INNER_STEPS candidates each
+        let mut candidates: Vec<BeamHypothesis> = Vec::with_capacity(beam_size * 10);
+
         for t in 0..time_steps {
             /*
             if t % 50 == 0 {
@@ -1121,7 +1125,7 @@ impl TransducerModel {
             }
             */
 
-            let mut candidates = Vec::new();
+            candidates.clear();  // Reuse allocation from previous iteration
 
             // Expand each hypothesis in the beam
             for hyp in &beam {
@@ -1212,7 +1216,7 @@ impl TransducerModel {
 
             // Keep top beam_size hypotheses
             candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
-            beam = candidates.into_iter().take(beam_size).collect();
+            beam = candidates.drain(..beam_size.min(candidates.len())).collect();
 
             // Move completed hypotheses (reached end of encoder output)
             beam.retain(|hyp| {
