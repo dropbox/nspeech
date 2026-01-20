@@ -7,6 +7,7 @@ use std::path::Path;
 use crate::embed_zst_asset;
 embed_zst_asset!(pub VAD_CONFIG,                     "vad16.config.json.zst");
 embed_zst_asset!(pub VAD_MODEL,                      "vad16.safetensors.zst");
+embed_zst_asset!(pub VAD_MODEL_Q8_0_GGUF,            "vad16_q8_0.gguf.zst");
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct VadConfig {
@@ -287,6 +288,132 @@ impl SileroVad {
 
         // --- Head conv (usually 1x1, no padding needed) ---
         let head = conv_from(st, device, "head.weight", "head.bias", 1, 0)?;
+
+        Ok((basis, [enc0, enc1, enc2, enc3], rnn, head))
+    }
+
+    /// Load VAD from GGUF Q8_0 quantized format (recommended)
+    pub fn load_from_gguf<P: AsRef<Path>>(assets: P, device: &Device) -> Result<Self> {
+        let assets = assets.as_ref().to_path_buf();
+
+        // Load config from embedded asset
+        let cfg_bytes = VAD_CONFIG.bytes(&assets).map_err(|_| {
+            anyhow::anyhow!("failed to load VAD config from assets")
+        })?;
+        let cfg: VadConfig = serde_json::from_slice(cfg_bytes)?;
+
+        // Load GGUF model from embedded asset (decompress and own the bytes)
+        let gguf_bytes_borrowed = VAD_MODEL_Q8_0_GGUF.bytes(&assets).map_err(|_| {
+            anyhow::anyhow!("failed to load VAD GGUF from assets")
+        })?;
+        // Convert borrowed bytes to owned Vec for GGUF parsing
+        let gguf_bytes: Vec<u8> = gguf_bytes_borrowed.to_vec();
+
+        // Parse GGUF and dequantize tensors to FP32
+        use candle_core::quantized::gguf_file;
+
+        // Create cursor and read GGUF header
+        let gguf = gguf_file::Content::read(&mut std::io::Cursor::new(&gguf_bytes))?;
+
+        // Extract tensors (dequantize Q8_0 -> FP32)
+        let mut tensors = std::collections::HashMap::new();
+        for (name, _) in gguf.tensor_infos.iter() {
+            // Each tensor read needs a fresh cursor
+            let qtensor = gguf.tensor(&mut std::io::Cursor::new(&gguf_bytes), name, device)?;
+            let tensor = qtensor.dequantize(device)?;
+            tensors.insert(name.clone(), tensor);
+        }
+
+        let (basis, enc, rnn, head) = Self::load_tensors_from_map(device, &tensors, &cfg)?;
+
+        let stft = StftMag::new(basis, &cfg)?;
+
+        Ok(Self { cfg, stft, enc, rnn, head })
+    }
+
+    fn load_tensors_from_map(
+        device: &Device,
+        tensors: &std::collections::HashMap<String, Tensor>,
+        cfg: &VadConfig,
+    ) -> Result<(Tensor, [nn::Conv1d; 4], LstmCell, nn::Conv1d)> {
+        // Helper to get a tensor from the map
+        fn get_tensor(
+            tensors: &std::collections::HashMap<String, Tensor>,
+            name: &str,
+        ) -> Result<Tensor> {
+            tensors
+                .get(name)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Missing tensor: {}", name))
+        }
+
+        // --- STFT basis ---
+        let basis = get_tensor(tensors, "stft.forward_basis_buffer")?;
+
+        // --- Encoder convs ---
+        fn conv_from_map(
+            tensors: &std::collections::HashMap<String, Tensor>,
+            device: &Device,
+            wkey: &str,
+            bkey: &str,
+            stride: usize,
+            padding: usize,
+        ) -> Result<nn::Conv1d> {
+            let weight = get_tensor(tensors, wkey)?;
+            let bias = get_tensor(tensors, bkey)?;
+
+            // Handle flattened weights from quantized GGUF
+            // If weight is 2D [out, in*k], we need to infer original shape from bias
+            let weight = if weight.rank() == 2 {
+                // Weight was flattened during quantization [out, in*k]
+                let dims = weight.dims();
+                let out_ch = dims[0];
+                let in_k = dims[1];
+
+                // Infer kernel size and input channels
+                // For enc.0: [128, 387] with stride=1 should be [128, 129, 3]
+                // For enc.1: [64, 384] with stride=2 should be [64, 128, 3]
+                // For enc.2: [64, 192] with stride=2 should be [64, 64, 3]
+                // For enc.3: [128, 192] with stride=1 should be [128, 64, 3]
+
+                // We know all VAD encoder convs have kernel=3
+                let k = 3;
+                let in_ch = in_k / k;
+
+                // Reshape back to 3D: [out, in, k]
+                weight.reshape((out_ch, in_ch, k))?
+            } else {
+                weight
+            };
+
+            let (out_ch, in_ch, k) = weight.dims3()?;
+
+            let cfg = nn::Conv1dConfig { stride, padding, ..Default::default() };
+
+            let mut tensor_map = std::collections::HashMap::new();
+            tensor_map.insert("weight".to_string(), weight);
+            tensor_map.insert("bias".to_string(), bias);
+            let vb = nn::VarBuilder::from_tensors(tensor_map, DType::F32, device);
+
+            Ok(nn::conv1d(in_ch, out_ch, k, cfg, vb)?)
+        }
+
+        let padding = cfg.encoder_padding;
+        let enc0 = conv_from_map(tensors, device, "enc.0.weight", "enc.0.bias", 1, padding)?;
+        let enc1 = conv_from_map(tensors, device, "enc.1.weight", "enc.1.bias", 2, padding)?;
+        let enc2 = conv_from_map(tensors, device, "enc.2.weight", "enc.2.bias", 2, padding)?;
+        let enc3 = conv_from_map(tensors, device, "enc.3.weight", "enc.3.bias", 1, padding)?;
+
+        // --- RNN tensors ---
+        let w_ih = get_tensor(tensors, "rnn.weight_ih")?;
+        let w_hh = get_tensor(tensors, "rnn.weight_hh")?;
+        let b_ih = get_tensor(tensors, "rnn.bias_ih")?;
+        let b_hh = get_tensor(tensors, "rnn.bias_hh")?;
+
+        let rnn = LstmCell::new(w_ih, w_hh, b_ih, b_hh)?;
+
+        // --- Head conv ---
+        let head = conv_from_map(tensors, device, "head.weight", "head.bias", 1, 0)?;
 
         Ok((basis, [enc0, enc1, enc2, enc3], rnn, head))
     }

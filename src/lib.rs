@@ -289,13 +289,6 @@ impl SpeechInner {
                 speech_chunks += 1;
             }
 
-            // Log periodically to track VAD behavior (every ~16 seconds)
-            //if total_chunks % 500 == 0 {
-                let current_time = self.total_samples_processed as f64 / 16000.0;
-                info!("VAD @ {:.1}s: prob={:.3}, is_speech={}, segment_active={}, silence_frames={}",
-                      current_time, speech_prob, is_speech, !self.current_segment.is_empty(), self.silence_frames);
-            //}
-
             // Update pre-buffer
             self.pre_buffer.extend(chunk.iter().copied());
             if self.pre_buffer.len() > 16000 {  // Keep 1s
@@ -495,11 +488,11 @@ impl Speech {
             }
         };
 
-        info!("Loading Silero VAD...");
-        // Load VAD model for speech detection
-        let vad = match silero::SileroVad::load(&assets, &device) {
+        info!("Loading Silero VAD (quantized GGUF)...");
+        // Load VAD model for speech detection (Q8_0 quantized)
+        let vad = match silero::SileroVad::load_from_gguf(&assets, &device) {
             Ok(vad) => {
-                info!("✓ VAD loaded");
+                info!("✓ VAD loaded (Q8_0 quantized, 194 KB)");
                 Some(vad)
             }
             Err(e) => {
