@@ -1,8 +1,9 @@
 """
-Download Silero VAD models and compress for deployment.
+Download Silero VAD models, quantize to GGUF Q8_0, and compress for deployment.
 
-This script downloads the Silero VAD v4.0 model from GitHub in safetensors format
-and compresses it for use in the speech recognition system.
+This script downloads the Silero VAD v4.0 model from GitHub in safetensors format,
+quantizes it to GGUF Q8_0 format for efficient inference, and compresses both versions
+for use in the speech recognition system.
 
 Usage:
   python scripts/download_vad.py
@@ -10,8 +11,9 @@ Usage:
   # Or specify custom directories:
   python scripts/download_vad.py --cache .cache/vad --assets assets
 
-The VAD model is small (~1.2 MB) and will be compressed to ~948 KB.
-No PyTorch required - downloads safetensors directly.
+The VAD model is small (~1.2 MB) and will be quantized to ~194 KB (6.2x reduction).
+No PyTorch required for download - safetensors format used directly.
+Quantization requires Rust toolchain (cargo) to be available.
 """
 
 import argparse
@@ -229,13 +231,50 @@ def main() -> None:
         print(f"Step 3: Using cached config: {config_path}\n")
 
     # Compress files
-    print("Step 4: Compressing with zstd (level 19)...")
+    print("Step 4: Compressing safetensors with zstd (level 19)...")
 
     model_zst = assets_dir / "vad16.safetensors.zst"
     compress_file(model_path, model_zst)
 
     config_zst = assets_dir / "vad16.config.json.zst"
     compress_file(config_path, config_zst)
+
+    # Quantize to GGUF Q8_0
+    print("\nStep 5: Quantizing to GGUF Q8_0 format...")
+    gguf_path = cache_dir / "vad16_q8_0.gguf.zst"
+
+    try:
+        # Run the Rust quantization tool
+        result = subprocess.run(
+            ["cargo", "run", "--example", "quantize_vad_gguf", "--release", "--",
+             str(model_path), str(gguf_path)],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+
+        print("  Quantization output:")
+        # Print key lines from output
+        for line in result.stdout.split('\n'):
+            if any(x in line for x in ['Quantizing', 'Q8_0', 'FP32', 'compression', '✓']):
+                print(f"    {line}")
+
+        # Copy to assets directory
+        assets_gguf = assets_dir / "vad16_q8_0.gguf.zst"
+        shutil.copy2(gguf_path, assets_gguf)
+
+        size_kb = assets_gguf.stat().st_size / 1024
+        print(f"  ✓ Quantized GGUF created ({size_kb:.1f} KB)")
+
+    except subprocess.CalledProcessError as e:
+        print(f"  ✗ Quantization failed: {e}")
+        print(f"  stderr: {e.stderr}")
+        print("  Continuing without quantized model...")
+    except FileNotFoundError:
+        print("  ✗ Cargo not found. Skipping quantization.")
+        print("  You can manually quantize later with:")
+        print(f"    cargo run --example quantize_vad_gguf --release -- {model_path} {gguf_path}")
 
     # Summary
     print("\n" + "=" * 60)
@@ -247,10 +286,12 @@ def main() -> None:
     print("  - Compressed .zst files ready for inference:")
     for p in sorted(assets_dir.glob("vad*.zst")):
         size_kb = p.stat().st_size / 1024
-        print(f"    • {p.name} ({size_kb:.1f} KB)")
+        model_type = "quantized GGUF Q8_0" if "q8_0" in p.name else "safetensors FP32"
+        print(f"    • {p.name:30s} ({size_kb:6.1f} KB) - {model_type}")
 
     print("\nYou can now run:")
-    print("  cargo run --release --features quantized --example transcribe_with_vad -- audio.wav")
+    print("  cargo run --release --example transcribe_with_vad -- audio.wav")
+    print("\nThe quantized GGUF model (vad16_q8_0.gguf.zst) is used by default for 6.2x smaller size.")
 
 
 if __name__ == "__main__":
