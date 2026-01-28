@@ -20,6 +20,101 @@ use speech::parakeet::{get_device, load_parakeet_tdt_from_local, TransducerModel
 use speech::silero::{SileroVad, VadStream};
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::time::Instant;
+
+/// Performance metrics tracking
+#[derive(Debug, Default)]
+struct PerformanceMetrics {
+    // Model loading times
+    vad_load_ms: u128,
+    tdt_load_ms: u128,
+    audio_load_ms: u128,
+
+    // Processing times
+    vad_processing_ms: u128,
+    transcription_ms: u128,
+
+    // Per-segment transcription times
+    segment_times: Vec<(usize, f64, u128)>, // (segment_id, audio_duration_sec, processing_ms)
+
+    // Speech detection stats
+    total_speech_sec: f64,
+    total_segments: usize,
+}
+
+impl PerformanceMetrics {
+    fn add_segment_time(&mut self, segment_id: usize, audio_duration: f64, processing_ms: u128) {
+        self.segment_times.push((segment_id, audio_duration, processing_ms));
+        self.total_speech_sec += audio_duration;
+        self.total_segments += 1;
+    }
+
+    fn print_report(&self, total_audio_sec: f64) {
+        println!("\n=== PERFORMANCE METRICS ===");
+
+        // Model loading
+        println!("\nModel Loading:");
+        println!("  VAD load:           {:>6} ms", self.vad_load_ms);
+        println!("  TDT load:           {:>6} ms", self.tdt_load_ms);
+        println!("  Audio load:         {:>6} ms", self.audio_load_ms);
+        println!("  Total setup:        {:>6} ms",
+                 self.vad_load_ms + self.tdt_load_ms + self.audio_load_ms);
+
+        // VAD processing
+        println!("\nVAD Processing:");
+        println!("  Processing time:    {:>6} ms", self.vad_processing_ms);
+        println!("  Audio processed:    {:>6.2} s", total_audio_sec);
+        let vad_rtf = self.vad_processing_ms as f64 / 1000.0 / total_audio_sec;
+        println!("  Real-time factor:   {:>6.3}x {}", vad_rtf,
+                 if vad_rtf < 1.0 { "(faster than real-time)" } else { "" });
+
+        // Speech detection
+        let silence_sec = total_audio_sec - self.total_speech_sec;
+        let speech_percent = (self.total_speech_sec / total_audio_sec) * 100.0;
+        println!("\nSpeech Detection:");
+        println!("  Total audio:        {:>6.2} s", total_audio_sec);
+        println!("  Speech detected:    {:>6.2} s ({:.1}%)", self.total_speech_sec, speech_percent);
+        println!("  Silence filtered:   {:>6.2} s ({:.1}%)",
+                 silence_sec, 100.0 - speech_percent);
+        println!("  Segments found:     {:>6}", self.total_segments);
+
+        // Transcription
+        println!("\nTranscription:");
+        println!("  Processing time:    {:>6} ms", self.transcription_ms);
+        println!("  Speech transcribed: {:>6.2} s", self.total_speech_sec);
+        let trans_rtf = self.transcription_ms as f64 / 1000.0 / self.total_speech_sec;
+        println!("  Real-time factor:   {:>6.3}x {}", trans_rtf,
+                 if trans_rtf < 1.0 { "(faster than real-time)" } else { "" });
+
+        if !self.segment_times.is_empty() {
+            println!("\n  Per-segment performance:");
+            for (seg_id, audio_dur, proc_ms) in &self.segment_times {
+                let rtf = *proc_ms as f64 / 1000.0 / audio_dur;
+                println!("    Segment {:2}: {:.2}s audio → {:>5} ms (RTF: {:.3}x)",
+                         seg_id, audio_dur, proc_ms, rtf);
+            }
+        }
+
+        // Overall pipeline
+        let total_processing_ms = self.vad_processing_ms + self.transcription_ms;
+        let overall_rtf = total_processing_ms as f64 / 1000.0 / total_audio_sec;
+        println!("\nOverall Pipeline:");
+        println!("  Total processing:   {:>6} ms", total_processing_ms);
+        println!("  Total audio:        {:>6.2} s", total_audio_sec);
+        println!("  Real-time factor:   {:>6.3}x {}", overall_rtf,
+                 if overall_rtf < 1.0 { "(faster than real-time)" } else { "" });
+
+        // Efficiency summary
+        let processing_speedup = 1.0 / overall_rtf;
+        println!("\nEfficiency Summary:");
+        if overall_rtf < 1.0 {
+            println!("  ✓ Processing is {:.1}x faster than real-time", processing_speedup);
+        } else {
+            println!("  ⚠ Processing is {:.1}x slower than real-time", overall_rtf);
+        }
+        println!("  ✓ VAD filtered {:.1}% of audio (silence skipped)", 100.0 - speech_percent);
+    }
+}
 
 /// Configuration for VAD-based streaming
 #[derive(Debug, Clone)]
@@ -275,20 +370,28 @@ fn main() -> Result<()> {
 
     let assets = PathBuf::from("assets");
 
+    // Initialize performance tracking
+    let mut metrics = PerformanceMetrics::default();
+
     // Load Silero VAD
     println!("Loading Silero VAD...");
+    let vad_start = Instant::now();
     let vad = SileroVad::load_from_gguf(&assets, &device)?;
     let vad_stream = VadStream::new(vad, &device)?;
-    println!("✓ VAD loaded\n");
+    metrics.vad_load_ms = vad_start.elapsed().as_millis();
+    println!("✓ VAD loaded ({} ms)\n", metrics.vad_load_ms);
 
     // Load Parakeet TDT model (from embedded assets)
     println!("Loading Parakeet TDT model...");
+    let tdt_start = Instant::now();
     let mut model = load_parakeet_tdt_from_local(&assets, &device)?;
     model.load_tokenizer(&assets)?;
-    println!("✓ TDT model loaded\n");
+    metrics.tdt_load_ms = tdt_start.elapsed().as_millis();
+    println!("✓ TDT model loaded ({} ms)\n", metrics.tdt_load_ms);
 
     // Load audio
     println!("Loading audio...");
+    let audio_start = Instant::now();
     let mut reader = hound::WavReader::open(audio_path)?;
     let spec = reader.spec();
 
@@ -305,7 +408,9 @@ fn main() -> Result<()> {
         .collect::<Result<Vec<_>, _>>()?;
 
     let total_duration_sec = all_samples.len() as f64 / 16000.0;
-    println!("✓ Loaded: {:.2}s ({} samples)\n", total_duration_sec, all_samples.len());
+    metrics.audio_load_ms = audio_start.elapsed().as_millis();
+    println!("✓ Loaded: {:.2}s ({} samples, {} ms)\n",
+             total_duration_sec, all_samples.len(), metrics.audio_load_ms);
 
     // Create streaming transcriber
     let stream_config = StreamConfig::default();
@@ -330,6 +435,9 @@ fn main() -> Result<()> {
     let mut total_tokens = 0;
     let mut all_transcriptions = Vec::new();
 
+    // Start VAD processing timer
+    let vad_start = Instant::now();
+
     while idx < all_samples.len() {
         let end = (idx + STREAM_CHUNK_SIZE).min(all_samples.len());
         let chunk = &all_samples[idx..end];
@@ -340,14 +448,21 @@ fn main() -> Result<()> {
         // Transcribe completed segments
         for (audio_samples, start_time, end_time) in completed {
             segment_count += 1;
+            let segment_duration = end_time - start_time;
             println!("\n[Segment {}] Transcribing {:.2}s - {:.2}s ({:.2}s)",
-                   segment_count, start_time, end_time, end_time - start_time);
+                   segment_count, start_time, end_time, segment_duration);
 
+            // Time the transcription
+            let trans_start = Instant::now();
             let (text, token_count) = transcribe_segment(&audio_samples, &model, &device)?;
+            let trans_ms = trans_start.elapsed().as_millis();
 
             total_tokens += token_count;
+            metrics.transcription_ms += trans_ms;
+            metrics.add_segment_time(segment_count, segment_duration, trans_ms);
 
-            println!("  Tokens: {}", token_count);
+            println!("  Tokens: {} ({} ms, RTF: {:.3}x)",
+                     token_count, trans_ms, trans_ms as f64 / 1000.0 / segment_duration);
             println!("  \x1b[1;36mText: {}\x1b[0m\n", text.trim());
 
             all_transcriptions.push((start_time, end_time, text.trim().to_string()));
@@ -356,17 +471,27 @@ fn main() -> Result<()> {
         idx = end;
     }
 
+    // Record VAD processing time (before final flush)
+    metrics.vad_processing_ms = vad_start.elapsed().as_millis();
+
     // Flush any remaining segment
     if let Some((audio_samples, start_time, end_time)) = streaming_transcriber.flush()? {
         segment_count += 1;
+        let segment_duration = end_time - start_time;
         println!("\n[Segment {}] Transcribing {:.2}s - {:.2}s (final)",
                segment_count, start_time, end_time);
 
+        // Time the transcription
+        let trans_start = Instant::now();
         let (text, token_count) = transcribe_segment(&audio_samples, &model, &device)?;
+        let trans_ms = trans_start.elapsed().as_millis();
 
         total_tokens += token_count;
+        metrics.transcription_ms += trans_ms;
+        metrics.add_segment_time(segment_count, segment_duration, trans_ms);
 
-        println!("  Tokens: {}", token_count);
+        println!("  Tokens: {} ({} ms, RTF: {:.3}x)",
+                 token_count, trans_ms, trans_ms as f64 / 1000.0 / segment_duration);
         println!("  \x1b[1;36mText: {}\x1b[0m\n", text.trim());
 
         all_transcriptions.push((start_time, end_time, text.trim().to_string()));
@@ -402,6 +527,9 @@ fn main() -> Result<()> {
             println!("\n✓ Perfect match!");
         }
     }
+
+    // Print performance metrics report
+    metrics.print_report(total_duration_sec);
 
     println!("\n✓ Streaming transcription complete!");
 
