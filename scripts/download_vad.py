@@ -294,7 +294,7 @@ def main() -> None:
         print(f"    • {p.name:30s} ({size_kb:6.1f} KB) - {model_type}")
 
     print("\nYou can now run:")
-    print("  cargo run --release --example transcribe_with_vad -- audio.wav")
+    print("  cargo run --example transcribe_tdt_with_vad --release -- audio.wav")
     print("\nThe quantized GGUF model (vad16_q8_0.gguf.zst) is used by default.")
     print("Note: Provides 6.2x smaller storage size, but inference uses dequantized FP32.")
 

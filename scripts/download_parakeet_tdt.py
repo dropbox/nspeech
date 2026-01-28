@@ -388,9 +388,8 @@ def main():
         size_mb = p.stat().st_size / (1024 * 1024)
         print(f"  - {p.name} ({size_mb:.1f} MB)")
 
-    print("\nNext steps:")
-    print("1. Implement Transducer decoder in Rust")
-    print("2. Test with: cargo run --example transcribe_tdt --release -- audio.wav")
+    print("\nYou can now run:")
+    print("  cargo run --example transcribe_tdt_with_vad --release -- audio.wav")
 
     return 0
 
