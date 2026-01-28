@@ -294,8 +294,8 @@ impl StreamingEncoder {
     ///
     /// # Returns
     /// Encoder output [B, chunk_output_frames, d_model]
-    pub fn process_chunk(&mut self, features: &Tensor, is_final: bool) -> Result<Tensor> {
-        let (batch_size, chunk_frames, _feat_dim) = features.dims3()?;
+    pub fn process_chunk(&mut self, features: &Tensor, _is_final: bool) -> Result<Tensor> {
+        let (_batch_size, chunk_frames, _feat_dim) = features.dims3()?;
 
         // For now, we'll use the encoder directly without caching
         // True streaming requires modifying the encoder's forward pass to:

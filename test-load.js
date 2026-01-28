@@ -116,7 +116,7 @@ try {
     console.log('Transcriber created, loading audio...');
 
     // Read WAV file
-    const wavFile = process.argv[2] || 'MLKDream_16k.wav';
+    const wavFile = process.argv[2] || 'dots.wav';
     console.log(`Reading ${wavFile}...`);
     const { samples, sampleRate } = readWav(wavFile);
 

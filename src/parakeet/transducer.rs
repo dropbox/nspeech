@@ -875,7 +875,7 @@ impl TransducerModel {
                         current_hyp.last_token = token;
                     } else {
                         // Invalid token, treat as blank
-                        let mut blank_hyp = current_hyp.clone();
+                        let blank_hyp = current_hyp.clone();
                         candidates.push(blank_hyp);
                         break;
                     }

@@ -139,9 +139,6 @@ pub mod parakeet;
 // Silero VAD (Voice Activity Detection)
 pub mod silero;
 
-// Streaming buffer module (shared between Node.js and CLI examples)
-pub mod streaming_buffer;
-
 /// Transcription result with timestamp
 #[napi(object)]
 pub struct Transcription {
@@ -168,9 +165,11 @@ struct SpeechInner {
 
     // Configuration
     speech_threshold: f32,
-    period_pause_frames: usize,  // Frames of silence to trigger segment end
+    #[allow(dead_code)]
+    period_pause_frames: usize,  // Frames of silence to trigger segment end (used with feature flag)
 
     // Debug WAV writer
+    #[allow(dead_code)]
     debug_wav_writer: Option<WavWriter<std::io::BufWriter<std::fs::File>>>,
 }
 
@@ -242,7 +241,7 @@ impl SpeechInner {
         WavWriter::create("debug_input.wav", spec)
     }
 
-    fn process_samples<F>(&mut self, samples: &[f32], callback: &F) -> Result<()>
+    fn process_samples<F>(&mut self, samples: &[f32], _callback: &F) -> Result<()>
     where
         F: Fn(Transcription),
     {
@@ -359,7 +358,7 @@ impl SpeechInner {
             None => return Ok(None), // Fail silently if model not available
         };
 
-        let segment_duration_ms = (self.current_segment.len() as f64 / 16.0);
+        let segment_duration_ms = self.current_segment.len() as f64 / 16.0;
 
         if self.current_segment.len() < 4000 {  // Skip very short segments (< 250ms)
             info!("Skipping short segment: {:.0}ms ({} samples)", segment_duration_ms, self.current_segment.len());

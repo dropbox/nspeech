@@ -49,6 +49,7 @@ impl Default for StreamConfig {
 struct StreamingTranscriber {
     vad_stream: VadStream,
     config: StreamConfig,
+    #[allow(dead_code)]
     device: candle_core::Device,
 
     // Current segment accumulation

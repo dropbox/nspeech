@@ -77,6 +77,7 @@ pub struct StreamingState {
     encoder_frames_consumed: usize,
 
     /// Chunk configuration for calculating overlap frames
+    #[allow(dead_code)]
     chunk_samples: usize,
     overlap_samples: usize,
 }
@@ -198,7 +199,7 @@ impl StreamingTransducer {
     /// # Returns
     /// Tokens decoded from these features
     pub fn process_features(&mut self, features: &Tensor) -> Result<Vec<u32>> {
-        let (batch_size, mel_frames, _feat_dim) = features.dims3()?;
+        let (batch_size, _mel_frames, _feat_dim) = features.dims3()?;
         assert_eq!(batch_size, 1, "Streaming only supports batch_size=1");
 
         // Run encoder on features (process full overlapping chunk for context)
