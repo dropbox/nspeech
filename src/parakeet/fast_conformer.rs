@@ -10,8 +10,6 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-#[cfg(feature = "quantized")]
-use std::io::Seek;
 use tokenizers::Tokenizer;
 
 // Embedded assets (configs/tokenizer/models)
