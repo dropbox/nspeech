@@ -11,7 +11,6 @@ jobs = -1
 [target.aarch64-apple-darwin]
 rustflags = [
     "-C", "target-cpu=apple-m1",       # Optimize for Apple Silicon
-    "-C", "opt-level=3",
 ]
 
 # Linux x86-64 - optimized for Intel Xeon Platinum 8375C (Ice Lake)
@@ -20,21 +19,11 @@ rustflags = [
     # Target Ice Lake microarchitecture with full AVX-512 support
     "-C", "target-cpu=icelake-server",
 
-    # Enable link-time optimization for better cross-crate optimization
-    "-C", "lto=thin",
-
-    # Additional optimizations
-    "-C", "codegen-units=1",           # Better optimization at cost of compile time
-    "-C", "opt-level=3",                # Maximum optimization
-
     # Explicitly enable key CPU features for Ice Lake
     # These are redundant with target-cpu but make capabilities explicit
     "-C", "target-feature=+avx512f,+avx512dq,+avx512cd,+avx512bw,+avx512vl",
     "-C", "target-feature=+avx512vnni",  # Vector Neural Network Instructions
     "-C", "target-feature=+avx2,+fma",   # Also available, used as fallback
-
-    # Other performance features
-    "-C", "prefer-dynamic=no",          # Static linking for better optimization
 ]
 
 # Profile for release builds (used when building with --release)
