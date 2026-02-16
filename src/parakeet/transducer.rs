@@ -1538,17 +1538,31 @@ pub fn load_parakeet_tdt_from_gguf_local<P: AsRef<Path>>(
 
     // Load tokenizer from embedded asset
     info!("  Loading tokenizer from assets...");
-    let tok_bytes = TDT_TOKENIZER_JSON.bytes(&assets).map_err(|_| {
-        Error::new(
-            ErrorKind::Other,
-            format!("Failed to load parakeet-tdt-tokenizer.json.zst from {:?}\n\
-                     \nMissing model files? Download with:\n\
-                     python scripts/download_parakeet_tdt.py",
-                    assets.join("parakeet-tdt-tokenizer.json.zst")),
-        )
-    })?;
-    let tokenizer = Tokenizer::from_bytes(tok_bytes)
-        .map_err(|e| Error::new(ErrorKind::Other, format!("failed to parse TDT_TOKENIZER_JSON: {e}")))?;
+    let tokenizer = if let Ok(tok_bytes) = TDT_TOKENIZER_JSON.bytes(&assets) {
+        // JSON format available (preferred - faster loading)
+        Tokenizer::from_bytes(tok_bytes)
+            .map_err(|e| Error::new(ErrorKind::Other, format!("failed to parse TDT_TOKENIZER_JSON: {e}")))?
+    } else {
+        // JSON format not found - check if model format exists
+        if TDT_TOKENIZER.bytes(&assets).is_ok() {
+            return Err(anyhow!(
+                "Found parakeet-tdt-tokenizer.model.zst but missing parakeet-tdt-tokenizer.json.zst\n\
+                 \nThe JSON format is required for loading. Please install Python dependencies and re-run:\n\
+                 \n  pip install sentencepiece tokenizers\n\
+                 python scripts/download_parakeet_tdt.py\n\
+                 \nThis will create the required parakeet-tdt-tokenizer.json.zst file."
+            ));
+        } else {
+            return Err(anyhow!(
+                "Failed to load tokenizer from {:?}\n\
+                 \nMissing file: parakeet-tdt-tokenizer.json.zst\n\
+                 \nDownload with:\n\
+                 pip install sentencepiece tokenizers\n\
+                 python scripts/download_parakeet_tdt.py",
+                assets
+            ));
+        }
+    };
 
     // Load GGUF from embedded asset (already decompressed by embed_zst_asset macro)
     info!("  Loading GGUF file from assets...");
@@ -1743,14 +1757,26 @@ pub fn load_parakeet_tdt_from_gguf_mmap_local<P: AsRef<Path>>(
 
     // Load tokenizer from embedded asset
     info!("  Loading tokenizer from assets...");
-    let tok_bytes = TDT_TOKENIZER_JSON.bytes(&assets).map_err(|_| {
-        Error::new(
-            ErrorKind::Other,
-            "failed to get decompressed bytes for TDT_TOKENIZER_JSON",
-        )
-    })?;
-    let tokenizer = Tokenizer::from_bytes(tok_bytes)
-        .map_err(|e| Error::new(ErrorKind::Other, format!("failed to parse TDT_TOKENIZER_JSON: {e}")))?;
+    let tokenizer = if let Ok(tok_bytes) = TDT_TOKENIZER_JSON.bytes(&assets) {
+        Tokenizer::from_bytes(tok_bytes)
+            .map_err(|e| Error::new(ErrorKind::Other, format!("failed to parse TDT_TOKENIZER_JSON: {e}")))?
+    } else {
+        if TDT_TOKENIZER.bytes(&assets).is_ok() {
+            return Err(anyhow!(
+                "Found parakeet-tdt-tokenizer.model.zst but missing parakeet-tdt-tokenizer.json.zst\n\
+                 \nThe JSON format is required. Please install Python dependencies and re-run:\n\
+                 pip install sentencepiece tokenizers\n\
+                 python scripts/download_parakeet_tdt.py"
+            ));
+        } else {
+            return Err(anyhow!(
+                "Missing tokenizer file: parakeet-tdt-tokenizer.json.zst\n\
+                 \nDownload with:\n\
+                 pip install sentencepiece tokenizers\n\
+                 python scripts/download_parakeet_tdt.py"
+            ));
+        }
+    };
 
     // Memory-map GGUF file (uncompressed)
     info!("  Memory-mapping GGUF file from assets...");
@@ -2228,14 +2254,26 @@ pub fn load_parakeet_streaming_tdt_from_gguf_local<P: AsRef<Path>>(
 
     // Load tokenizer from embedded asset
     info!("  Loading tokenizer from assets...");
-    let tok_bytes = STREAMING_TDT_TOKENIZER_JSON.bytes(&assets).map_err(|_| {
-        Error::new(
-            ErrorKind::Other,
-            "failed to get decompressed bytes for STREAMING_TDT_TOKENIZER_JSON",
-        )
-    })?;
-    let tokenizer = Tokenizer::from_bytes(tok_bytes)
-        .map_err(|e| Error::new(ErrorKind::Other, format!("failed to parse STREAMING_TDT_TOKENIZER_JSON: {e}")))?;
+    let tokenizer = if let Ok(tok_bytes) = STREAMING_TDT_TOKENIZER_JSON.bytes(&assets) {
+        Tokenizer::from_bytes(tok_bytes)
+            .map_err(|e| Error::new(ErrorKind::Other, format!("failed to parse STREAMING_TDT_TOKENIZER_JSON: {e}")))?
+    } else {
+        if STREAMING_TDT_TOKENIZER.bytes(&assets).is_ok() {
+            return Err(anyhow!(
+                "Found parakeet-streaming-tdt-tokenizer.model.zst but missing parakeet-streaming-tdt-tokenizer.json.zst\n\
+                 \nThe JSON format is required. Please install Python dependencies and re-run:\n\
+                 pip install sentencepiece tokenizers\n\
+                 python scripts/download_parakeet_tdt.py"
+            ));
+        } else {
+            return Err(anyhow!(
+                "Missing tokenizer file: parakeet-streaming-tdt-tokenizer.json.zst\n\
+                 \nDownload with:\n\
+                 pip install sentencepiece tokenizers\n\
+                 python scripts/download_parakeet_tdt.py"
+            ));
+        }
+    };
 
     // Load GGUF from embedded asset (already decompressed by embed_zst_asset macro)
     info!("  Loading GGUF file from assets...");
