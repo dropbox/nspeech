@@ -9,8 +9,9 @@ use candle_transformers::models::with_tracing::QMatMul;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
-#[cfg(feature = "quantized")]
 use std::path::Path;
+#[cfg(feature = "quantized")]
+use std::io::Seek;
 use tokenizers::Tokenizer;
 
 // Embedded assets (configs/tokenizer/models)
