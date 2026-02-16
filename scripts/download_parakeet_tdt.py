@@ -342,22 +342,24 @@ def main():
     compressed_files = []
 
     # Compress config
-    config_zst = compress_file(config_path, "parakeet-tdt-config.json.zst")
+    config_zst = cache_dir / "parakeet-tdt-config.json.zst"
+    compress_file(str(config_path), str(config_zst))
     compressed_files.append(config_zst)
 
-    # Compress weights
-    weights_zst = compress_file(safetensors_path, "parakeet-tdt-model.safetensors.zst")
-    compressed_files.append(weights_zst)
+    # Skip safetensors compression (slow and not needed - we use GGUF instead)
+    # The uncompressed safetensors is kept in cache for potential re-quantization
 
     # Compress tokenizers if they exist
     if files['tokenizer']:
         # Compress tokenizer.model
-        tokenizer_model_zst = compress_file(tokenizer_model_path, "parakeet-tdt-tokenizer.model.zst")
+        tokenizer_model_zst = cache_dir / "parakeet-tdt-tokenizer.model.zst"
+        compress_file(str(tokenizer_model_path), str(tokenizer_model_zst))
         compressed_files.append(tokenizer_model_zst)
 
         # Compress tokenizer.json if it was created
         if (cache_dir / "tokenizer.json").exists():
-            tokenizer_json_zst = compress_file(cache_dir / "tokenizer.json", "parakeet-tdt-tokenizer.json.zst")
+            tokenizer_json_zst = cache_dir / "parakeet-tdt-tokenizer.json.zst"
+            compress_file(str(cache_dir / "tokenizer.json"), str(tokenizer_json_zst))
             compressed_files.append(tokenizer_json_zst)
 
     # Quantize model to GGUF format

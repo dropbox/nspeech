@@ -238,10 +238,10 @@ def main() -> None:
     print("Step 4: Compressing safetensors with zstd (level 19)...")
 
     model_zst = assets_dir / "vad16.safetensors.zst"
-    compress_file(model_path, model_zst)
+    compress_file(str(model_path), str(model_zst))
 
     config_zst = assets_dir / "vad16.config.json.zst"
-    compress_file(config_path, config_zst)
+    compress_file(str(config_path), str(config_zst))
 
     # Quantize to GGUF Q8_0
     print("\nStep 5: Quantizing to GGUF Q8_0 format...")
