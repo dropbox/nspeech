@@ -6,7 +6,6 @@ use candle_nn::{
     VarBuilder,
 };
 use candle_transformers::models::with_tracing::QMatMul;
-use hf_hub::api::sync::Api;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
@@ -1512,22 +1511,6 @@ impl FastConformerConfig {
     }
 }
 
-pub fn load_parakeet_ctc_from_hf(repo_id: &str, device: &Device) -> Result<ParakeetFastConformerCtc> {
-    let api = Api::new()?;
-    let repo = api.model(repo_id.to_string());
-    let config_path = repo.get("config.json")?;
-    let weights_path = repo.get("model.safetensors")?;
-    let tokenizer_path = repo.get("tokenizer.json")?;
-    let cfg_json = std::fs::read_to_string(config_path)?;
-    let hf_cfg: HfParakeetCtcConfig = serde_json::from_str(&cfg_json)?;
-    let cfg = FastConformerConfig::from_hf(&hf_cfg);
-    let tokenizer = Tokenizer::from_file(tokenizer_path)
-        .map_err(|e| anyhow!("tokenizer load error: {e}"))?;
-    let vb =
-        unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F16, device)? };
-    ParakeetFastConformerCtc::new_with_tokenizer(cfg, vb, tokenizer)
-}
-
 pub fn load_parakeet_ctc_from_local<P: AsRef<Path>>(
     dir: P,
     device: &Device,
@@ -1556,54 +1539,6 @@ pub fn load_parakeet_ctc_from_local<P: AsRef<Path>>(
         unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F16, device)? };
     ParakeetFastConformerCtc::new_with_tokenizer(cfg, vb, tokenizer)
 }
-
-/// Load Parakeet CTC model from GGUF quantized weights stored on Hugging Face Hub
-///
-/// # Arguments
-/// * `repo_id` - Hugging Face repository (e.g., "nvidia/parakeet-ctc-0.6b")
-/// * `gguf_filename` - GGUF file name (e.g., "model_q8_0.gguf" or "model_q4k.gguf")
-/// * `device` - Device to load model on
-///
-/// # Example
-/// ```no_run
-/// use speech::parakeet::{load_parakeet_ctc_from_gguf_hf, get_device};
-/// let device = get_device()?;
-/// let model = load_parakeet_ctc_from_gguf_hf("nvidia/parakeet-ctc-0.6b", "model_q8_0.gguf", &device)?;
-/// # Ok::<(), anyhow::Error>(())
-/// ```
-#[cfg(feature = "quantized")]
-pub fn load_parakeet_ctc_from_gguf_hf(
-    repo_id: &str,
-    gguf_filename: &str,
-    device: &Device,
-) -> Result<QParakeetFastConformerCtc> {
-    println!("Loading quantized model from Hugging Face Hub");
-    println!("  Repository: {}", repo_id);
-    println!("  GGUF file: {}", gguf_filename);
-
-    let api = Api::new()?;
-    let repo = api.model(repo_id.to_string());
-    let config_path = repo.get("config.json")?;
-    let gguf_path = repo.get(gguf_filename)?;
-    let tokenizer_path = repo.get("tokenizer.json")?;
-
-    load_gguf_model_common(config_path, gguf_path, tokenizer_path, device)
-}
-
-/// Load Parakeet CTC model from safetensors (FP32 full-precision inference)
-#[cfg(not(feature = "quantized"))]
-pub fn load_parakeet_ctc_from_gguf_hf(
-    repo_id: &str,
-    _gguf_filename: &str,  // Ignored in FP32 mode
-    device: &Device,
-) -> Result<ParakeetFastConformerCtc> {
-    println!("Loading model from Hugging Face Hub (FP32 full-precision from safetensors)");
-    println!("  Repository: {}", repo_id);
-
-    // Use the existing safetensors loader for true FP32 weights
-    load_parakeet_ctc_from_hf(repo_id, device)
-}
-
 /// Load Parakeet CTC model from GGUF quantized weights stored locally
 ///
 /// # Arguments

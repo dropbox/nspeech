@@ -12,8 +12,7 @@ pub mod streaming_encoder;
 // Re-export commonly used types and functions
 pub use fast_conformer::{
     FastConformerConfig, ParakeetFastConformerCtc, QParakeetFastConformerCtc,
-    load_parakeet_ctc_from_hf, load_parakeet_ctc_from_local,
-    load_parakeet_ctc_from_gguf_hf, load_parakeet_ctc_from_gguf_local,
+    load_parakeet_ctc_from_local, load_parakeet_ctc_from_gguf_local,
     VAD_CONFIG, VAD_MODEL, // Re-export VAD assets for use in silero module
 };
 
@@ -21,7 +20,7 @@ pub use fast_conformer::{
 pub use transducer::{
     TransducerConfig, TransducerModel, PredictionNetwork, JointNetwork,
     TokenWithTimestamp, BeamStreamingState, StreamingBeamHypothesis,
-    load_parakeet_tdt_from_hf, load_parakeet_tdt_from_local,
+    load_parakeet_tdt_from_local,
     load_parakeet_tdt_from_gguf_local, load_parakeet_tdt_from_gguf_mmap_local,
     load_parakeet_streaming_tdt_from_local,  // BF16 safetensors
     //load_parakeet_streaming_tdt_from_gguf_local,  // Cache-aware streaming variant (quantized)
