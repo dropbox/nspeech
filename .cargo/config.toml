@@ -1,0 +1,55 @@
+# Build configuration for multiple target platforms
+#
+# Local development: macOS arm64 (Apple Silicon)
+# Production deployment: Linux x86-64 with Intel Xeon Platinum 8375C (Ice Lake)
+
+[build]
+# Use all available CPU cores for compilation
+jobs = -1
+
+# macOS arm64 (Apple Silicon) - local development
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-C", "target-cpu=apple-m1",       # Optimize for Apple Silicon
+    "-C", "opt-level=3",
+]
+
+# Linux x86-64 - optimized for Intel Xeon Platinum 8375C (Ice Lake)
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    # Target Ice Lake microarchitecture with full AVX-512 support
+    "-C", "target-cpu=icelake-server",
+
+    # Enable link-time optimization for better cross-crate optimization
+    "-C", "lto=thin",
+
+    # Additional optimizations
+    "-C", "codegen-units=1",           # Better optimization at cost of compile time
+    "-C", "opt-level=3",                # Maximum optimization
+
+    # Explicitly enable key CPU features for Ice Lake
+    # These are redundant with target-cpu but make capabilities explicit
+    "-C", "target-feature=+avx512f,+avx512dq,+avx512cd,+avx512bw,+avx512vl",
+    "-C", "target-feature=+avx512vnni",  # Vector Neural Network Instructions
+    "-C", "target-feature=+avx2,+fma",   # Also available, used as fallback
+
+    # Other performance features
+    "-C", "prefer-dynamic=no",          # Static linking for better optimization
+]
+
+# Profile for release builds (used when building with --release)
+[profile.release]
+lto = "thin"              # Link-time optimization
+codegen-units = 1         # Single codegen unit for better optimization
+opt-level = 3             # Maximum optimization
+strip = false             # Keep symbols for better profiling
+panic = "abort"           # Smaller binary, faster panic handling
+
+# Profile for distribution builds
+[profile.dist]
+inherits = "release"
+lto = "fat"               # Full LTO for maximum optimization
+codegen-units = 1
+opt-level = 3
+strip = true              # Remove symbols for smaller binary
+
