@@ -28,7 +28,7 @@ candle-nn = { git = "https://github.com/huggingface/candle", branch = "main" }
 candle-transformers = { git = "https://github.com/huggingface/candle", branch = "main" }
 
 # Tokenizer to decode Parakeet's SentencePiece/BPE tokens
-tokenizers = { version = "0.20", features = ["http"] }
+tokenizers = "0.20"
 hound = "3.5"
 rustfft = "6.2"
 num-complex = "0.4"
