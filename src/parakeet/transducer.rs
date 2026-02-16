@@ -1503,7 +1503,10 @@ pub fn load_parakeet_tdt_from_gguf_local<P: AsRef<Path>>(
     let cfg_bytes = TDT_CONFIG.bytes(&assets).map_err(|_| {
         Error::new(
             ErrorKind::Other,
-            "failed to get decompressed bytes for TDT_CONFIG",
+            format!("Failed to load parakeet-tdt-config.json.zst from {:?}\n\
+                     \nMissing model files? Download with:\n\
+                     python scripts/download_parakeet_tdt.py",
+                    assets.join("parakeet-tdt-config.json.zst")),
         )
     })?;
     let hf_cfg: HfTransducerConfig = serde_json::from_slice(cfg_bytes).map_err(|e| {
@@ -1538,7 +1541,10 @@ pub fn load_parakeet_tdt_from_gguf_local<P: AsRef<Path>>(
     let tok_bytes = TDT_TOKENIZER_JSON.bytes(&assets).map_err(|_| {
         Error::new(
             ErrorKind::Other,
-            "failed to get decompressed bytes for TDT_TOKENIZER_JSON",
+            format!("Failed to load parakeet-tdt-tokenizer.json.zst from {:?}\n\
+                     \nMissing model files? Download with:\n\
+                     python scripts/download_parakeet_tdt.py",
+                    assets.join("parakeet-tdt-tokenizer.json.zst")),
         )
     })?;
     let tokenizer = Tokenizer::from_bytes(tok_bytes)
@@ -1549,7 +1555,11 @@ pub fn load_parakeet_tdt_from_gguf_local<P: AsRef<Path>>(
     let gguf_bytes = TDT_MODEL_Q8_0_GGUF.bytes(&assets).map_err(|_| {
         Error::new(
             ErrorKind::Other,
-            "failed to load TDT_MODEL_Q8_0_GGUF",
+            format!("Failed to load parakeet-tdt-model_q8_0.gguf.zst from {:?}\n\
+                     \nMissing model files? Download with:\n\
+                     python scripts/download_parakeet_tdt.py\n\
+                     \nNote: This is a large file (~650MB compressed)",
+                    assets.join("parakeet-tdt-model_q8_0.gguf.zst")),
         )
     })?;
 
