@@ -5,9 +5,10 @@ use serde::Deserialize;
 use std::path::Path;
 
 use crate::embed_zst_asset;
+use crate::embed_asset;
 embed_zst_asset!(pub VAD_CONFIG,                     "vad16.config.json.zst");
 embed_zst_asset!(pub VAD_MODEL,                      "vad16.safetensors.zst");
-embed_zst_asset!(pub VAD_MODEL_Q8_0_GGUF,            "vad16_q8_0.gguf.zst");
+embed_asset!(pub VAD_MODEL_Q8_0_GGUF_MMAP,           "vad16_q8_0.gguf");  // Uncompressed for mmap
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct VadConfig {
@@ -292,20 +293,22 @@ impl SileroVad {
         Ok((basis, [enc0, enc1, enc2, enc3], rnn, head))
     }
 
-    /// Load VAD from GGUF Q8_0 quantized format (recommended for smaller file size)
+    /// Load VAD from memory-mapped GGUF Q8_0 quantized format (recommended)
     ///
-    /// **Note**: This provides **quantized storage** (6.2x smaller file size) but performs
-    /// **FP32 inference** by dequantizing weights on load. True quantized inference is not
-    /// implemented because Candle does not support quantized Conv1d/LSTM operations.
+    /// **Note**: Uses memory-mapping for efficient loading without zstd decompression overhead.
+    /// Weights are dequantized to FP32 on load for inference (Candle doesn't support quantized
+    /// Conv1d/LSTM operations).
     ///
     /// Benefits:
-    /// - 6.2x smaller download/disk size (194 KB vs 948 KB)
-    /// - Faster model loading from disk
+    /// - Zero-copy memory mapping (faster loading)
+    /// - No decompression overhead
+    /// - Lower peak memory usage during load
     ///
     /// Limitations:
     /// - Runtime memory usage same as FP32 (weights dequantized on load)
     /// - Inference speed same as FP32 (no quantized operations)
-    pub fn load_from_gguf<P: AsRef<Path>>(assets: P, device: &Device) -> Result<Self> {
+    /// - Requires uncompressed GGUF file on disk
+    pub fn load_from_gguf_mmap<P: AsRef<Path>>(assets: P, device: &Device) -> Result<Self> {
         let assets = assets.as_ref().to_path_buf();
 
         // Load config from embedded asset
@@ -314,26 +317,22 @@ impl SileroVad {
         })?;
         let cfg: VadConfig = serde_json::from_slice(cfg_bytes)?;
 
-        // Load GGUF model from embedded asset (decompress and own the bytes)
-        let gguf_bytes_borrowed = VAD_MODEL_Q8_0_GGUF.bytes(&assets).map_err(|_| {
-            anyhow::anyhow!("failed to load VAD GGUF from assets")
+        // Memory-map GGUF file (uncompressed, zero-copy)
+        let gguf_bytes = VAD_MODEL_Q8_0_GGUF_MMAP.bytes(&assets).map_err(|_| {
+            anyhow::anyhow!("failed to mmap VAD GGUF from assets")
         })?;
-        // Convert borrowed bytes to owned Vec for GGUF parsing
-        let gguf_bytes: Vec<u8> = gguf_bytes_borrowed.to_vec();
 
-        // Parse GGUF and dequantize tensors to FP32
+        // Parse GGUF from mmap'd bytes
         use candle_core::quantized::gguf_file;
-
-        // Create cursor and read GGUF header
-        let gguf = gguf_file::Content::read(&mut std::io::Cursor::new(&gguf_bytes))?;
+        let gguf = gguf_file::Content::read(&mut std::io::Cursor::new(gguf_bytes))?;
 
         // Extract tensors (dequantize Q8_0 -> FP32 for inference)
         // NOTE: Dequantization happens here because Candle doesn't support quantized
-        // Conv1d/LSTM operations. The benefit is purely storage size reduction (6.2x).
+        // Conv1d/LSTM operations. The benefit is faster loading and lower peak memory.
         let mut tensors = std::collections::HashMap::new();
         for (name, _) in gguf.tensor_infos.iter() {
             // Each tensor read needs a fresh cursor
-            let qtensor = gguf.tensor(&mut std::io::Cursor::new(&gguf_bytes), name, device)?;
+            let qtensor = gguf.tensor(&mut std::io::Cursor::new(gguf_bytes), name, device)?;
             let tensor = qtensor.dequantize(device)?;  // Dequantize to FP32 for inference
             tensors.insert(name.clone(), tensor);
         }

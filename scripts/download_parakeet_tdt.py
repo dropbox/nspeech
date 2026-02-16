@@ -35,9 +35,14 @@ try:
     from safetensors.torch import save_file
     import torch
     import yaml
-    DEPS_AVAILABLE = True
-except ImportError:
-    DEPS_AVAILABLE = False
+except ImportError as e:
+    print("Error: Required dependencies not installed")
+    print(f"Missing: {e}")
+    print("\nInstall with:")
+    print("  pip install -r requirements.txt")
+    print("\nOr install individually:")
+    print("  pip install huggingface_hub torch safetensors pyyaml")
+    exit(1)
 
 
 def extract_nemo_file(nemo_path: pathlib.Path, extract_dir: pathlib.Path) -> Dict[str, pathlib.Path]:
@@ -169,14 +174,15 @@ def convert_weights_to_safetensors(ckpt_path: pathlib.Path, output_path: pathlib
     print(f"  ✓ Saved: {size_mb:.1f} MB")
 
 
-def quantize_tdt_model(cache_dir: pathlib.Path, safetensors_path: pathlib.Path) -> pathlib.Path | None:
-    """Quantize TDT safetensors model to GGUF format with zstd compression.
+def quantize_tdt_model(cache_dir: pathlib.Path, safetensors_path: pathlib.Path) -> pathlib.Path:
+    """Quantize TDT safetensors model to GGUF format (uncompressed for mmap).
 
-    Returns path to quantized .gguf.zst file, or None if quantization failed.
+    Returns path to quantized .gguf file.
+    Raises exception if quantization fails.
     """
-    print("\nQuantizing TDT model to GGUF with zstd compression...")
+    print("\nQuantizing TDT model to GGUF (uncompressed for mmap)...")
 
-    gguf_path = cache_dir / "parakeet-tdt-model_q8_0.gguf.zst"
+    gguf_path = cache_dir / "parakeet-tdt-model_q8_0.gguf"
 
     if not safetensors_path.exists():
         print(f"  ✗ model.safetensors not found at {safetensors_path}")
@@ -185,20 +191,33 @@ def quantize_tdt_model(cache_dir: pathlib.Path, safetensors_path: pathlib.Path) 
     print(f"  Input:  {safetensors_path}")
     print(f"  Output: {gguf_path}")
     print(f"  Format: Q8_0 (recommended quality/size balance)")
-    print(f"  Compression: zstd level 19 (inline)\n")
+    print(f"  Note: Uncompressed for memory-mapped loading\n")
+
+    # Run cargo build first to ensure quantize_gguf is compiled
+    print("  Building quantize_gguf tool...")
+    project_root = pathlib.Path(__file__).parent.parent
 
     try:
-        # Run cargo build first to ensure quantize_gguf is compiled
-        print("  Building quantize_gguf tool...")
-        project_root = pathlib.Path(__file__).parent.parent
         subprocess.run(
             ["cargo", "build", "--example", "quantize_gguf", "--release"],
             check=True,
             cwd=project_root,
+            capture_output=True,
+            text=True,
         )
+    except subprocess.CalledProcessError as e:
+        print(f"\n✗ Error: Failed to build quantize_gguf tool")
+        print(f"stdout: {e.stdout}")
+        print(f"stderr: {e.stderr}")
+        raise Exception("Quantization build failed") from e
+    except FileNotFoundError:
+        print("\n✗ Error: cargo command not found")
+        print("Please install Rust from https://rustup.rs")
+        raise Exception("cargo not found")
 
-        # Run quantization tool (compression is always enabled)
-        print("  Running quantization (this may take a few minutes)...")
+    # Run quantization tool (compression is always enabled)
+    print("  Running quantization (this may take a few minutes)...")
+    try:
         subprocess.run(
             [
                 "cargo", "run", "--example", "quantize_gguf", "--release", "--",
@@ -208,23 +227,20 @@ def quantize_tdt_model(cache_dir: pathlib.Path, safetensors_path: pathlib.Path) 
             ],
             check=True,
             cwd=project_root,
+            capture_output=True,
+            text=True,
         )
-        print(f"  ✓ Quantized TDT model saved to {gguf_path}")
-        return gguf_path
     except subprocess.CalledProcessError as e:
-        print(f"  ✗ Quantization failed: {e}")
-        print(f"  You can manually quantize later with:")
-        print(f"    cargo run --example quantize_gguf --release -- \\")
-        print(f"      {safetensors_path} {gguf_path} --format q8_0")
-        return None
+        print(f"\n✗ Error: Quantization failed")
+        print(f"stdout: {e.stdout}")
+        print(f"stderr: {e.stderr}")
+        raise Exception("Quantization failed") from e
+
+    print(f"  ✓ Quantized TDT model saved to {gguf_path}")
+    return gguf_path
 
 
 def main():
-    if not DEPS_AVAILABLE:
-        print("Error: Required dependencies not installed")
-        print("Install with: pip install huggingface_hub torch safetensors pyyaml")
-        return 1
-
     parser = argparse.ArgumentParser(
         description="Download and convert Parakeet TDT model"
     )
@@ -310,32 +326,36 @@ def main():
         try:
             from tokenizers import Tokenizer, models as tokenizer_models
             from sentencepiece import SentencePieceProcessor
+        except ImportError as e:
+            print(f"\n✗ Error: Required tokenizer dependencies not installed: {e}")
+            print("\nThe tokenizer.json file is REQUIRED for the Rust code to work.")
+            print("\nInstall with:")
+            print("  pip install sentencepiece tokenizers")
+            print("\nOr install all dependencies:")
+            print("  pip install -r requirements.txt")
+            return 1
 
-            sp = SentencePieceProcessor()
-            sp.load(str(tokenizer_model_path))
+        sp = SentencePieceProcessor()
+        sp.load(str(tokenizer_model_path))
 
-            # Get vocabulary
-            vocab = {}
-            for i in range(sp.vocab_size()):
-                piece = sp.id_to_piece(i)
-                score = sp.get_score(i)
-                vocab[piece] = score
+        # Get vocabulary
+        vocab = {}
+        for i in range(sp.vocab_size()):
+            piece = sp.id_to_piece(i)
+            score = sp.get_score(i)
+            vocab[piece] = score
 
-            # Create Unigram tokenizer
-            tokenizer = Tokenizer(tokenizer_models.Unigram(list(vocab.items())))
+        # Create Unigram tokenizer
+        tokenizer = Tokenizer(tokenizer_models.Unigram(list(vocab.items())))
 
-            # Add decoder to handle SentencePiece special characters
-            from tokenizers import decoders
-            tokenizer.decoder = decoders.Metaspace(replacement="▁")
+        # Add decoder to handle SentencePiece special characters
+        from tokenizers import decoders
+        tokenizer.decoder = decoders.Metaspace(replacement="▁")
 
-            # Save as JSON
-            tokenizer_json_path = cache_dir / "tokenizer.json"
-            tokenizer.save(str(tokenizer_json_path))
-            print(f"✓ Created tokenizer.json with {len(vocab)} tokens")
-        except ImportError:
-            print("⚠ Warning: sentencepiece or tokenizers not installed, skipping tokenizer.json conversion")
-            print("  The model will still work but may have issues loading the tokenizer")
-            print("  Install with: pip install sentencepiece tokenizers")
+        # Save as JSON
+        tokenizer_json_path = cache_dir / "tokenizer.json"
+        tokenizer.save(str(tokenizer_json_path))
+        print(f"✓ Created tokenizer.json with {len(vocab)} tokens")
 
     # Compress files
     print("\nCompressing files with zstd...")
@@ -362,11 +382,10 @@ def main():
             compress_file(str(cache_dir / "tokenizer.json"), str(tokenizer_json_zst))
             compressed_files.append(tokenizer_json_zst)
 
-    # Quantize model to GGUF format
+    # Quantize model to GGUF format (uncompressed for mmap)
     if not args.skip_quantize:
         gguf_file = quantize_tdt_model(cache_dir, safetensors_path)
-        if gguf_file:
-            compressed_files.append(gguf_file)
+        compressed_files.append(gguf_file)
 
     # Copy to assets
     print(f"\nCopying to assets directory...")
@@ -386,9 +405,10 @@ def main():
     print(f"\nCache: {cache_dir}")
     print(f"Assets: {assets_dir}")
     print("\nAssets contents:")
-    for p in sorted(assets_dir.glob("parakeet-tdt-*.zst")):
-        size_mb = p.stat().st_size / (1024 * 1024)
-        print(f"  - {p.name} ({size_mb:.1f} MB)")
+    for p in sorted(assets_dir.glob("parakeet-tdt-*")):
+        if p.suffix in ['.zst', '.gguf']:
+            size_mb = p.stat().st_size / (1024 * 1024)
+            print(f"  - {p.name} ({size_mb:.1f} MB)")
 
     print("\nYou can now run:")
     print("  cargo run --example transcribe_tdt_with_vad --release -- audio.wav")

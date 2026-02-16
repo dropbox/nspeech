@@ -153,7 +153,7 @@ def convert_github_safetensors(input_path: pathlib.Path, output_path: pathlib.Pa
     print(f"  ✓ Converted safetensors ({size_mb:.2f} MB)")
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(
         description="Download and prepare Silero VAD models"
     )
@@ -243,9 +243,9 @@ def main() -> None:
     config_zst = assets_dir / "vad16.config.json.zst"
     compress_file(str(config_path), str(config_zst))
 
-    # Quantize to GGUF Q8_0
-    print("\nStep 5: Quantizing to GGUF Q8_0 format...")
-    gguf_path = cache_dir / "vad16_q8_0.gguf.zst"
+    # Quantize to GGUF Q8_0 (uncompressed for mmap)
+    print("\nStep 5: Quantizing to GGUF Q8_0 format (uncompressed for mmap)...")
+    gguf_path = cache_dir / "vad16_q8_0.gguf"
 
     try:
         # Run the Rust quantization tool
@@ -265,20 +265,21 @@ def main() -> None:
                 print(f"    {line}")
 
         # Copy to assets directory
-        assets_gguf = assets_dir / "vad16_q8_0.gguf.zst"
+        assets_gguf = assets_dir / "vad16_q8_0.gguf"
         shutil.copy2(gguf_path, assets_gguf)
 
         size_kb = assets_gguf.stat().st_size / 1024
-        print(f"  ✓ Quantized GGUF created ({size_kb:.1f} KB)")
+        print(f"  ✓ Quantized GGUF created ({size_kb:.1f} KB) - uncompressed for mmap")
 
     except subprocess.CalledProcessError as e:
-        print(f"  ✗ Quantization failed: {e}")
-        print(f"  stderr: {e.stderr}")
-        print("  Continuing without quantized model...")
+        print(f"\n✗ Error: Quantization failed")
+        print(f"stdout: {e.stdout}")
+        print(f"stderr: {e.stderr}")
+        raise Exception("Quantization failed") from e
     except FileNotFoundError:
-        print("  ✗ Cargo not found. Skipping quantization.")
-        print("  You can manually quantize later with:")
-        print(f"    cargo run --example quantize_vad_gguf --release -- {model_path} {gguf_path}")
+        print("\n✗ Error: cargo command not found")
+        print("Please install Rust from https://rustup.rs")
+        raise Exception("cargo not found")
 
     # Summary
     print("\n" + "=" * 60)
@@ -287,17 +288,25 @@ def main() -> None:
     print("  - Original files kept for future use")
 
     print(f"\nAssets directory: {assets_dir}")
-    print("  - Compressed .zst files ready for inference:")
-    for p in sorted(assets_dir.glob("vad*.zst")):
-        size_kb = p.stat().st_size / 1024
-        model_type = "quantized GGUF Q8_0" if "q8_0" in p.name else "safetensors FP32"
-        print(f"    • {p.name:30s} ({size_kb:6.1f} KB) - {model_type}")
+    print("  - Files ready for inference:")
+    for p in sorted(assets_dir.glob("vad*")):
+        if p.suffix in ['.zst', '.gguf']:
+            size_kb = p.stat().st_size / 1024
+            if "q8_0" in p.name and p.suffix == '.gguf':
+                model_type = "quantized GGUF Q8_0 (mmap)"
+            elif "q8_0" in p.name:
+                model_type = "quantized GGUF Q8_0"
+            else:
+                model_type = "safetensors FP32"
+            print(f"    • {p.name:30s} ({size_kb:6.1f} KB) - {model_type}")
 
     print("\nYou can now run:")
     print("  cargo run --example transcribe_tdt_with_vad --release -- audio.wav")
-    print("\nThe quantized GGUF model (vad16_q8_0.gguf.zst) is used by default.")
-    print("Note: Provides 6.2x smaller storage size, but inference uses dequantized FP32.")
+    print("\nThe quantized GGUF model (vad16_q8_0.gguf) is used with mmap by default.")
+    print("Note: Memory-mapped for fast loading, inference uses dequantized FP32.")
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    exit(main())

@@ -16,7 +16,7 @@
 ///   PARAKEET_DEVICE=cpu cargo run --example transcribe_tdt_with_vad --release -- audio.wav
 
 use anyhow::Result;
-use speech::parakeet::{get_device, load_parakeet_tdt_from_gguf_local, TransducerModel};
+use speech::parakeet::{get_device, load_parakeet_tdt_from_gguf_mmap_local, TransducerModel};
 use speech::silero::{SileroVad, VadStream};
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -373,18 +373,18 @@ fn main() -> Result<()> {
     // Initialize performance tracking
     let mut metrics = PerformanceMetrics::default();
 
-    // Load Silero VAD
+    // Load Silero VAD (memory-mapped GGUF)
     println!("Loading Silero VAD...");
     let vad_start = Instant::now();
-    let vad = SileroVad::load_from_gguf(&assets, &device)?;
+    let vad = SileroVad::load_from_gguf_mmap(&assets, &device)?;
     let vad_stream = VadStream::new(vad, &device)?;
     metrics.vad_load_ms = vad_start.elapsed().as_millis();
     println!("✓ VAD loaded ({} ms)\n", metrics.vad_load_ms);
 
-    // Load Parakeet TDT model (from embedded assets, quantized GGUF)
+    // Load Parakeet TDT model (memory-mapped GGUF)
     println!("Loading Parakeet TDT model...");
     let tdt_start = Instant::now();
-    let mut model = load_parakeet_tdt_from_gguf_local(&assets, &device)?;
+    let mut model = load_parakeet_tdt_from_gguf_mmap_local(&assets, &device)?;
     model.load_tokenizer(&assets)?;
     metrics.tdt_load_ms = tdt_start.elapsed().as_millis();
     println!("✓ TDT model loaded ({} ms)\n", metrics.tdt_load_ms);
