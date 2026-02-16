@@ -1,5 +1,8 @@
 huggingface_hub>=0.24
 numpy
+pyyaml
 safetensors
+sentencepiece
+tokenizers
 torch
 zstandard
