@@ -1,4 +1,4 @@
-//! Moonshine V2 Streaming Transformer Encoder.
+//! Moonshine V2 Streaming Transformer Encoder (quantized inference).
 //!
 //! Architecture per layer:
 //! - Pre-norm (custom LayerNorm with unit offset gamma)
@@ -9,22 +9,29 @@
 //! - Residual connection
 //!
 //! Final norm after all layers.
+//!
+//! Weights are kept quantized (Q8_0) and dequantized on-the-fly during matmul.
 
 use anyhow::Result;
 use candle_core::{Device, Module, Tensor, D};
-use candle_nn::{Linear, VarBuilder};
+use candle_transformers::models::with_tracing::QMatMul;
 
 use super::config::MoonshineConfig;
 
+type QVarBuilder = candle_transformers::quantized_var_builder::VarBuilder;
+
 /// Custom LayerNorm with unit-offset gamma: output = LN(x) * (gamma + 1.0).
+///
+/// Gamma is dequantized on load (small 1D tensor, not worth keeping quantized).
 struct UnitOffsetLayerNorm {
     gamma: Tensor,
     eps: f64,
 }
 
 impl UnitOffsetLayerNorm {
-    fn new(dim: usize, vb: VarBuilder<'_>) -> Result<Self> {
-        let gamma = vb.get(dim, "gamma")?;
+    fn new(dim: usize, vb: QVarBuilder) -> Result<Self> {
+        let gamma_q = vb.get(dim, "gamma")?;
+        let gamma = gamma_q.dequantize(vb.device())?;
         Ok(Self { gamma, eps: 1e-5 })
     }
 
@@ -40,28 +47,37 @@ impl UnitOffsetLayerNorm {
 }
 
 /// Encoder MLP: fc1 (with bias) -> GELU -> fc2 (with bias).
+///
+/// Weights kept quantized via QMatMul; biases dequantized on load.
 struct EncoderMLP {
-    fc1: Linear,
-    fc2: Linear,
+    fc1: QMatMul,
+    fc1_bias: Tensor,
+    fc2: QMatMul,
+    fc2_bias: Tensor,
 }
 
 impl EncoderMLP {
-    fn new(hidden_size: usize, intermediate_size: usize, vb: VarBuilder<'_>) -> Result<Self> {
-        let fc1_w = vb.pp("fc1").get((intermediate_size, hidden_size), "weight")?;
-        let fc1_b = vb.pp("fc1").get(intermediate_size, "bias")?;
-        let fc1 = Linear::new(fc1_w, Some(fc1_b));
+    fn new(hidden_size: usize, intermediate_size: usize, vb: QVarBuilder) -> Result<Self> {
+        let device = vb.device();
+        let fc1 = QMatMul::new(hidden_size, intermediate_size, vb.pp("fc1"))?;
+        let fc1_bias = vb.pp("fc1").get(intermediate_size, "bias")?.dequantize(device)?;
 
-        let fc2_w = vb.pp("fc2").get((hidden_size, intermediate_size), "weight")?;
-        let fc2_b = vb.pp("fc2").get(hidden_size, "bias")?;
-        let fc2 = Linear::new(fc2_w, Some(fc2_b));
+        let fc2 = QMatMul::new(intermediate_size, hidden_size, vb.pp("fc2"))?;
+        let fc2_bias = vb.pp("fc2").get(hidden_size, "bias")?.dequantize(device)?;
 
-        Ok(Self { fc1, fc2 })
+        Ok(Self {
+            fc1,
+            fc1_bias,
+            fc2,
+            fc2_bias,
+        })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = self.fc1.forward(x)?;
+        let x = self.fc1.forward(x)?.broadcast_add(&self.fc1_bias)?;
         let x = x.gelu_erf()?;
-        Ok(self.fc2.forward(&x)?)
+        let x = self.fc2.forward(&x)?.broadcast_add(&self.fc2_bias)?;
+        Ok(x)
     }
 }
 
@@ -88,11 +104,13 @@ fn sliding_window_mask(
 }
 
 /// Encoder self-attention with sliding window mask.
+///
+/// Projection weights kept quantized via QMatMul (no bias on projections).
 struct EncoderAttention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: QMatMul,
+    k_proj: QMatMul,
+    v_proj: QMatMul,
+    o_proj: QMatMul,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -100,14 +118,14 @@ struct EncoderAttention {
 }
 
 impl EncoderAttention {
-    fn new(cfg: &MoonshineConfig, vb: VarBuilder<'_>) -> Result<Self> {
+    fn new(cfg: &MoonshineConfig, vb: QVarBuilder) -> Result<Self> {
         let h = cfg.encoder_dim;
         let kv_dim = cfg.encoder_num_kv_heads * cfg.encoder_head_dim;
 
-        let q_proj = Linear::new(vb.pp("q_proj").get((kv_dim, h), "weight")?, None);
-        let k_proj = Linear::new(vb.pp("k_proj").get((kv_dim, h), "weight")?, None);
-        let v_proj = Linear::new(vb.pp("v_proj").get((kv_dim, h), "weight")?, None);
-        let o_proj = Linear::new(vb.pp("o_proj").get((h, kv_dim), "weight")?, None);
+        let q_proj = QMatMul::new(h, kv_dim, vb.pp("q_proj"))?;
+        let k_proj = QMatMul::new(h, kv_dim, vb.pp("k_proj"))?;
+        let v_proj = QMatMul::new(h, kv_dim, vb.pp("v_proj"))?;
+        let o_proj = QMatMul::new(kv_dim, h, vb.pp("o_proj"))?;
 
         let scale = (cfg.encoder_head_dim as f64).powf(-0.5);
 
@@ -174,7 +192,7 @@ struct EncoderLayer {
 }
 
 impl EncoderLayer {
-    fn new(cfg: &MoonshineConfig, vb: VarBuilder<'_>) -> Result<Self> {
+    fn new(cfg: &MoonshineConfig, vb: QVarBuilder) -> Result<Self> {
         Ok(Self {
             self_attn: EncoderAttention::new(cfg, vb.pp("self_attn"))?,
             mlp: EncoderMLP::new(cfg.encoder_dim, cfg.encoder_intermediate_size, vb.pp("mlp"))?,
@@ -206,7 +224,7 @@ pub struct MoonshineEncoder {
 }
 
 impl MoonshineEncoder {
-    pub fn new(cfg: &MoonshineConfig, vb: VarBuilder<'_>) -> Result<Self> {
+    pub fn new(cfg: &MoonshineConfig, vb: QVarBuilder) -> Result<Self> {
         let mut layers = Vec::with_capacity(cfg.encoder_num_layers);
         for i in 0..cfg.encoder_num_layers {
             layers.push(EncoderLayer::new(cfg, vb.pp(&format!("layers.{i}")))?);

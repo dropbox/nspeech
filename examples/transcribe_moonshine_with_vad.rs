@@ -1,11 +1,12 @@
 /// VAD-based transcription using Moonshine V2 medium streaming model.
 ///
 /// Uses Silero VAD to detect speech segments and transcribes each
-/// segment independently with Moonshine. This naturally handles
-/// long audio by processing speech segments individually.
+/// segment independently with Moonshine. Encoder/decoder weights stay
+/// quantized (Q8_0) for reduced memory and faster inference.
 ///
 /// Usage:
 ///   cargo run --example transcribe_moonshine_with_vad --release -- dots.wav
+///   cargo run --example transcribe_moonshine_with_vad --release -- dots.wav assets
 ///   cargo run --example transcribe_moonshine_with_vad --release -- MLKDream_16k.wav
 ///   PARAKEET_DEVICE=cpu cargo run --example transcribe_moonshine_with_vad --release -- audio.wav
 
@@ -143,9 +144,9 @@ fn detect_speech_segments(
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let wav_path = args.get(1).map(|s| s.as_str()).unwrap_or("dots.wav");
-    let model_dir = args.get(2).map(|s| s.as_str()).unwrap_or("hf_moonshine");
+    let model_dir = args.get(2).map(|s| s.as_str()).unwrap_or("assets");
 
-    println!("=== Moonshine V2 + VAD Transcription ===\n");
+    println!("=== Moonshine V2 + VAD Transcription (Quantized) ===\n");
 
     // Load audio
     let t0 = Instant::now();
@@ -165,9 +166,10 @@ fn main() -> Result<()> {
     println!("\nVAD: {} segments, {:.2}s speech ({:.1}% of total) in {:.0}ms",
         segments.len(), speech_duration, speech_duration / total_duration * 100.0, vad_ms);
 
-    // Load model
+    // Load model from GGUF assets
     let t2 = Instant::now();
-    let model = MoonshineModel::load(model_dir, &device)?;
+    println!("Loading Moonshine from GGUF assets ({})...", model_dir);
+    let model = MoonshineModel::load_from_gguf_mmap(model_dir, &device)?;
     println!("Model loaded in {:.0}ms\n", t2.elapsed().as_millis());
 
     // Transcribe each segment

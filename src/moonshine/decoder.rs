@@ -1,4 +1,4 @@
-//! Moonshine V2 Streaming Transformer Decoder.
+//! Moonshine V2 Streaming Transformer Decoder (quantized inference).
 //!
 //! Architecture per layer:
 //! - Pre-norm (standard LayerNorm, no bias)
@@ -8,22 +8,29 @@
 //! - Residual
 //! - Final norm + GLU MLP: fc1 -> chunk(2) -> silu(gate) * x -> fc2
 //! - Residual
+//!
+//! Weights are kept quantized (Q8_0) and dequantized on-the-fly during matmul.
 
 use anyhow::Result;
 use candle_core::{DType, Device, Module, Tensor, D};
-use candle_nn::{Embedding, Linear, VarBuilder};
+use candle_transformers::models::with_tracing::QMatMul;
 
 use super::config::MoonshineConfig;
 
+type QVarBuilder = candle_transformers::quantized_var_builder::VarBuilder;
+
 /// Standard LayerNorm (weight only, no bias).
+///
+/// Weight is dequantized on load (small 1D tensor).
 struct LayerNorm {
     weight: Tensor,
     eps: f64,
 }
 
 impl LayerNorm {
-    fn new(dim: usize, vb: VarBuilder<'_>) -> Result<Self> {
-        let weight = vb.get(dim, "weight")?;
+    fn new(dim: usize, vb: QVarBuilder) -> Result<Self> {
+        let weight_q = vb.get(dim, "weight")?;
+        let weight = weight_q.dequantize(vb.device())?;
         Ok(Self { weight, eps: 1e-5 })
     }
 
@@ -38,6 +45,8 @@ impl LayerNorm {
 }
 
 /// RoPE with partial rotation and interleaved pattern.
+///
+/// No learned weights — computed from config parameters.
 struct RotaryEmbedding {
     inv_freq: Tensor,
 }
@@ -170,11 +179,13 @@ impl KVCache {
 }
 
 /// Decoder attention (self or cross).
+///
+/// Projection weights kept quantized via QMatMul (no bias on projections).
 struct DecoderAttention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: QMatMul,
+    k_proj: QMatMul,
+    v_proj: QMatMul,
+    o_proj: QMatMul,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -189,15 +200,15 @@ impl DecoderAttention {
         num_kv_heads: usize,
         head_dim: usize,
         is_causal: bool,
-        vb: VarBuilder<'_>,
+        vb: QVarBuilder,
     ) -> Result<Self> {
         let kv_dim = num_kv_heads * head_dim;
         let q_dim = num_heads * head_dim;
 
-        let q_proj = Linear::new(vb.pp("q_proj").get((q_dim, hidden_size), "weight")?, None);
-        let k_proj = Linear::new(vb.pp("k_proj").get((kv_dim, hidden_size), "weight")?, None);
-        let v_proj = Linear::new(vb.pp("v_proj").get((kv_dim, hidden_size), "weight")?, None);
-        let o_proj = Linear::new(vb.pp("o_proj").get((hidden_size, q_dim), "weight")?, None);
+        let q_proj = QMatMul::new(hidden_size, q_dim, vb.pp("q_proj"))?;
+        let k_proj = QMatMul::new(hidden_size, kv_dim, vb.pp("k_proj"))?;
+        let v_proj = QMatMul::new(hidden_size, kv_dim, vb.pp("v_proj"))?;
+        let o_proj = QMatMul::new(q_dim, hidden_size, vb.pp("o_proj"))?;
 
         Ok(Self {
             q_proj,
@@ -323,32 +334,41 @@ impl DecoderAttention {
 }
 
 /// Decoder GLU MLP: fc1 -> chunk(2) -> silu(gate) * x -> fc2.
+///
+/// Weights kept quantized via QMatMul; biases dequantized on load.
 struct DecoderMLP {
-    fc1: Linear,
-    fc2: Linear,
+    fc1: QMatMul,
+    fc1_bias: Tensor,
+    fc2: QMatMul,
+    fc2_bias: Tensor,
 }
 
 impl DecoderMLP {
-    fn new(hidden_size: usize, intermediate_size: usize, vb: VarBuilder<'_>) -> Result<Self> {
-        let fc1_w = vb.pp("fc1").get((intermediate_size * 2, hidden_size), "weight")?;
-        let fc1_b = vb.pp("fc1").get(intermediate_size * 2, "bias")?;
-        let fc1 = Linear::new(fc1_w, Some(fc1_b));
+    fn new(hidden_size: usize, intermediate_size: usize, vb: QVarBuilder) -> Result<Self> {
+        let device = vb.device();
+        let fc1 = QMatMul::new(hidden_size, intermediate_size * 2, vb.pp("fc1"))?;
+        let fc1_bias = vb.pp("fc1").get(intermediate_size * 2, "bias")?.dequantize(device)?;
 
-        let fc2_w = vb.pp("fc2").get((hidden_size, intermediate_size), "weight")?;
-        let fc2_b = vb.pp("fc2").get(hidden_size, "bias")?;
-        let fc2 = Linear::new(fc2_w, Some(fc2_b));
+        let fc2 = QMatMul::new(intermediate_size, hidden_size, vb.pp("fc2"))?;
+        let fc2_bias = vb.pp("fc2").get(hidden_size, "bias")?.dequantize(device)?;
 
-        Ok(Self { fc1, fc2 })
+        Ok(Self {
+            fc1,
+            fc1_bias,
+            fc2,
+            fc2_bias,
+        })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let h = self.fc1.forward(x)?;
+        let h = self.fc1.forward(x)?.broadcast_add(&self.fc1_bias)?;
         let dim = h.dim(D::Minus1)?;
         let half = dim / 2;
         let x_part = h.narrow(D::Minus1, 0, half)?;
         let gate = h.narrow(D::Minus1, half, half)?;
         let activated = candle_nn::ops::silu(&gate)?.mul(&x_part)?;
-        Ok(self.fc2.forward(&activated)?)
+        let x = self.fc2.forward(&activated)?.broadcast_add(&self.fc2_bias)?;
+        Ok(x)
     }
 }
 
@@ -363,7 +383,7 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn new(cfg: &MoonshineConfig, _layer_idx: usize, vb: VarBuilder<'_>) -> Result<Self> {
+    fn new(cfg: &MoonshineConfig, _layer_idx: usize, vb: QVarBuilder) -> Result<Self> {
         let h = cfg.decoder_dim;
         Ok(Self {
             self_attn: DecoderAttention::new(h, cfg.decoder_num_heads, cfg.decoder_num_kv_heads, cfg.decoder_head_dim, true, vb.pp("self_attn"))?,
@@ -403,9 +423,9 @@ impl DecoderLayer {
 
 /// Full Moonshine decoder.
 pub struct MoonshineDecoder {
-    embed_tokens: Embedding,
-    pos_emb: Embedding,
-    proj: Linear,
+    embed_tokens: candle_nn::Embedding,
+    pos_emb: candle_nn::Embedding,
+    proj: Option<QMatMul>,
     layers: Vec<DecoderLayer>,
     norm: LayerNorm,
     rotary_emb: RotaryEmbedding,
@@ -431,16 +451,20 @@ impl DecoderCache {
 }
 
 impl MoonshineDecoder {
-    pub fn new(cfg: &MoonshineConfig, device: &Device, vb: VarBuilder<'_>) -> Result<Self> {
-        let embed_tokens = candle_nn::embedding(cfg.vocab_size, cfg.decoder_dim, vb.pp("embed_tokens"))?;
-        let pos_emb = candle_nn::embedding(cfg.max_position_embeddings, cfg.encoder_dim, vb.pp("pos_emb"))?;
+    pub fn new(cfg: &MoonshineConfig, device: &Device, vb: QVarBuilder) -> Result<Self> {
+        // Dequantize embeddings on load (index_select requires dense tensors)
+        let embed_w = vb.pp("embed_tokens").get((cfg.vocab_size, cfg.decoder_dim), "weight")?
+            .dequantize(device)?;
+        let embed_tokens = candle_nn::Embedding::new(embed_w, cfg.decoder_dim);
+
+        let pos_w = vb.pp("pos_emb").get((cfg.max_position_embeddings, cfg.encoder_dim), "weight")?
+            .dequantize(device)?;
+        let pos_emb = candle_nn::Embedding::new(pos_w, cfg.encoder_dim);
 
         let proj = if cfg.encoder_dim != cfg.decoder_dim {
-            let w = vb.pp("proj").get((cfg.decoder_dim, cfg.encoder_dim), "weight")?;
-            Linear::new(w, None)
+            Some(QMatMul::new(cfg.encoder_dim, cfg.decoder_dim, vb.pp("proj"))?)
         } else {
-            let w = Tensor::eye(cfg.decoder_dim, DType::F32, device)?;
-            Linear::new(w, None)
+            None
         };
 
         let mut layers = Vec::with_capacity(cfg.decoder_num_layers);
@@ -475,7 +499,11 @@ impl MoonshineDecoder {
         let pos_ids = Tensor::arange(0u32, enc_len as u32, encoder_hidden.device())?;
         let pos_emb = self.pos_emb.forward(&pos_ids)?;
         let encoder_with_pos = encoder_hidden.broadcast_add(&pos_emb)?;
-        let encoder_proj = self.proj.forward(&encoder_with_pos)?;
+        let encoder_proj = if let Some(proj) = &self.proj {
+            proj.forward(&encoder_with_pos)?
+        } else {
+            encoder_with_pos
+        };
 
         // Token embeddings
         let hidden = self.embed_tokens.forward(input_ids)?;

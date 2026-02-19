@@ -1,10 +1,11 @@
 /// Moonshine V2 end-to-end transcription example.
 ///
-/// Loads the Moonshine V2 medium streaming model from safetensors
-/// and transcribes a WAV file.
+/// Loads the Moonshine V2 medium streaming model from GGUF assets and transcribes a WAV file.
+/// Encoder/decoder weights stay quantized (Q8_0) for reduced memory and faster inference.
 ///
 /// Usage:
 ///   cargo run --example transcribe_moonshine --release -- dots.wav
+///   cargo run --example transcribe_moonshine --release -- dots.wav assets
 ///   PARAKEET_DEVICE=cpu cargo run --example transcribe_moonshine --release -- dots.wav
 
 use anyhow::Result;
@@ -37,9 +38,9 @@ fn load_wav_samples(path: &str) -> Result<Vec<f32>> {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let wav_path = args.get(1).map(|s| s.as_str()).unwrap_or("dots.wav");
-    let model_dir = args.get(2).map(|s| s.as_str()).unwrap_or("hf_moonshine");
+    let model_dir = args.get(2).map(|s| s.as_str()).unwrap_or("assets");
 
-    println!("=== Moonshine V2 Transcription ===\n");
+    println!("=== Moonshine V2 Transcription (Quantized) ===\n");
 
     // Load audio
     let t0 = Instant::now();
@@ -52,9 +53,10 @@ fn main() -> Result<()> {
     let device = get_device()?;
     println!("Device: {:?}", device);
 
-    // Load model
+    // Load model from GGUF assets
     let t1 = Instant::now();
-    let model = MoonshineModel::load(model_dir, &device)?;
+    println!("Loading from GGUF assets ({})...", model_dir);
+    let model = MoonshineModel::load_from_gguf_mmap(model_dir, &device)?;
     println!("Model loaded in {:.0}ms\n", t1.elapsed().as_millis());
 
     // Transcribe

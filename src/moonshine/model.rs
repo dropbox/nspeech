@@ -2,77 +2,88 @@
 //!
 //! Combines frontend + encoder + decoder into an end-to-end transcription pipeline.
 //! Supports greedy decoding with KV cache.
+//!
+//! Loads from GGUF Q8_0 quantized format only. Encoder/decoder weights are kept
+//! quantized and dequantized on-the-fly during matmul for reduced memory usage.
 
 use std::path::Path;
 
 use anyhow::Result;
-use candle_core::{DType, Device, IndexOp, Module, Tensor};
-use candle_nn::VarBuilder;
+use candle_core::{Device, IndexOp, Module, Tensor};
+use candle_transformers::models::with_tracing::QMatMul;
 
 use super::config::MoonshineConfig;
 use super::decoder::{DecoderCache, MoonshineDecoder};
 use super::encoder::MoonshineEncoder;
 use super::frontend::MoonshineFrontend;
 
-/// Full Moonshine V2 model.
+/// Full Moonshine V2 model with quantized inference.
 pub struct MoonshineModel {
     pub cfg: MoonshineConfig,
     frontend: MoonshineFrontend,
     encoder: MoonshineEncoder,
     decoder: MoonshineDecoder,
-    proj_out: candle_nn::Linear,
+    proj_out: QMatMul,
     tokenizer: Option<tokenizers::Tokenizer>,
 }
 
 impl MoonshineModel {
-    /// Load model from safetensors file.
-    pub fn load<P: AsRef<Path>>(model_dir: P, device: &Device) -> Result<Self> {
-        let model_dir = model_dir.as_ref();
+    /// Load model from memory-mapped GGUF Q8_0 quantized format.
+    ///
+    /// Encoder/decoder weights stay quantized (Q8_0) and are dequantized on-the-fly
+    /// during matrix multiplication. Frontend conv weights and embeddings are
+    /// dequantized on load (Candle has no quantized conv1d or index_select).
+    pub fn load_from_gguf_mmap<P: AsRef<Path>>(assets: P, device: &Device) -> Result<Self> {
+        use super::{MOONSHINE_CONFIG, MOONSHINE_MODEL_Q8_0_GGUF_MMAP, MOONSHINE_TOKENIZER};
 
-        // Load config
-        let config_path = model_dir.join("streaming_config.json");
-        let config_str = std::fs::read_to_string(&config_path)
-            .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", config_path.display(), e))?;
-        let cfg: MoonshineConfig = serde_json::from_str(&config_str)?;
+        let assets = assets.as_ref().to_path_buf();
 
-        println!("Moonshine config: encoder_dim={}, decoder_dim={}, depth={}, vocab_size={}",
-            cfg.encoder_dim, cfg.decoder_dim, cfg.encoder_num_layers, cfg.vocab_size);
+        // Load config from embedded/file asset
+        let cfg_bytes = MOONSHINE_CONFIG.bytes(&assets).map_err(|_| {
+            anyhow::anyhow!("failed to load Moonshine config from assets")
+        })?;
+        let cfg: MoonshineConfig = serde_json::from_slice(cfg_bytes)?;
 
-        // Load weights
-        let safetensors_path = model_dir.join("model.safetensors");
-        let tensors = candle_core::safetensors::load(&safetensors_path, device)?;
+        println!(
+            "Moonshine config: encoder_dim={}, decoder_dim={}, depth={}, vocab_size={}",
+            cfg.encoder_dim, cfg.decoder_dim, cfg.encoder_num_layers, cfg.vocab_size
+        );
 
-        println!("Loaded {} tensors from {}", tensors.len(), safetensors_path.display());
+        // Load tokenizer from embedded/file asset
+        let tok_bytes = MOONSHINE_TOKENIZER.bytes(&assets).map_err(|_| {
+            anyhow::anyhow!("failed to load Moonshine tokenizer from assets")
+        })?;
+        let tokenizer = match tokenizers::Tokenizer::from_bytes(tok_bytes) {
+            Ok(t) => {
+                println!("Loaded tokenizer from assets");
+                Some(t)
+            }
+            Err(e) => {
+                println!("Warning: Failed to load tokenizer: {}", e);
+                None
+            }
+        };
 
-        let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
+        // Memory-map GGUF file
+        let gguf_bytes = MOONSHINE_MODEL_Q8_0_GGUF_MMAP.bytes(&assets).map_err(|_| {
+            anyhow::anyhow!("failed to mmap Moonshine GGUF from assets")
+        })?;
+
+        // Create quantized VarBuilder — keeps weights as QTensor (Q8_0)
+        let vb = candle_transformers::quantized_var_builder::VarBuilder::from_gguf_buffer(
+            gguf_bytes,
+            device,
+        )?;
+
+        println!("Building model (quantized weights stay in Q8_0 format)...");
 
         // Build model components
-        // HF weight prefix: model.encoder.embedder.* -> embedder.*
         let frontend = MoonshineFrontend::new(&cfg, vb.pp("model.encoder.embedder"))?;
         let encoder = MoonshineEncoder::new(&cfg, vb.pp("model.encoder"))?;
         let decoder = MoonshineDecoder::new(&cfg, device, vb.pp("model.decoder"))?;
 
-        // Output projection: decoder_dim -> vocab_size
-        let proj_out_w = vb.pp("proj_out").get((cfg.vocab_size, cfg.decoder_dim), "weight")?;
-        let proj_out = candle_nn::Linear::new(proj_out_w, None);
-
-        // Load tokenizer
-        let tokenizer_path = model_dir.join("tokenizer.json");
-        let tokenizer = if tokenizer_path.exists() {
-            match tokenizers::Tokenizer::from_file(&tokenizer_path) {
-                Ok(t) => {
-                    println!("Loaded tokenizer from {}", tokenizer_path.display());
-                    Some(t)
-                }
-                Err(e) => {
-                    println!("Warning: Failed to load tokenizer: {}", e);
-                    None
-                }
-            }
-        } else {
-            println!("Warning: tokenizer.json not found at {}", tokenizer_path.display());
-            None
-        };
+        // Output projection: decoder_dim -> vocab_size (quantized, no bias)
+        let proj_out = QMatMul::new(cfg.decoder_dim, cfg.vocab_size, vb.pp("proj_out"))?;
 
         Ok(Self {
             cfg,

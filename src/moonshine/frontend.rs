@@ -10,12 +10,16 @@
 //!
 //! Total: 4x temporal reduction. For 1s of audio (16000 samples = 200 frames),
 //! output is ~50 time steps of `encoder_dim`-dimensional features.
+//!
+//! Conv and linear weights are dequantized on load (no quantized conv1d in Candle).
 
 use anyhow::Result;
 use candle_core::{Module, Tensor};
-use candle_nn::{Conv1d, Conv1dConfig, Linear, VarBuilder};
+use candle_nn::{Conv1d, Conv1dConfig, Linear};
 
 use super::config::MoonshineConfig;
+
+type QVarBuilder = candle_transformers::quantized_var_builder::VarBuilder;
 
 /// Causal Conv1d: left-pads input so convolution is causal.
 struct CausalConv1d {
@@ -24,12 +28,12 @@ struct CausalConv1d {
 }
 
 impl CausalConv1d {
-    fn new(
-        in_channels: usize,
-        out_channels: usize,
+    /// Build from pre-dequantized weight and bias tensors.
+    fn from_tensors(
+        weight: Tensor,
+        bias: Tensor,
         kernel_size: usize,
         stride: usize,
-        vb: VarBuilder<'_>,
     ) -> Result<Self> {
         let cfg = Conv1dConfig {
             stride,
@@ -38,7 +42,7 @@ impl CausalConv1d {
             groups: 1,
             ..Default::default()
         };
-        let conv = candle_nn::conv1d(in_channels, out_channels, kernel_size, cfg, vb)?;
+        let conv = Conv1d::new(weight, Some(bias), cfg);
         let left_pad = kernel_size - 1; // dilation = 1
         Ok(Self { conv, left_pad })
     }
@@ -77,6 +81,8 @@ fn asinh_compression(x: &Tensor, log_k: &Tensor) -> Result<Tensor> {
 }
 
 /// Moonshine V2 audio frontend / embedder.
+///
+/// All weights are dequantized on load (conv ops require dense tensors).
 pub struct MoonshineFrontend {
     frame_len: usize,
     linear: Linear,
@@ -86,31 +92,33 @@ pub struct MoonshineFrontend {
 }
 
 impl MoonshineFrontend {
-    pub fn new(cfg: &MoonshineConfig, vb: VarBuilder<'_>) -> Result<Self> {
+    pub fn new(cfg: &MoonshineConfig, vb: QVarBuilder) -> Result<Self> {
         let fe = &cfg.frontend;
+        let device = vb.device();
 
         // Linear: frame_len -> d_model (no bias)
-        let linear_weight = vb.pp("linear").get((fe.d_model, cfg.frame_len), "weight")?;
-        let linear = Linear::new(linear_weight, None);
+        // May be stored as FP32 in GGUF (Q8_0 quantization failed for small 768x80 matrix)
+        let linear_w = vb.pp("linear").get((fe.d_model, cfg.frame_len), "weight")?
+            .dequantize(device)?;
+        let linear = Linear::new(linear_w, None);
 
-        // Asinh compression parameter (scalar)
-        let log_k = vb.pp("comp").get(&[] as &[usize], "log_k")?;
+        // Asinh compression parameter (scalar stored as [1] in GGUF)
+        let log_k = vb.pp("comp").get(1, "log_k")?.dequantize(device)?
+            .reshape(&[] as &[usize])?;
 
-        // Causal Conv1d layers
-        let conv1 = CausalConv1d::new(
-            fe.d_model,
-            fe.c1,
-            fe.kernel_size,
-            fe.stride,
-            vb.pp("conv1"),
-        )?;
-        let conv2 = CausalConv1d::new(
-            fe.c1,
-            fe.c2,
-            fe.kernel_size,
-            fe.stride,
-            vb.pp("conv2"),
-        )?;
+        // Conv1: weight stored as flattened [c1, d_model*kernel] in GGUF, reshape to [c1, d_model, kernel]
+        let conv1_w = vb.pp("conv1").get((fe.c1, fe.d_model * fe.kernel_size), "weight")?
+            .dequantize(device)?
+            .reshape((fe.c1, fe.d_model, fe.kernel_size))?;
+        let conv1_b = vb.pp("conv1").get(fe.c1, "bias")?.dequantize(device)?;
+        let conv1 = CausalConv1d::from_tensors(conv1_w, conv1_b, fe.kernel_size, fe.stride)?;
+
+        // Conv2: weight stored as flattened [c2, c1*kernel] in GGUF, reshape to [c2, c1, kernel]
+        let conv2_w = vb.pp("conv2").get((fe.c2, fe.c1 * fe.kernel_size), "weight")?
+            .dequantize(device)?
+            .reshape((fe.c2, fe.c1, fe.kernel_size))?;
+        let conv2_b = vb.pp("conv2").get(fe.c2, "bias")?.dequantize(device)?;
+        let conv2 = CausalConv1d::from_tensors(conv2_w, conv2_b, fe.kernel_size, fe.stride)?;
 
         Ok(Self {
             frame_len: cfg.frame_len,
