@@ -11,12 +11,11 @@
 //! Based on the HuggingFace implementation:
 //! `UsefulSensors/moonshine-streaming-medium`
 
-use crate::embed_zst_asset;
 use crate::embed_asset;
 
-embed_zst_asset!(pub MOONSHINE_CONFIG,              "moonshine-config.json.zst");
-embed_zst_asset!(pub MOONSHINE_TOKENIZER,           "moonshine-tokenizer.json.zst");
-embed_asset!(pub MOONSHINE_MODEL_Q8_0_GGUF_MMAP,    "moonshine_q8_0.gguf");
+embed_asset!(pub MOONSHINE_CONFIG,              "moonshine-config.json");
+embed_asset!(pub MOONSHINE_TOKENIZER,           "moonshine-tokenizer.json");
+embed_asset!(pub MOONSHINE_MODEL_Q8_0_GGUF_MMAP,"moonshine_q8_0.gguf");
 
 pub mod config;
 pub mod decoder;
