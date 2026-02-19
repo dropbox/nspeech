@@ -136,6 +136,9 @@ pub fn stats(name: &str, number: f64) {
 // Parakeet speech recognition library
 pub mod parakeet;
 
+// Moonshine V2 streaming ASR
+pub mod moonshine;
+
 // Silero VAD (Voice Activity Detection)
 pub mod silero;
 

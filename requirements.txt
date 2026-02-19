@@ -1,8 +1,12 @@
 huggingface_hub>=0.24
+moonshine-voice
 numpy
+onnx
+onnxruntime
 pyyaml
 safetensors
 sentencepiece
 tokenizers
 torch
+transformers>=5.0
 zstandard
