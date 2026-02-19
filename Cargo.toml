@@ -55,6 +55,6 @@ candle-core = { git = "https://github.com/huggingface/candle", branch = "main", 
 candle-nn = { git = "https://github.com/huggingface/candle", branch = "main", features = ["metal", "accelerate"] }
 
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
-candle-core = { git = "https://github.com/huggingface/candle", branch = "main", features = ["accelerate"] }
-candle-nn = { git = "https://github.com/huggingface/candle", branch = "main", features = ["accelerate"] }
+candle-core = { git = "https://github.com/huggingface/candle", branch = "main" }
+candle-nn = { git = "https://github.com/huggingface/candle", branch = "main" }
 
