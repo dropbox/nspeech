@@ -12,7 +12,7 @@
 //! Weights are kept quantized (Q8_0) and dequantized on-the-fly during matmul.
 
 use anyhow::Result;
-use candle_core::{DType, Device, Module, Tensor, D};
+use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
 use candle_transformers::models::with_tracing::QMatMul;
 
 use super::config::MoonshineConfig;
@@ -163,6 +163,20 @@ impl KVCache {
         Self { k: None, v: None }
     }
 
+    /// Truncate KV cache to first `len` entries on the sequence dimension.
+    pub fn truncate(&mut self, len: usize) {
+        if let Some(k) = &self.k {
+            if k.dim(2).unwrap_or(0) > len {
+                self.k = Some(k.i((.., .., ..len, ..)).unwrap());
+            }
+        }
+        if let Some(v) = &self.v {
+            if v.dim(2).unwrap_or(0) > len {
+                self.v = Some(v.i((.., .., ..len, ..)).unwrap());
+            }
+        }
+    }
+
     pub fn update(&mut self, k: Tensor, v: Tensor) -> Result<(Tensor, Tensor)> {
         let (k_full, v_full) = match (&self.k, &self.v) {
             (Some(prev_k), Some(prev_v)) => {
@@ -308,7 +322,7 @@ impl DecoderAttention {
         let v = v.contiguous()?;
         let attn_weights = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * self.scale)?;
         let attn_weights = if let Some(mask) = mask {
-            (attn_weights + mask)?
+            attn_weights.broadcast_add(mask)?
         } else {
             attn_weights
         };
@@ -438,6 +452,9 @@ pub struct DecoderCache {
     pub self_caches: Vec<KVCache>,
     pub cross_caches: Vec<KVCache>,
     pub seq_len: usize,
+    /// Cached encoder projection (encoder_hidden + pos_emb → projected).
+    /// Valid for the lifetime of a single decode run (same encoder output).
+    pub encoder_proj: Option<Tensor>,
 }
 
 impl DecoderCache {
@@ -446,7 +463,17 @@ impl DecoderCache {
             self_caches: (0..num_layers).map(|_| KVCache::new()).collect(),
             cross_caches: (0..num_layers).map(|_| KVCache::new()).collect(),
             seq_len: 0,
+            encoder_proj: None,
         }
+    }
+
+    /// Truncate all self-attention caches to first `len` entries.
+    /// Cross-attention caches are unchanged (encoder output hasn't changed shape).
+    pub fn truncate(&mut self, len: usize) {
+        for cache in &mut self.self_caches {
+            cache.truncate(len);
+        }
+        self.seq_len = len;
     }
 }
 
@@ -493,16 +520,21 @@ impl MoonshineDecoder {
         encoder_hidden: &Tensor,
         cache: &mut DecoderCache,
     ) -> Result<Tensor> {
-        let enc_len = encoder_hidden.dim(1)?;
-
-        // Positional embedding for encoder states
-        let pos_ids = Tensor::arange(0u32, enc_len as u32, encoder_hidden.device())?;
-        let pos_emb = self.pos_emb.forward(&pos_ids)?;
-        let encoder_with_pos = encoder_hidden.broadcast_add(&pos_emb)?;
-        let encoder_proj = if let Some(proj) = &self.proj {
-            proj.forward(&encoder_with_pos)?
+        // Reuse cached encoder projection if available (same encoder output within a decode run)
+        let encoder_proj = if let Some(cached) = &cache.encoder_proj {
+            cached.clone()
         } else {
-            encoder_with_pos
+            let enc_len = encoder_hidden.dim(1)?;
+            let pos_ids = Tensor::arange(0u32, enc_len as u32, encoder_hidden.device())?;
+            let pos_emb = self.pos_emb.forward(&pos_ids)?;
+            let encoder_with_pos = encoder_hidden.broadcast_add(&pos_emb)?;
+            let proj = if let Some(proj) = &self.proj {
+                proj.forward(&encoder_with_pos)?
+            } else {
+                encoder_with_pos
+            };
+            cache.encoder_proj = Some(proj.clone());
+            proj
         };
 
         // Token embeddings

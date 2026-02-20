@@ -43,6 +43,9 @@ pub struct MoonshineStream {
     encoder_right_context: usize,
     /// Number of committed feature frames to re-include as left context
     encoder_overlap: usize,
+
+    /// Previous token sequence (without EOS) for speculative prefix reuse
+    previous_tokens: Vec<u32>,
 }
 
 impl MoonshineStream {
@@ -52,6 +55,7 @@ impl MoonshineStream {
         self.committed_encoder = None;
         self.num_committed = 0;
         self.total_features_at_last_encode = 0;
+        self.previous_tokens = Vec::new();
     }
 }
 
@@ -184,6 +188,91 @@ impl MoonshineModel {
         Ok(generated)
     }
 
+    /// Decode with speculative prefix reuse.
+    ///
+    /// If previous_tokens is non-empty, batch-verifies them in one forward pass,
+    /// finds the divergence point, then continues generating from there.
+    /// Falls back to standard greedy decode if no previous tokens.
+    fn speculative_decode(
+        &self,
+        encoder_hidden: &Tensor,
+        max_tokens: usize,
+        previous_tokens: &[u32],
+    ) -> Result<Vec<u32>> {
+        let device = encoder_hidden.device();
+        let mut cache = DecoderCache::new(self.cfg.decoder_num_layers);
+        let bos = self.cfg.bos_id as u32;
+        let eos = self.cfg.eos_id as u32;
+        let mut generated = Vec::new();
+        let mut next_token: u32;
+
+        if !previous_tokens.is_empty() {
+            // Batch-verify: [BOS, t0, t1, ..., t_{N-1}]
+            let mut input = vec![bos];
+            input.extend_from_slice(previous_tokens);
+            let input_len = input.len();
+            let input_ids = Tensor::from_vec(input, (1, input_len), device)?;
+
+            let hidden = self.decoder.forward(&input_ids, encoder_hidden, &mut cache)?;
+            let logits = self.proj_out.forward(&hidden)?;
+
+            // Find first divergence
+            let mut divergence = previous_tokens.len();
+            for i in 0..previous_tokens.len() {
+                let predicted = logits.i((0, i))?.argmax(0)?.to_scalar::<u32>()?;
+                if predicted != previous_tokens[i] {
+                    divergence = i;
+                    break;
+                }
+            }
+
+            // Keep verified prefix
+            generated.extend_from_slice(&previous_tokens[..divergence]);
+
+            if divergence < previous_tokens.len() {
+                // Truncate self-attention cache to divergence+1 (BOS + verified tokens)
+                cache.truncate(divergence + 1);
+                next_token = logits.i((0, divergence))?.argmax(0)?.to_scalar::<u32>()?;
+            } else {
+                // All verified — get next new token from last position
+                next_token = logits
+                    .i((0, previous_tokens.len()))?
+                    .argmax(0)?
+                    .to_scalar::<u32>()?;
+            }
+
+            generated.push(next_token);
+            if next_token == eos {
+                return Ok(generated);
+            }
+        } else {
+            // Standard BOS start
+            let input_ids = Tensor::from_vec(vec![bos], (1, 1), device)?;
+            let hidden = self.decoder.forward(&input_ids, encoder_hidden, &mut cache)?;
+            let logits = self.proj_out.forward(&hidden)?;
+            next_token = logits.i((0, 0))?.argmax(0)?.to_scalar::<u32>()?;
+            generated.push(next_token);
+            if next_token == eos {
+                return Ok(generated);
+            }
+        }
+
+        // Continue token-by-token
+        let remaining = max_tokens.saturating_sub(generated.len());
+        for _ in 0..remaining {
+            let input_ids = Tensor::from_vec(vec![next_token], (1, 1), device)?;
+            let hidden = self.decoder.forward(&input_ids, encoder_hidden, &mut cache)?;
+            let logits = self.proj_out.forward(&hidden)?;
+            next_token = logits.i((0, 0))?.argmax(0)?.to_scalar::<u32>()?;
+            generated.push(next_token);
+            if next_token == eos {
+                break;
+            }
+        }
+
+        Ok(generated)
+    }
+
     /// Decode token IDs to text using the tokenizer.
     pub fn decode_tokens(&self, tokens: &[u32]) -> Result<String> {
         let tokenizer = self.tokenizer.as_ref()
@@ -219,6 +308,7 @@ impl MoonshineModel {
             total_features_at_last_encode: 0,
             encoder_right_context,
             encoder_overlap,
+            previous_tokens: Vec::new(),
         }
     }
 
@@ -313,7 +403,8 @@ impl MoonshineModel {
 
         // ~0.02s per encoder frame (frontend 4x reduction of 80-sample frames at 16kHz)
         let max_tokens = ((enc_frames as f64 * 0.02) * 6.5).ceil() as usize + 10;
-        let tokens = self.greedy_decode(&encoder_out, max_tokens)?;
+        let tokens =
+            self.speculative_decode(&encoder_out, max_tokens, &stream.previous_tokens)?;
 
         // Remove EOS token if present
         let tokens: Vec<u32> = tokens
@@ -321,6 +412,7 @@ impl MoonshineModel {
             .filter(|&t| t != self.cfg.eos_id as u32)
             .collect();
 
+        stream.previous_tokens = tokens.clone();
         stream.samples_at_last_update = audio.len();
         let text = self.decode_tokens(&tokens)?;
         Ok(Some(text))
