@@ -17,6 +17,7 @@ quantized = []            # Use quantized inference (QMatMul with Q8_0/Q4K weigh
 embed-assets = []         # Embed model assets in binary
 qwen = []                 # Enable Qwen3 text correction model (adds ~400MB to assets)
 auto-transcribe-on-pause = []  # Automatically transcribe segments after detecting pause (non-default)
+use-moonshine = []        # NAPI binding uses Moonshine V2 instead of Parakeet TDT
 
 [dependencies]
 anyhow = "1"

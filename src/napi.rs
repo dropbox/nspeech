@@ -1,4 +1,9 @@
-/* Node module API for Parakeet Speech Recognition */
+/* Node module API for Speech Recognition
+ *
+ * ASR backend is selected at compile time:
+ *   cargo build --release --lib                        # Parakeet TDT (default)
+ *   cargo build --release --lib --features use-moonshine  # Moonshine V2
+ */
 
 use napi::Result;
 use napi_derive::napi;
@@ -14,7 +19,11 @@ use napi::threadsafe_function::{ThreadsafeFunctionCallMode, ThreadsafeCallContex
 use once_cell::sync::OnceCell;
 use hound::{WavWriter, WavSpec, SampleFormat};
 
-use crate::{parakeet, silero};
+#[cfg(not(feature = "use-moonshine"))]
+use crate::parakeet;
+#[cfg(feature = "use-moonshine")]
+use crate::moonshine;
+use crate::silero;
 
 #[napi(object)]
 pub struct LogEvent {
@@ -148,8 +157,12 @@ pub struct Transcription {
 /// Inner state for transcription stream
 struct SpeechInner {
     vad_stream: Option<silero::VadStream>,
+    #[cfg(not(feature = "use-moonshine"))]
     tdt_model: Option<parakeet::TransducerModel>,
+    #[cfg(not(feature = "use-moonshine"))]
     feat_extractor: parakeet::ParakeetFeatureExtractor,
+    #[cfg(feature = "use-moonshine")]
+    moonshine_model: Option<moonshine::MoonshineModel>,
     device: candle_core::Device,
 
     // VAD state
@@ -171,6 +184,7 @@ struct SpeechInner {
 }
 
 impl SpeechInner {
+    #[cfg(not(feature = "use-moonshine"))]
     fn new(
         vad: Option<silero::SileroVad>,
         model: Option<parakeet::TransducerModel>,
@@ -215,6 +229,60 @@ impl SpeechInner {
             vad_stream,
             tdt_model: model,
             feat_extractor,
+            device: device.clone(),
+            current_segment: Vec::new(),
+            current_segment_start: None,
+            pre_buffer,
+            silence_frames: 0,
+            was_speech_last_frame: false,
+            total_samples_processed: 0,
+            speech_threshold,
+            period_pause_frames,
+            debug_wav_writer,
+        }
+    }
+
+    #[cfg(feature = "use-moonshine")]
+    fn new(
+        vad: Option<silero::SileroVad>,
+        model: Option<moonshine::MoonshineModel>,
+        device: candle_core::Device,
+    ) -> Self {
+        // Create debug WAV writer
+        let debug_wav_writer = match Self::create_debug_wav_writer() {
+            Ok(writer) => {
+                info!("Debug WAV writer created: debug_input.wav");
+                Some(writer)
+            }
+            Err(e) => {
+                info!("Failed to create debug WAV writer: {}", e);
+                None
+            }
+        };
+
+        info!("Moonshine + VAD streaming mode: enabled (VAD segmentation + Moonshine transcription)");
+
+        // Create VAD stream if VAD was loaded successfully
+        let vad_stream = vad.and_then(|v| match silero::VadStream::new(v, &device) {
+            Ok(stream) => Some(stream),
+            Err(e) => {
+                warn!("VAD stream could not be created: {}", e);
+                None
+            }
+        });
+
+        // Pre-buffer: 1 second of audio
+        let pre_buffer_samples = 16000;
+        let pre_buffer = std::collections::VecDeque::with_capacity(pre_buffer_samples);
+
+        // Configuration
+        let speech_threshold = 0.1;  // Low threshold for better capture
+        let period_pause_ms = 500.0;  // 500ms silence = segment end
+        let period_pause_frames = (period_pause_ms / 32.0) as usize;  // 32ms per VAD frame (512 samples @ 16kHz)
+
+        Self {
+            vad_stream,
+            moonshine_model: model,
             device: device.clone(),
             current_segment: Vec::new(),
             current_segment_start: None,
@@ -337,13 +405,14 @@ impl SpeechInner {
         Ok(())
     }
 
+    #[cfg(not(feature = "use-moonshine"))]
     fn transcribe_segment(&mut self) -> Result<Option<Transcription>> {
         use candle_core::DType;
 
         // Check if TDT model is available
         let tdt_model = match self.tdt_model.as_ref() {
             Some(model) => model,
-            None => return Ok(None), // Fail silently if model not available
+            None => return Ok(None),
         };
 
         let segment_duration_ms = self.current_segment.len() as f64 / 16.0;
@@ -376,7 +445,6 @@ impl SpeechInner {
             .map_err(|e| napi::Error::from_reason(format!("Encoder error: {}", e)))?;
 
         // Run TDT beam decode with beam_size=2 for quality
-        // Using explicit GC in Node.js to manage memory
         let tokens = tdt_model.beam_decode(&encoder_out, 2)
             .map_err(|e| napi::Error::from_reason(format!("TDT decode error: {}", e)))?;
 
@@ -387,6 +455,43 @@ impl SpeechInner {
         // Decode tokens to text
         let text = tdt_model.decode_tokens(&tokens)
             .map_err(|e| napi::Error::from_reason(format!("Token decode error: {}", e)))?;
+
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(Transcription {
+            text: text.trim().to_string(),
+            raw_text: text.trim().to_string(),
+            start_time,
+            end_time,
+        }))
+    }
+
+    #[cfg(feature = "use-moonshine")]
+    fn transcribe_segment(&mut self) -> Result<Option<Transcription>> {
+        // Check if Moonshine model is available
+        let model = match self.moonshine_model.as_ref() {
+            Some(model) => model,
+            None => return Ok(None),
+        };
+
+        let segment_duration_ms = self.current_segment.len() as f64 / 16.0;
+
+        if self.current_segment.len() < 4000 {  // Skip very short segments (< 250ms)
+            info!("Skipping short segment: {:.0}ms ({} samples)", segment_duration_ms, self.current_segment.len());
+            return Ok(None);
+        }
+
+        let start_time = self.current_segment_start.unwrap_or(0.0);
+        let end_time = start_time + (self.current_segment.len() as f64 / 16000.0);
+
+        info!("Transcribing segment: {:.2}s-{:.2}s ({:.1}s, {} samples)",
+              start_time, end_time, end_time - start_time, self.current_segment.len());
+
+        // Moonshine takes raw audio directly (no mel spectrogram needed)
+        let text = model.transcribe(&self.current_segment, &self.device)
+            .map_err(|e| napi::Error::from_reason(format!("Moonshine transcription error: {}", e)))?;
 
         if text.trim().is_empty() {
             return Ok(None);
@@ -466,20 +571,35 @@ impl Speech {
         let assets = PathBuf::from(assets);
 
         // Get device
+        #[cfg(not(feature = "use-moonshine"))]
         let device = match parakeet::get_device() {
             Ok(device) => device,
             Err(e) => {
                 warn!("Device could not be initialized: {}", e);
-                // Use CPU as fallback
+                candle_core::Device::Cpu
+            }
+        };
+        #[cfg(feature = "use-moonshine")]
+        let device = {
+            // Moonshine uses the same device selection logic
+            if std::env::var("PARAKEET_DEVICE").as_deref() == Ok("cpu") {
+                info!("Using CPU (forced by PARAKEET_DEVICE=cpu)");
+                candle_core::Device::Cpu
+            } else {
+                #[cfg(target_os = "macos")]
+                match candle_core::Device::new_metal(0) {
+                    Ok(d) => { info!("Using Metal GPU acceleration"); d }
+                    Err(_) => { info!("Metal not available, using CPU"); candle_core::Device::Cpu }
+                }
+                #[cfg(not(target_os = "macos"))]
                 candle_core::Device::Cpu
             }
         };
 
         info!("Loading Silero VAD (memory-mapped GGUF)...");
-        // Load VAD model for speech detection (Q8_0 quantized storage, FP32 inference, mmap)
         let vad = match silero::SileroVad::load_from_gguf_mmap(&assets, &device) {
             Ok(vad) => {
-                info!("✓ VAD loaded (Q8_0 storage format, 194 KB)");
+                info!("VAD loaded (Q8_0 storage format)");
                 Some(vad)
             }
             Err(e) => {
@@ -488,35 +608,51 @@ impl Speech {
             }
         };
 
-        info!("Loading Parakeet TDT model (quantized GGUF, mmap)...");
-        // Load TDT model from assets directory (GGUF with 80 mel bins)
-        let model = match parakeet::load_parakeet_tdt_from_gguf_mmap_local(&assets, &device) {
-            Ok(mut model) => {
-                info!("Loading tokenizer...");
-                match model.load_tokenizer(&assets) {
-                    Ok(_) => {
-                        info!("✓ TDT model and tokenizer loaded");
-                        Some(model)
-                    }
-                    Err(e) => {
-                        warn!("Failed to load tokenizer: {}", e);
-                        None
+        #[cfg(not(feature = "use-moonshine"))]
+        let model = {
+            info!("Loading Parakeet TDT model (quantized GGUF, mmap)...");
+            match parakeet::load_parakeet_tdt_from_gguf_mmap_local(&assets, &device) {
+                Ok(mut model) => {
+                    info!("Loading tokenizer...");
+                    match model.load_tokenizer(&assets) {
+                        Ok(_) => {
+                            info!("TDT model and tokenizer loaded");
+                            Some(model)
+                        }
+                        Err(e) => {
+                            warn!("Failed to load tokenizer: {}", e);
+                            None
+                        }
                     }
                 }
+                Err(e) => {
+                    warn!("Failed to load TDT model: {}", e);
+                    None
+                }
             }
-            Err(e) => {
-                warn!("Failed to load TDT model: {}", e);
-                None
+        };
+
+        #[cfg(feature = "use-moonshine")]
+        let model = {
+            info!("Loading Moonshine V2 model (quantized GGUF, mmap)...");
+            match moonshine::MoonshineModel::load_from_gguf_mmap(&assets, &device) {
+                Ok(model) => {
+                    info!("Moonshine V2 model loaded");
+                    Some(model)
+                }
+                Err(e) => {
+                    warn!("Failed to load Moonshine model: {}", e);
+                    None
+                }
             }
         };
 
         if vad.is_some() && model.is_some() {
-            info!("Models loaded successfully (VAD + TDT)");
+            info!("Models loaded successfully");
         } else {
             warn!("Some models failed to load - transcription will not work");
         }
 
-        // Create inner state with VAD + TDT streaming
         let inner = SpeechInner::new(vad, model, device);
 
         // Create threadsafe callback and wrap in Arc so it can be cloned for async tasks
