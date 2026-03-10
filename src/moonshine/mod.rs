@@ -25,3 +25,4 @@ pub mod model;
 
 pub use config::MoonshineConfig;
 pub use model::MoonshineModel;
+pub use model::MoonshineStream;
