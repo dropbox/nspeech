@@ -10,15 +10,48 @@
 //!
 //! Final norm after all layers.
 //!
-//! Weights are kept quantized (Q8_0) and dequantized on-the-fly during matmul.
+//! With `fast-cpu` feature: uses column-tiled rayon-parallel quantized matmul
+//! and fast_add for residual connections.
 
 use anyhow::Result;
 use candle_core::{Device, Module, Tensor, D};
-use candle_transformers::models::with_tracing::QMatMul;
 
 use super::config::MoonshineConfig;
 
 type QVarBuilder = candle_transformers::quantized_var_builder::VarBuilder;
+
+// Conditional matmul type: fast-cpu uses column-tiled parallel matmul, default uses candle QMatMul
+#[cfg(feature = "fast-cpu")]
+type MM = crate::fast_matmul::MatMul;
+#[cfg(not(feature = "fast-cpu"))]
+type MM = candle_transformers::models::with_tracing::QMatMul;
+
+fn new_mm(in_dim: usize, out_dim: usize, vb: QVarBuilder) -> Result<MM> {
+    #[cfg(feature = "fast-cpu")]
+    {
+        let qt = vb.get((out_dim, in_dim), "weight")?;
+        let t = qt.dequantize(vb.device())?;
+        #[cfg(feature = "fbgemm-bf16")]
+        { Ok(MM::from_tensor_bf16(t)) }
+        #[cfg(not(feature = "fbgemm-bf16"))]
+        { Ok(MM::from_tensor(t)) }
+    }
+    #[cfg(not(feature = "fast-cpu"))]
+    {
+        Ok(MM::new(in_dim, out_dim, vb)?)
+    }
+}
+
+fn residual_add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "fast-cpu")]
+    {
+        Ok(crate::fast_ops::fast_add(a, b)?)
+    }
+    #[cfg(not(feature = "fast-cpu"))]
+    {
+        Ok((a + b)?)
+    }
+}
 
 /// Custom LayerNorm with unit-offset gamma: output = LN(x) * (gamma + 1.0).
 ///
@@ -47,22 +80,20 @@ impl UnitOffsetLayerNorm {
 }
 
 /// Encoder MLP: fc1 (with bias) -> GELU -> fc2 (with bias).
-///
-/// Weights kept quantized via QMatMul; biases dequantized on load.
 struct EncoderMLP {
-    fc1: QMatMul,
+    fc1: MM,
     fc1_bias: Tensor,
-    fc2: QMatMul,
+    fc2: MM,
     fc2_bias: Tensor,
 }
 
 impl EncoderMLP {
     fn new(hidden_size: usize, intermediate_size: usize, vb: QVarBuilder) -> Result<Self> {
         let device = vb.device();
-        let fc1 = QMatMul::new(hidden_size, intermediate_size, vb.pp("fc1"))?;
+        let fc1 = new_mm(hidden_size, intermediate_size, vb.pp("fc1"))?;
         let fc1_bias = vb.pp("fc1").get(intermediate_size, "bias")?.dequantize(device)?;
 
-        let fc2 = QMatMul::new(intermediate_size, hidden_size, vb.pp("fc2"))?;
+        let fc2 = new_mm(intermediate_size, hidden_size, vb.pp("fc2"))?;
         let fc2_bias = vb.pp("fc2").get(hidden_size, "bias")?.dequantize(device)?;
 
         Ok(Self {
@@ -104,13 +135,11 @@ fn sliding_window_mask(
 }
 
 /// Encoder self-attention with sliding window mask.
-///
-/// Projection weights kept quantized via QMatMul (no bias on projections).
 struct EncoderAttention {
-    q_proj: QMatMul,
-    k_proj: QMatMul,
-    v_proj: QMatMul,
-    o_proj: QMatMul,
+    q_proj: MM,
+    k_proj: MM,
+    v_proj: MM,
+    o_proj: MM,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -122,10 +151,10 @@ impl EncoderAttention {
         let h = cfg.encoder_dim;
         let kv_dim = cfg.encoder_num_kv_heads * cfg.encoder_head_dim;
 
-        let q_proj = QMatMul::new(h, kv_dim, vb.pp("q_proj"))?;
-        let k_proj = QMatMul::new(h, kv_dim, vb.pp("k_proj"))?;
-        let v_proj = QMatMul::new(h, kv_dim, vb.pp("v_proj"))?;
-        let o_proj = QMatMul::new(kv_dim, h, vb.pp("o_proj"))?;
+        let q_proj = new_mm(h, kv_dim, vb.pp("q_proj"))?;
+        let k_proj = new_mm(h, kv_dim, vb.pp("k_proj"))?;
+        let v_proj = new_mm(h, kv_dim, vb.pp("v_proj"))?;
+        let o_proj = new_mm(kv_dim, h, vb.pp("o_proj"))?;
 
         let scale = (cfg.encoder_head_dim as f64).powf(-0.5);
 
@@ -206,13 +235,13 @@ impl EncoderLayer {
         let residual = x.clone();
         let h = self.input_layernorm.forward(x)?;
         let h = self.self_attn.forward(&h, mask)?;
-        let x = (residual + h)?;
+        let x = residual_add(&residual, &h)?;
 
         // Pre-norm FFN + residual
         let residual = x.clone();
         let h = self.post_attention_layernorm.forward(&x)?;
         let h = self.mlp.forward(&h)?;
-        Ok((residual + h)?)
+        residual_add(&residual, &h)
     }
 }
 

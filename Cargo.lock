@@ -524,6 +524,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
+name = "fbgemm-rs"
+version = "0.2.0"
+dependencies = [
+ "rayon",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1724,6 +1731,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "candle-transformers",
+ "fbgemm-rs",
  "hound",
  "log",
  "memmap2",
@@ -1732,6 +1740,7 @@ dependencies = [
  "napi-derive",
  "num-complex",
  "once_cell",
+ "rayon",
  "rustfft",
  "safetensors 0.4.5",
  "serde",

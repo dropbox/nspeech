@@ -18,6 +18,9 @@ embed-assets = []         # Embed model assets in binary
 qwen = []                 # Enable Qwen3 text correction model (adds ~400MB to assets)
 auto-transcribe-on-pause = []  # Automatically transcribe segments after detecting pause (non-default)
 use-moonshine = []        # NAPI binding uses Moonshine V2 instead of Parakeet TDT
+fast-cpu = ["dep:rayon"]  # CPU-optimized matmul: pre-dequantize to F32 + BLAS, with rayon-parallel Q8_0 fallback
+fbgemm = ["fast-cpu", "dep:fbgemm-rs"]  # Additionally use fbgemm-rs AVX2/Neon packed GEMM (f32 weights)
+fbgemm-bf16 = ["fbgemm"]               # Use bf16-packed weights with fbgemm-rs (half memory, ~0.4% accuracy loss)
 
 [dependencies]
 anyhow = "1"
@@ -47,6 +50,10 @@ napi = "3.2.2"
 napi-derive = "3.2.2"
 log = "0.4"
 once_cell = "1.21.3"
+
+# CPU-optimized matmul (optional)
+rayon = { version = "1", optional = true }
+fbgemm-rs = { path = "../fbgemm-rs", optional = true, features = ["rayon"] }
 
 [build-dependencies]
 napi-build = "2.2.3"

@@ -10,9 +10,32 @@ use std::path::Path;
 
 use anyhow::Result;
 use candle_core::{Device, IndexOp, Module, Tensor};
-use candle_transformers::models::with_tracing::QMatMul;
 
 use super::config::MoonshineConfig;
+
+// Conditional matmul type: fast-cpu dequantizes to F32 for Accelerate BLAS
+#[cfg(feature = "fast-cpu")]
+type MM = crate::fast_matmul::MatMul;
+#[cfg(not(feature = "fast-cpu"))]
+type MM = candle_transformers::models::with_tracing::QMatMul;
+
+type QVarBuilder = candle_transformers::quantized_var_builder::VarBuilder;
+
+fn new_mm(in_dim: usize, out_dim: usize, vb: QVarBuilder) -> Result<MM> {
+    #[cfg(feature = "fast-cpu")]
+    {
+        let qt = vb.get((out_dim, in_dim), "weight")?;
+        let t = qt.dequantize(vb.device())?;
+        #[cfg(feature = "fbgemm-bf16")]
+        { Ok(MM::from_tensor_bf16(t)) }
+        #[cfg(not(feature = "fbgemm-bf16"))]
+        { Ok(MM::from_tensor(t)) }
+    }
+    #[cfg(not(feature = "fast-cpu"))]
+    {
+        Ok(MM::new(in_dim, out_dim, vb)?)
+    }
+}
 use super::decoder::{DecoderCache, MoonshineDecoder};
 use super::encoder::MoonshineEncoder;
 use super::frontend::MoonshineFrontend;
@@ -65,7 +88,7 @@ pub struct MoonshineModel {
     frontend: MoonshineFrontend,
     encoder: MoonshineEncoder,
     decoder: MoonshineDecoder,
-    proj_out: QMatMul,
+    proj_out: MM,
     tokenizer: Option<tokenizers::Tokenizer>,
 }
 
@@ -125,7 +148,7 @@ impl MoonshineModel {
         let decoder = MoonshineDecoder::new(&cfg, device, vb.pp("model.decoder"))?;
 
         // Output projection: decoder_dim -> vocab_size (quantized, no bias)
-        let proj_out = QMatMul::new(cfg.decoder_dim, cfg.vocab_size, vb.pp("proj_out"))?;
+        let proj_out = new_mm(cfg.decoder_dim, cfg.vocab_size, vb.pp("proj_out"))?;
 
         Ok(Self {
             cfg,

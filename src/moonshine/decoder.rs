@@ -9,15 +9,48 @@
 //! - Final norm + GLU MLP: fc1 -> chunk(2) -> silu(gate) * x -> fc2
 //! - Residual
 //!
-//! Weights are kept quantized (Q8_0) and dequantized on-the-fly during matmul.
+//! With `fast-cpu` feature: uses column-tiled rayon-parallel quantized matmul
+//! and fast_add for residual connections.
 
 use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Module, Tensor, D};
-use candle_transformers::models::with_tracing::QMatMul;
 
 use super::config::MoonshineConfig;
 
 type QVarBuilder = candle_transformers::quantized_var_builder::VarBuilder;
+
+// Conditional matmul type: fast-cpu dequantizes to F32 for Accelerate BLAS
+#[cfg(feature = "fast-cpu")]
+type MM = crate::fast_matmul::MatMul;
+#[cfg(not(feature = "fast-cpu"))]
+type MM = candle_transformers::models::with_tracing::QMatMul;
+
+fn new_mm(in_dim: usize, out_dim: usize, vb: QVarBuilder) -> anyhow::Result<MM> {
+    #[cfg(feature = "fast-cpu")]
+    {
+        let qt = vb.get((out_dim, in_dim), "weight")?;
+        let t = qt.dequantize(vb.device())?;
+        #[cfg(feature = "fbgemm-bf16")]
+        { Ok(MM::from_tensor_bf16(t)) }
+        #[cfg(not(feature = "fbgemm-bf16"))]
+        { Ok(MM::from_tensor(t)) }
+    }
+    #[cfg(not(feature = "fast-cpu"))]
+    {
+        Ok(MM::new(in_dim, out_dim, vb)?)
+    }
+}
+
+fn residual_add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "fast-cpu")]
+    {
+        Ok(crate::fast_ops::fast_add(a, b)?)
+    }
+    #[cfg(not(feature = "fast-cpu"))]
+    {
+        Ok((a + b)?)
+    }
+}
 
 /// Standard LayerNorm (weight only, no bias).
 ///
@@ -193,13 +226,11 @@ impl KVCache {
 }
 
 /// Decoder attention (self or cross).
-///
-/// Projection weights kept quantized via QMatMul (no bias on projections).
 struct DecoderAttention {
-    q_proj: QMatMul,
-    k_proj: QMatMul,
-    v_proj: QMatMul,
-    o_proj: QMatMul,
+    q_proj: MM,
+    k_proj: MM,
+    v_proj: MM,
+    o_proj: MM,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -219,10 +250,10 @@ impl DecoderAttention {
         let kv_dim = num_kv_heads * head_dim;
         let q_dim = num_heads * head_dim;
 
-        let q_proj = QMatMul::new(hidden_size, q_dim, vb.pp("q_proj"))?;
-        let k_proj = QMatMul::new(hidden_size, kv_dim, vb.pp("k_proj"))?;
-        let v_proj = QMatMul::new(hidden_size, kv_dim, vb.pp("v_proj"))?;
-        let o_proj = QMatMul::new(q_dim, hidden_size, vb.pp("o_proj"))?;
+        let q_proj = new_mm(hidden_size, q_dim, vb.pp("q_proj"))?;
+        let k_proj = new_mm(hidden_size, kv_dim, vb.pp("k_proj"))?;
+        let v_proj = new_mm(hidden_size, kv_dim, vb.pp("v_proj"))?;
+        let o_proj = new_mm(q_dim, hidden_size, vb.pp("o_proj"))?;
 
         Ok(Self {
             q_proj,
@@ -348,22 +379,20 @@ impl DecoderAttention {
 }
 
 /// Decoder GLU MLP: fc1 -> chunk(2) -> silu(gate) * x -> fc2.
-///
-/// Weights kept quantized via QMatMul; biases dequantized on load.
 struct DecoderMLP {
-    fc1: QMatMul,
+    fc1: MM,
     fc1_bias: Tensor,
-    fc2: QMatMul,
+    fc2: MM,
     fc2_bias: Tensor,
 }
 
 impl DecoderMLP {
     fn new(hidden_size: usize, intermediate_size: usize, vb: QVarBuilder) -> Result<Self> {
         let device = vb.device();
-        let fc1 = QMatMul::new(hidden_size, intermediate_size * 2, vb.pp("fc1"))?;
+        let fc1 = new_mm(hidden_size, intermediate_size * 2, vb.pp("fc1"))?;
         let fc1_bias = vb.pp("fc1").get(intermediate_size * 2, "bias")?.dequantize(device)?;
 
-        let fc2 = QMatMul::new(intermediate_size, hidden_size, vb.pp("fc2"))?;
+        let fc2 = new_mm(intermediate_size, hidden_size, vb.pp("fc2"))?;
         let fc2_bias = vb.pp("fc2").get(hidden_size, "bias")?.dequantize(device)?;
 
         Ok(Self {
@@ -421,17 +450,17 @@ impl DecoderLayer {
         let residual = hidden_states.clone();
         let h = self.input_layernorm.forward(hidden_states)?;
         let h = self.self_attn.forward(&h, None, self_cache, Some(rope), rotary_dim)?;
-        let x = (residual + h)?;
+        let x = residual_add(&residual, &h)?;
 
         let residual = x.clone();
         let h = self.post_attention_layernorm.forward(&x)?;
         let h = self.encoder_attn.forward(&h, Some(encoder_hidden), cross_cache, None, 0)?;
-        let x = (residual + h)?;
+        let x = residual_add(&residual, &h)?;
 
         let residual = x.clone();
         let h = self.final_layernorm.forward(&x)?;
         let h = self.mlp.forward(&h)?;
-        Ok((residual + h)?)
+        residual_add(&residual, &h)
     }
 }
 
@@ -439,7 +468,7 @@ impl DecoderLayer {
 pub struct MoonshineDecoder {
     embed_tokens: candle_nn::Embedding,
     pos_emb: candle_nn::Embedding,
-    proj: Option<QMatMul>,
+    proj: Option<MM>,
     layers: Vec<DecoderLayer>,
     norm: LayerNorm,
     rotary_emb: RotaryEmbedding,
@@ -489,7 +518,7 @@ impl MoonshineDecoder {
         let pos_emb = candle_nn::Embedding::new(pos_w, cfg.encoder_dim);
 
         let proj = if cfg.encoder_dim != cfg.decoder_dim {
-            Some(QMatMul::new(cfg.encoder_dim, cfg.decoder_dim, vb.pp("proj"))?)
+            Some(new_mm(cfg.encoder_dim, cfg.decoder_dim, vb.pp("proj"))?)
         } else {
             None
         };
