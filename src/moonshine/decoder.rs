@@ -30,10 +30,7 @@ fn new_mm(in_dim: usize, out_dim: usize, vb: QVarBuilder) -> anyhow::Result<MM> 
     {
         let qt = vb.get((out_dim, in_dim), "weight")?;
         let t = qt.dequantize(vb.device())?;
-        #[cfg(feature = "fbgemm-bf16")]
-        { Ok(MM::from_tensor_bf16(t)) }
-        #[cfg(not(feature = "fbgemm-bf16"))]
-        { Ok(MM::from_tensor(t)) }
+        Ok(MM::from_tensor(t))
     }
     #[cfg(not(feature = "fast-cpu"))]
     {

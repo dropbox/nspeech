@@ -295,44 +295,27 @@ pub fn add_punctuation(text: &str) -> String {
     add_punctuation_internal(text, false)
 }
 
-/// Select the best available device for inference
-/// Prefers Metal on macOS if PARAKEET_DEVICE env var is not set to "cpu"
-/// Falls back to CPU with Accelerate framework
+/// Select the best available device for inference.
+/// Metal on aarch64 macOS, CPU everywhere else.
+/// Override with PARAKEET_DEVICE=cpu.
 pub fn get_device() -> Result<Device> {
-    // Allow forcing CPU mode via environment variable
     if std::env::var("PARAKEET_DEVICE").as_deref() == Ok("cpu") {
         println!("Using CPU (forced by PARAKEET_DEVICE=cpu)");
         return Ok(Device::Cpu);
     }
 
-    // fast-cpu feature uses custom CPU GEMM kernels (fbgemm-rs) that have no Metal impl
-    #[cfg(feature = "fast-cpu")]
-    {
-        println!("Using CPU (fast-cpu feature uses optimized CPU GEMM)");
-        return Ok(Device::Cpu);
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        // Note: Metal acceleration has some known issues with certain tensor operations
-        // in Candle. If you encounter errors, set PARAKEET_DEVICE=cpu
+    // Metal only works on Apple Silicon (ARM), not Intel x86_64
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         match Device::new_metal(0) {
             Ok(device) => {
                 println!("Using Metal GPU acceleration");
-                println!("  (If you encounter errors, try: PARAKEET_DEVICE=cpu)");
                 return Ok(device);
             }
             Err(e) => {
-                println!("Metal not available ({}), using CPU with Accelerate", e);
+                println!("Metal not available ({e}), falling back to CPU");
             }
         }
     }
-
-    #[cfg(not(target_os = "macos"))]
-    println!("Using CPU");
-
-    #[cfg(target_os = "macos")]
-    println!("Using CPU with Accelerate framework");
 
     Ok(Device::Cpu)
 }
