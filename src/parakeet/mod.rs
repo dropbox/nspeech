@@ -305,6 +305,13 @@ pub fn get_device() -> Result<Device> {
         return Ok(Device::Cpu);
     }
 
+    // fast-cpu feature uses custom CPU GEMM kernels (fbgemm-rs) that have no Metal impl
+    #[cfg(feature = "fast-cpu")]
+    {
+        println!("Using CPU (fast-cpu feature uses optimized CPU GEMM)");
+        return Ok(Device::Cpu);
+    }
+
     #[cfg(target_os = "macos")]
     {
         // Note: Metal acceleration has some known issues with certain tensor operations
