@@ -33,7 +33,7 @@ fn new_mm(in_dim: usize, out_dim: usize, vb: QVarBuilder) -> Result<MM> {
         Ok(MM::new(in_dim, out_dim, vb)?)
     }
 }
-use super::decoder::{DecoderCache, MoonshineDecoder};
+use super::decoder::{DecoderCache, KVCache, MoonshineDecoder};
 use super::encoder::MoonshineEncoder;
 use super::frontend::MoonshineFrontend;
 
@@ -42,6 +42,12 @@ use super::frontend::MoonshineFrontend;
 /// Tracks audio accumulation and controls when to emit partial results.
 /// Uses incremental encoding: caches committed encoder output and only
 /// re-encodes new audio plus a small overlap on each update.
+///
+/// Decoder KV cache is preserved across streaming updates for efficiency.
+/// Self-attention K/V entries for previously generated tokens are reused,
+/// avoiding the O(N²) cost of re-decoding from scratch on each partial.
+/// Cross-attention K/V is invalidated when the encoder output grows (new
+/// committed frames), then recomputed once from the new encoder output.
 pub struct MoonshineStream {
     /// Total audio samples at last transcription
     samples_at_last_update: usize,
@@ -64,8 +70,15 @@ pub struct MoonshineStream {
     /// Number of committed feature frames to re-include as left context
     encoder_overlap: usize,
 
-    /// Previous token sequence (without EOS) for speculative prefix reuse
-    previous_tokens: Vec<u32>,
+    // Persistent decoder state (reused across streaming updates)
+    /// Decoder KV cache persisted across partial updates
+    decoder_cache: Option<DecoderCache>,
+    /// Tokens generated so far in this streaming session (excluding BOS/EOS)
+    cached_tokens: Vec<u32>,
+    /// Next token to feed to the decoder. None = need BOS (fresh) or hit EOS.
+    pending_input: Option<u32>,
+    /// Encoder frame count when decoder cache was last used
+    encoder_frames_at_last_decode: usize,
 }
 
 impl MoonshineStream {
@@ -75,7 +88,10 @@ impl MoonshineStream {
         self.committed_encoder = None;
         self.num_committed = 0;
         self.total_features_at_last_encode = 0;
-        self.previous_tokens = Vec::new();
+        self.decoder_cache = None;
+        self.cached_tokens = Vec::new();
+        self.pending_input = None;
+        self.encoder_frames_at_last_decode = 0;
     }
 }
 
@@ -208,91 +224,6 @@ impl MoonshineModel {
         Ok(generated)
     }
 
-    /// Decode with speculative prefix reuse.
-    ///
-    /// If previous_tokens is non-empty, batch-verifies them in one forward pass,
-    /// finds the divergence point, then continues generating from there.
-    /// Falls back to standard greedy decode if no previous tokens.
-    fn speculative_decode(
-        &self,
-        encoder_hidden: &Tensor,
-        max_tokens: usize,
-        previous_tokens: &[u32],
-    ) -> Result<Vec<u32>> {
-        let device = encoder_hidden.device();
-        let mut cache = DecoderCache::new(self.cfg.decoder_num_layers);
-        let bos = self.cfg.bos_id as u32;
-        let eos = self.cfg.eos_id as u32;
-        let mut generated = Vec::new();
-        let mut next_token: u32;
-
-        if !previous_tokens.is_empty() {
-            // Batch-verify: [BOS, t0, t1, ..., t_{N-1}]
-            let mut input = vec![bos];
-            input.extend_from_slice(previous_tokens);
-            let input_len = input.len();
-            let input_ids = Tensor::from_vec(input, (1, input_len), device)?;
-
-            let hidden = self.decoder.forward(&input_ids, encoder_hidden, &mut cache)?;
-            let logits = self.proj_out.forward(&hidden)?;
-
-            // Find first divergence
-            let mut divergence = previous_tokens.len();
-            for i in 0..previous_tokens.len() {
-                let predicted = logits.i((0, i))?.argmax(0)?.to_scalar::<u32>()?;
-                if predicted != previous_tokens[i] {
-                    divergence = i;
-                    break;
-                }
-            }
-
-            // Keep verified prefix
-            generated.extend_from_slice(&previous_tokens[..divergence]);
-
-            if divergence < previous_tokens.len() {
-                // Truncate self-attention cache to divergence+1 (BOS + verified tokens)
-                cache.truncate(divergence + 1);
-                next_token = logits.i((0, divergence))?.argmax(0)?.to_scalar::<u32>()?;
-            } else {
-                // All verified — get next new token from last position
-                next_token = logits
-                    .i((0, previous_tokens.len()))?
-                    .argmax(0)?
-                    .to_scalar::<u32>()?;
-            }
-
-            generated.push(next_token);
-            if next_token == eos {
-                return Ok(generated);
-            }
-        } else {
-            // Standard BOS start
-            let input_ids = Tensor::from_vec(vec![bos], (1, 1), device)?;
-            let hidden = self.decoder.forward(&input_ids, encoder_hidden, &mut cache)?;
-            let logits = self.proj_out.forward(&hidden)?;
-            next_token = logits.i((0, 0))?.argmax(0)?.to_scalar::<u32>()?;
-            generated.push(next_token);
-            if next_token == eos {
-                return Ok(generated);
-            }
-        }
-
-        // Continue token-by-token
-        let remaining = max_tokens.saturating_sub(generated.len());
-        for _ in 0..remaining {
-            let input_ids = Tensor::from_vec(vec![next_token], (1, 1), device)?;
-            let hidden = self.decoder.forward(&input_ids, encoder_hidden, &mut cache)?;
-            let logits = self.proj_out.forward(&hidden)?;
-            next_token = logits.i((0, 0))?.argmax(0)?.to_scalar::<u32>()?;
-            generated.push(next_token);
-            if next_token == eos {
-                break;
-            }
-        }
-
-        Ok(generated)
-    }
-
     /// Decode token IDs to text using the tokenizer.
     pub fn decode_tokens(&self, tokens: &[u32]) -> Result<String> {
         let tokenizer = self.tokenizer.as_ref()
@@ -328,7 +259,10 @@ impl MoonshineModel {
             total_features_at_last_encode: 0,
             encoder_right_context,
             encoder_overlap,
-            previous_tokens: Vec::new(),
+            decoder_cache: None,
+            cached_tokens: Vec::new(),
+            pending_input: None,
+            encoder_frames_at_last_decode: 0,
         }
     }
 
@@ -401,7 +335,8 @@ impl MoonshineModel {
     /// Check if enough new audio has accumulated and transcribe if so.
     ///
     /// Returns `Some(partial_text)` when a new partial is available.
-    /// Uses incremental encoding to avoid re-encoding already-committed frames.
+    /// Uses incremental encoding and persistent decoder KV cache to avoid
+    /// redundant work across streaming updates.
     pub fn stream_try_update(
         &self,
         stream: &mut MoonshineStream,
@@ -421,20 +356,67 @@ impl MoonshineModel {
             return Ok(None);
         }
 
+        let num_layers = self.cfg.decoder_num_layers;
+        let cache = stream.decoder_cache.get_or_insert_with(|| DecoderCache::new(num_layers));
+        let bos = self.cfg.bos_id as u32;
+        let eos = self.cfg.eos_id as u32;
+
+        // When encoder output grows, invalidate cross-attention K/V cache
+        // (encoder projections change) but keep self-attention K/V cache
+        // (previously generated token representations are approximately stable).
+        if enc_frames != stream.encoder_frames_at_last_decode {
+            for cc in &mut cache.cross_caches {
+                *cc = KVCache::new();
+            }
+            cache.encoder_proj = None;
+            stream.encoder_frames_at_last_decode = enc_frames;
+
+            // If we previously hit EOS, the last token was already consumed
+            // by the decoder but produced EOS. With more encoder context, it
+            // might not be EOS anymore. Truncate to re-evaluate.
+            if stream.pending_input.is_none() && !stream.cached_tokens.is_empty() {
+                let last = stream.cached_tokens.pop().unwrap();
+                cache.truncate(cache.seq_len.saturating_sub(1));
+                stream.pending_input = Some(last);
+            }
+        }
+
         // ~0.02s per encoder frame (frontend 4x reduction of 80-sample frames at 16kHz)
         let max_tokens = ((enc_frames as f64 * 0.02) * 6.5).ceil() as usize + 10;
-        let tokens =
-            self.speculative_decode(&encoder_out, max_tokens, &stream.previous_tokens)?;
 
-        // Remove EOS token if present
-        let tokens: Vec<u32> = tokens
-            .into_iter()
-            .filter(|&t| t != self.cfg.eos_id as u32)
-            .collect();
+        // Bootstrap: feed BOS token to start decoding
+        if stream.pending_input.is_none() && stream.cached_tokens.is_empty() {
+            let input_ids = Tensor::from_vec(vec![bos], (1, 1), device)?;
+            let hidden = self.decoder.forward(&input_ids, &encoder_out, cache)?;
+            let logits = self.proj_out.forward(&hidden)?;
+            let next_token = logits.i((0, 0))?.argmax(0)?.to_scalar::<u32>()?;
+            if next_token == eos {
+                stream.samples_at_last_update = audio.len();
+                return Ok(Some(String::new()));
+            }
+            stream.cached_tokens.push(next_token);
+            stream.pending_input = Some(next_token);
+        }
 
-        stream.previous_tokens = tokens.clone();
+        // Continue generating from where we left off
+        while let Some(token) = stream.pending_input {
+            if stream.cached_tokens.len() >= max_tokens {
+                break;
+            }
+            let input_ids = Tensor::from_vec(vec![token], (1, 1), device)?;
+            let hidden = self.decoder.forward(&input_ids, &encoder_out, cache)?;
+            let logits = self.proj_out.forward(&hidden)?;
+            let next_token = logits.i((0, 0))?.argmax(0)?.to_scalar::<u32>()?;
+            if next_token == eos {
+                stream.pending_input = None;
+                break;
+            }
+            stream.cached_tokens.push(next_token);
+            stream.pending_input = Some(next_token);
+        }
+
         stream.samples_at_last_update = audio.len();
-        let text = self.decode_tokens(&tokens)?;
+        let text = self.decode_tokens(&stream.cached_tokens)?;
         Ok(Some(text))
     }
 
