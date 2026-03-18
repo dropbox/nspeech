@@ -350,6 +350,14 @@ impl SpeechInner {
         F: Fn(Transcription),
     {
         info!("process_samples {}", samples.len());
+
+        // Write raw audio to debug WAV
+        if let Some(writer) = self.debug_wav_writer.as_mut() {
+            for &s in samples {
+                let _ = writer.write_sample(s);
+            }
+        }
+
         // Check if VAD stream is available
         let vad_stream = match self.vad_stream.as_mut() {
             Some(stream) => stream,
@@ -605,6 +613,11 @@ impl SpeechInner {
             }
         } else {
             info!("Flush: no remaining segment to transcribe");
+        }
+
+        // Flush debug WAV writer so the file is readable
+        if let Some(writer) = self.debug_wav_writer.as_mut() {
+            let _ = writer.flush();
         }
 
         // Clear all state buffers to prevent audio bleed between utterances
