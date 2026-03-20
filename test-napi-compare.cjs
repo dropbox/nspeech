@@ -36,6 +36,7 @@ function readWav(filename) {
         channels: buf.readUInt16LE(offset + 10),
         sampleRate: buf.readUInt32LE(offset + 12),
         bitsPerSample: buf.readUInt16LE(offset + 22),
+        _chunkOffset: offset,
       };
     } else if (id === 'data') {
       dataOffset = offset + 8;
@@ -49,17 +50,26 @@ function readWav(filename) {
   if (fmt.channels !== 1) throw new Error(`Expected mono, got ${fmt.channels} channels`);
   if (fmt.sampleRate !== 16000) throw new Error(`Expected 16kHz, got ${fmt.sampleRate}Hz`);
 
+  // Resolve extensible format (65534) to actual sub-format
+  let effectiveFormat = fmt.format;
+  if (fmt.format === 65534) {
+    // WAVE_FORMAT_EXTENSIBLE: sub-format GUID starts at offset+32 in fmt chunk
+    // First 2 bytes of GUID encode the actual format (1=PCM, 3=IEEE float)
+    effectiveFormat = buf.readUInt16LE(fmt._chunkOffset + 8 + 24);
+  }
+
   const samples = [];
-  if (fmt.format === 1 && fmt.bitsPerSample === 16) {
+  if (effectiveFormat === 1 && fmt.bitsPerSample === 16) {
     for (let i = dataOffset; i < dataOffset + dataSize; i += 2) {
       samples.push(buf.readInt16LE(i) / 32768.0);
     }
-  } else if (fmt.format === 3 && fmt.bitsPerSample === 32) {
+  } else if ((effectiveFormat === 3 || fmt.format === 65534) && fmt.bitsPerSample === 32) {
+    // IEEE float 32-bit (either direct format 3 or extensible with float sub-format)
     for (let i = dataOffset; i < dataOffset + dataSize; i += 4) {
       samples.push(buf.readFloatLE(i));
     }
   } else {
-    throw new Error(`Unsupported format: ${fmt.format}, ${fmt.bitsPerSample}-bit`);
+    throw new Error(`Unsupported format: ${fmt.format} (effective=${effectiveFormat}), ${fmt.bitsPerSample}-bit`);
   }
 
   return { samples, sampleRate: fmt.sampleRate };

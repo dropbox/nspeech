@@ -290,10 +290,7 @@ impl SpeechInner {
             (Some(vad), Some(model)) => {
                 match silero::VadStream::new(vad, &device) {
                     Ok(vad_stream) => {
-                        let config = streaming::StreamingConfig {
-                            auto_transcribe_on_pause: cfg!(feature = "auto-transcribe-on-pause"),
-                            ..streaming::StreamingConfig::default()
-                        };
+                        let config = streaming::StreamingConfig::default();
                         Some(streaming::StreamingTranscriber::new(model, vad_stream, device, config))
                     }
                     Err(e) => {
