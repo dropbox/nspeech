@@ -36,6 +36,8 @@ fn new_mm(in_dim: usize, out_dim: usize, vb: QVarBuilder) -> Result<MM> {
 use super::decoder::{DecoderCache, KVCache, MoonshineDecoder};
 use super::encoder::MoonshineEncoder;
 use super::frontend::MoonshineFrontend;
+#[cfg(feature = "triton-metal")]
+use super::triton_encoder::TritonEncoder;
 
 /// Streaming transcription state.
 ///
@@ -99,7 +101,10 @@ impl MoonshineStream {
 pub struct MoonshineModel {
     pub cfg: MoonshineConfig,
     frontend: MoonshineFrontend,
+    #[allow(dead_code)] // fallback when triton_encoder is None
     encoder: MoonshineEncoder,
+    #[cfg(feature = "triton-metal")]
+    triton_encoder: Option<TritonEncoder>,
     decoder: MoonshineDecoder,
     proj_out: MM,
     tokenizer: Option<tokenizers::Tokenizer>,
@@ -158,6 +163,26 @@ impl MoonshineModel {
         // Build model components
         let frontend = MoonshineFrontend::new(&cfg, vb.pp("model.encoder.embedder"))?;
         let encoder = MoonshineEncoder::new(&cfg, vb.pp("model.encoder"))?;
+
+        #[cfg(feature = "triton-metal")]
+        let triton_encoder = {
+            if let Device::Metal(_md) = device {
+                let kernel_dir = crate::triton_kernels::default_kernel_dir();
+                match TritonEncoder::new(&cfg, vb.pp("model.encoder"), &kernel_dir) {
+                    Ok(te) => {
+                        println!("  Triton encoder loaded ({})", kernel_dir.display());
+                        Some(te)
+                    }
+                    Err(e) => {
+                        println!("  Triton encoder unavailable: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        };
+
         let decoder = MoonshineDecoder::new(&cfg, device, vb.pp("model.decoder"))?;
 
         // Output projection: decoder_dim -> vocab_size (quantized, no bias)
@@ -167,6 +192,8 @@ impl MoonshineModel {
             cfg,
             frontend,
             encoder,
+            #[cfg(feature = "triton-metal")]
+            triton_encoder,
             decoder,
             proj_out,
             tokenizer,
@@ -177,9 +204,19 @@ impl MoonshineModel {
     ///
     /// Input: raw audio samples `[1, audio_len]` (padded to multiple of frame_len).
     /// Output: `[1, enc_seq_len, encoder_dim]`.
+    /// Run encoder on features (dispatches to Triton when available).
+    fn run_encoder(&self, features: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "triton-metal")]
+        if let Some(te) = &self.triton_encoder {
+            // Triton encoder outputs F16; decoder expects F32
+            return te.forward(features)?.to_dtype(candle_core::DType::F32).map_err(Into::into);
+        }
+        self.encoder.forward(features)
+    }
+
     pub fn encode(&self, audio: &Tensor) -> Result<Tensor> {
         let features = self.frontend.forward(audio)?;
-        self.encoder.forward(&features)
+        self.run_encoder(&features)
     }
 
     /// Greedy decode from encoder output.
@@ -297,7 +334,7 @@ impl MoonshineModel {
 
         // 3. First encode (no cache): run full encoder
         if stream.committed_encoder.is_none() {
-            let encoded = self.encoder.forward(&all_features)?;
+            let encoded = self.run_encoder(&all_features)?;
             let committable = total_features.saturating_sub(stream.encoder_right_context);
             if committable > 0 {
                 let committed = encoded.i((.., ..committable, ..))?;
@@ -313,7 +350,7 @@ impl MoonshineModel {
         // 4. Incremental: re-encode overlap + new frames
         let chunk_start = stream.num_committed.saturating_sub(stream.encoder_overlap);
         let chunk_features = all_features.i((.., chunk_start.., ..))?;
-        let chunk_encoded = self.encoder.forward(&chunk_features)?;
+        let chunk_encoded = self.run_encoder(&chunk_features)?;
         let chunk_len = chunk_encoded.dim(1)?;
 
         // 5. Extract new committed frames from chunk

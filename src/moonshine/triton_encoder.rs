@@ -12,12 +12,24 @@ use candle_core::{DType, Device, Tensor};
 
 use super::config::MoonshineConfig;
 use crate::triton_kernels::{
-    TritonKernels, empty_f16, triton_flash_attention, triton_layernorm_unit_offset, triton_matmul,
-    triton_residual_add,
+    TritonKernels, triton_matmul, triton_flash_attention, empty_f16,
 };
 
 fn cdiv(a: usize, b: usize) -> usize {
     (a + b - 1) / b
+}
+
+/// Unit-offset layernorm in F32: LN(x) * (gamma + 1.0)
+/// x: [rows, cols] F32, gamma: [cols] F16 → output [rows, cols] F32
+fn unit_offset_layernorm(x: &Tensor, gamma: &Tensor) -> Result<Tensor> {
+    let eps = 1e-5f64;
+    let mean = x.mean_keepdim(1)?;
+    let x_centered = x.broadcast_sub(&mean)?;
+    let var = (&x_centered * &x_centered)?.mean_keepdim(1)?;
+    let inv_std = (var + eps)?.sqrt()?.recip()?;
+    let normed = x_centered.broadcast_mul(&inv_std)?;
+    let scale = (gamma.to_dtype(DType::F32)? + 1.0f64)?;
+    Ok(normed.broadcast_mul(&scale)?)
 }
 
 type QVarBuilder = candle_transformers::quantized_var_builder::VarBuilder;
@@ -182,8 +194,12 @@ impl TritonEncoder {
 
     /// Run encoder forward pass.
     ///
-    /// Input: `[1, seq_len, encoder_dim]` F16 from frontend.
-    /// Output: `[1, seq_len, encoder_dim]` F16 encoded features.
+    /// Input: `[1, seq_len, encoder_dim]` from frontend (any dtype).
+    /// Output: `[1, seq_len, encoder_dim]` F32 encoded features.
+    ///
+    /// Matmul and FA2 run in F16 via Triton kernels (compute-bound).
+    /// Residual stream, layernorm, bias, and GELU run in F32 via Candle (bandwidth-bound)
+    /// to maintain precision over 14 layers.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (batch, seq_len, dim) = x.dims3()?;
         assert_eq!(batch, 1, "TritonEncoder only supports batch=1");
@@ -195,65 +211,57 @@ impl TritonEncoder {
         // Pad seq_len to multiple of 64 for largest tile size.
         let block_m = 64;
         let padded_seq = cdiv(seq_len, block_m) * block_m;
-        let mut hidden = x.reshape((seq_len, dim))?.to_dtype(DType::F16)?;
+
+        // Hidden state stays in F32 for precision; converted to F16 before each matmul.
+        let mut hidden = x.reshape((seq_len, dim))?.to_dtype(DType::F32)?;
         if padded_seq > seq_len {
-            let pad = Tensor::zeros((padded_seq - seq_len, dim), DType::F16, x.device())?;
+            let pad = Tensor::zeros((padded_seq - seq_len, dim), DType::F32, x.device())?;
             hidden = Tensor::cat(&[&hidden, &pad], 0)?;
         }
 
         for (i, layer) in self.layers.iter().enumerate() {
             let [left, right] = self.sliding_windows[i];
 
-            // ── Pre-norm ──
+            // ── Pre-norm (F32 via Candle) ──
             let residual = hidden.clone();
-            let normed = triton_layernorm_unit_offset(
-                dev, &self.kernels.layernorm_unit_offset,
-                &hidden, &layer.input_layernorm.gamma,
-                padded_seq, dim,
-            )?;
+            let normed = unit_offset_layernorm(&hidden, &layer.input_layernorm.gamma)?;
 
-            // ── Self-attention (Q/K/V projections via Triton, attention via Candle) ──
+            // ── Self-attention (Triton matmul for projections, Candle for attention) ──
             let kv_dim = layer.self_attn.num_kv_heads * layer.self_attn.head_dim;
+            let nh = layer.self_attn.num_heads;
+            let hd = layer.self_attn.head_dim;
+            let normed_f16 = normed.to_dtype(DType::F16)?;
 
             let q = triton_matmul(
                 dev, &self.kernels.matmul_64x64,
-                &normed, &layer.self_attn.q_proj.weight,
+                &normed_f16, &layer.self_attn.q_proj.weight,
                 padded_seq, kv_dim, dim,
             )?;
             let k = triton_matmul(
                 dev, &self.kernels.matmul_64x64,
-                &normed, &layer.self_attn.k_proj.weight,
+                &normed_f16, &layer.self_attn.k_proj.weight,
                 padded_seq, kv_dim, dim,
             )?;
             let v = triton_matmul(
                 dev, &self.kernels.matmul_64x64,
-                &normed, &layer.self_attn.v_proj.weight,
+                &normed_f16, &layer.self_attn.v_proj.weight,
                 padded_seq, kv_dim, dim,
             )?;
 
-            // Q/K/V are [padded_seq, kv_dim] = [padded_seq, n_heads * head_dim].
-            // The FA2 kernel supports arbitrary strides, so use the
-            // [seq, n_heads, D] layout directly — no transpose/copy needed.
-            let nh = layer.self_attn.num_heads;
-            let hd = layer.self_attn.head_dim;
-
-            // stride_h = D (adjacent heads), stride_m = kv_dim (adjacent rows)
-            let stride_h = hd as i32;
-            let stride_m = kv_dim as i32;
+            // FA2 kernel: fused QK^T + softmax + sliding window + attn*V
+            // Q, K, V are [padded_seq, kv_dim] F16 with interleaved heads
+            let attn_out = empty_f16(dev, (padded_seq, kv_dim))?;
             let sm_scale = layer.self_attn.scale as f32;
-
-            // Allocate output as [padded_seq, kv_dim] — same layout as Q/K/V
-            let attn_flat = empty_f16(dev, (padded_seq, kv_dim))?;
-
-            // Flash Attention 2: fused QK^T, softmax+mask, attn*V — all in F16
             triton_flash_attention(
                 dev, &self.kernels.flash_attention,
-                &q, &k, &v, &attn_flat,
-                nh, seq_len, hd,
-                stride_h, stride_m,
+                &q, &k, &v, &attn_out,
+                nh, padded_seq, hd,
+                hd as i32,       // stride_h: head_dim
+                kv_dim as i32,   // stride_m: row stride
                 sm_scale,
                 left as i32, right as i32,
             )?;
+            let attn_flat = attn_out;
 
             let attn_proj = triton_matmul(
                 dev, &self.kernels.matmul_64x64,
@@ -261,52 +269,38 @@ impl TritonEncoder {
                 padded_seq, dim, kv_dim,
             )?;
 
-            // ── Residual ──
-            hidden = triton_residual_add(
-                dev, &self.kernels.residual_add,
-                &attn_proj, &residual,
-                padded_seq * dim,
-            )?;
+            // ── Residual (F32) ──
+            hidden = (attn_proj.to_dtype(DType::F32)? + residual)?;
 
-            // ── Post-norm ──
+            // ── Post-norm (F32 via Candle) ──
             let residual = hidden.clone();
-            let normed = triton_layernorm_unit_offset(
-                dev, &self.kernels.layernorm_unit_offset,
-                &hidden, &layer.post_attention_layernorm.gamma,
-                padded_seq, dim,
-            )?;
+            let normed = unit_offset_layernorm(&hidden, &layer.post_attention_layernorm.gamma)?;
 
-            // ── FFN ──
-            // Use 64×64 matmul (2× faster than 32×32) + separate bias/GELU.
-            // The bias-fused matmul exceeds 32KB threadgroup memory at 64×64,
-            // but bias add + GELU are O(M*N) vs O(M*N*K) — negligible cost.
+            // ── FFN (Triton matmul in F16, bias+GELU in F32) ──
+            let normed_f16 = normed.to_dtype(DType::F16)?;
             let fc1_out = triton_matmul(
                 dev, &self.kernels.matmul_64x64,
-                &normed, &layer.mlp.fc1.weight,
+                &normed_f16, &layer.mlp.fc1.weight,
                 padded_seq, layer.mlp.fc1.out_dim, layer.mlp.fc1.in_dim,
             )?;
-            let fc1_out = fc1_out.broadcast_add(&layer.mlp.fc1.bias)?.gelu_erf()?;
+            let fc1_out = fc1_out.to_dtype(DType::F32)?
+                .broadcast_add(&layer.mlp.fc1.bias.to_dtype(DType::F32)?)?
+                .gelu_erf()?;
+            let fc1_f16 = fc1_out.to_dtype(DType::F16)?;
             let fc2_out = triton_matmul(
                 dev, &self.kernels.matmul_64x64,
-                &fc1_out, &layer.mlp.fc2.weight,
+                &fc1_f16, &layer.mlp.fc2.weight,
                 padded_seq, layer.mlp.fc2.out_dim, layer.mlp.fc2.in_dim,
             )?;
-            let fc2_out = fc2_out.broadcast_add(&layer.mlp.fc2.bias)?;
+            let fc2_out = fc2_out.to_dtype(DType::F32)?
+                .broadcast_add(&layer.mlp.fc2.bias.to_dtype(DType::F32)?)?;
 
-            // ── Residual ──
-            hidden = triton_residual_add(
-                dev, &self.kernels.residual_add,
-                &fc2_out, &residual,
-                padded_seq * dim,
-            )?;
+            // ── Residual (F32) ──
+            hidden = (fc2_out + residual)?;
         }
 
-        // Final norm
-        let out = triton_layernorm_unit_offset(
-            dev, &self.kernels.layernorm_unit_offset,
-            &hidden, &self.final_norm.gamma,
-            padded_seq, dim,
-        )?;
+        // Final norm (F32)
+        let out = unit_offset_layernorm(&hidden, &self.final_norm.gamma)?;
 
         // Slice back to seq_len and reshape to [1, seq_len, dim]
         let out = out.narrow(0, 0, seq_len)?;

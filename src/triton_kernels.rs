@@ -338,7 +338,7 @@ pub fn triton_flash_attention(
     out: &Tensor,
     n_heads: usize,
     seq_len: usize,
-    head_dim: usize,
+    _head_dim: usize,
     stride_h: i32,
     stride_m: i32,
     sm_scale: f32,
