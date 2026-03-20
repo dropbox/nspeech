@@ -193,21 +193,25 @@ impl StreamingTranscriber {
                         self.silence_frames += 1;
 
                         if self.silence_frames >= self.pause_frames {
-                            // Pause detected — finalize segment
-                            let duration_ms = self.current_segment.len() as f32 / 16.0;
-                            if duration_ms >= self.config.min_speech_duration_ms
-                                && self.config.auto_transcribe_on_pause
-                            {
-                                if let Some(evt) = self.finalize_current_segment()? {
-                                    events.push(evt);
+                            if self.config.auto_transcribe_on_pause {
+                                // Pause detected — finalize segment and reset
+                                let duration_ms = self.current_segment.len() as f32 / 16.0;
+                                if duration_ms >= self.config.min_speech_duration_ms {
+                                    if let Some(evt) = self.finalize_current_segment()? {
+                                        events.push(evt);
+                                    }
                                 }
-                            }
 
-                            self.in_speech = false;
-                            self.silence_frames = 0;
-                            self.current_segment.clear();
-                            self.current_segment_start = None;
-                            self.last_partial_text.clear();
+                                self.in_speech = false;
+                                self.silence_frames = 0;
+                                self.current_segment.clear();
+                                self.current_segment_start = None;
+                                self.last_partial_text.clear();
+                            } else {
+                                // No auto-transcribe: keep segment, reset silence counter.
+                                // Audio accumulates until explicit flush().
+                                self.silence_frames = 0;
+                            }
                         }
                     }
 
