@@ -57,7 +57,7 @@ impl TritonKernels {
 }
 
 /// Create an empty F16 output tensor on the Metal device.
-fn empty_f16(device: &MetalDevice, shape: impl Into<Shape>) -> Result<Tensor> {
+pub fn empty_f16(device: &MetalDevice, shape: impl Into<Shape>) -> Result<Tensor> {
     let shape: Shape = shape.into();
     let n = shape.elem_count();
     let buffer = device.new_buffer(n, DType::F16, "triton_out")?;
@@ -165,6 +165,7 @@ pub fn triton_matmul(
 /// Dispatch matmul + bias: C[M,N] = A[M,K] @ B[K,N] + bias[N]
 ///
 /// B must be [K, N] row-major. Transpose weights before calling.
+/// `block_m`/`block_n` must match the compiled kernel tile size.
 pub fn triton_matmul_bias(
     device: &MetalDevice,
     pipeline: &ComputePipeline,
@@ -174,6 +175,8 @@ pub fn triton_matmul_bias(
     m: usize,
     n: usize,
     k: usize,
+    block_m: usize,
+    block_n: usize,
 ) -> Result<Tensor> {
     let out = empty_f16(device, (m, n))?;
 
@@ -195,8 +198,8 @@ pub fn triton_matmul_bias(
         encoder.set_bytes(12, &1i32);           // stride_cn = 1
 
         let grid = MTLSize {
-            width: cdiv(m, 32),
-            height: cdiv(n, 32),
+            width: cdiv(m, block_m),
+            height: cdiv(n, block_n),
             depth: 1,
         };
         let tg = MTLSize { width: 1024, height: 1, depth: 1 };
@@ -210,6 +213,7 @@ pub fn triton_matmul_bias(
 /// Dispatch fused matmul + bias + GELU: C[M,N] = GELU(A[M,K] @ B[K,N] + bias[N])
 ///
 /// B must be [K, N] row-major. Transpose weights before calling.
+/// `block_m`/`block_n` must match the compiled kernel tile size.
 pub fn triton_matmul_bias_gelu(
     device: &MetalDevice,
     pipeline: &ComputePipeline,
@@ -219,6 +223,8 @@ pub fn triton_matmul_bias_gelu(
     m: usize,
     n: usize,
     k: usize,
+    block_m: usize,
+    block_n: usize,
 ) -> Result<Tensor> {
     let out = empty_f16(device, (m, n))?;
 
@@ -240,8 +246,8 @@ pub fn triton_matmul_bias_gelu(
         encoder.set_bytes(12, &1i32);           // stride_cn = 1
 
         let grid = MTLSize {
-            width: cdiv(m, 32),
-            height: cdiv(n, 32),
+            width: cdiv(m, block_m),
+            height: cdiv(n, block_n),
             depth: 1,
         };
         let tg = MTLSize { width: 1024, height: 1, depth: 1 };
@@ -312,8 +318,14 @@ pub fn triton_residual_add(
 
 /// Dispatch Flash Attention 2 with sliding window.
 ///
-/// Q, K, V: [n_heads, seq_len, head_dim] F16 contiguous.
-/// Returns O: [n_heads, seq_len, head_dim] F16.
+/// Q, K, V, O: contiguous buffers with same strides.
+/// stride_h: offset (in elements) between consecutive heads.
+/// stride_m: offset (in elements) between consecutive rows within a head.
+/// head_dim must be contiguous (stride 1).
+///
+/// Common layouts:
+///   [n_heads, seq_len, D]: stride_h = seq_len * D, stride_m = D
+///   [seq_len, n_heads, D]: stride_h = D, stride_m = n_heads * D
 ///
 /// The kernel fuses QK^T, softmax with sliding window masking, and attn*V
 /// in a single pass using online softmax (no materialised seq×seq matrix).
@@ -323,28 +335,29 @@ pub fn triton_flash_attention(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
+    out: &Tensor,
     n_heads: usize,
     seq_len: usize,
     head_dim: usize,
+    stride_h: i32,
+    stride_m: i32,
     sm_scale: f32,
     window_left: i32,
     window_right: i32,
-) -> Result<Tensor> {
-    let out = empty_f16(device, (n_heads, seq_len, head_dim))?;
-
-    with_metal_buffers!(q, k, v, &out, |q_buf, q_off, k_buf, k_off, v_buf, v_off, o_buf, o_off| {
+) -> Result<()> {
+    with_metal_buffers!(q, k, v, out, |q_buf, q_off, k_buf, k_off, v_buf, v_off, o_buf, o_off| {
         let encoder = device.command_encoder()?;
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(q_buf), q_off);
         encoder.set_buffer(1, Some(k_buf), k_off);
         encoder.set_buffer(2, Some(v_buf), v_off);
         encoder.set_buffer(3, Some(o_buf), o_off);
-        encoder.set_bytes(4, &(seq_len as i32));           // seq_len
-        encoder.set_bytes(5, &((seq_len * head_dim) as i32)); // stride_h = seq_len * D
-        encoder.set_bytes(6, &(head_dim as i32));           // stride_m = D
-        encoder.set_bytes(7, &sm_scale);                    // sm_scale
-        encoder.set_bytes(8, &window_left);                 // window_left
-        encoder.set_bytes(9, &window_right);                // window_right
+        encoder.set_bytes(4, &(seq_len as i32));
+        encoder.set_bytes(5, &stride_h);
+        encoder.set_bytes(6, &stride_m);
+        encoder.set_bytes(7, &sm_scale);
+        encoder.set_bytes(8, &window_left);
+        encoder.set_bytes(9, &window_right);
 
         let grid = MTLSize {
             width: cdiv(seq_len, 32),
@@ -356,7 +369,7 @@ pub fn triton_flash_attention(
         Ok::<(), anyhow::Error>(())
     })?;
 
-    Ok(out)
+    Ok(())
 }
 
 /// Default kernel directory.

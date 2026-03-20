@@ -12,8 +12,8 @@ use candle_core::{DType, Device, Tensor};
 
 use super::config::MoonshineConfig;
 use crate::triton_kernels::{
-    TritonKernels, triton_flash_attention, triton_layernorm_unit_offset, triton_matmul,
-    triton_matmul_bias, triton_matmul_bias_gelu, triton_residual_add,
+    TritonKernels, empty_f16, triton_flash_attention, triton_layernorm_unit_offset, triton_matmul,
+    triton_residual_add,
 };
 
 fn cdiv(a: usize, b: usize) -> usize {
@@ -192,7 +192,7 @@ impl TritonEncoder {
         let dev = &self.metal_device;
 
         // Flatten to [seq_len, dim] for 2D matmul dispatch.
-        // Pad seq_len to multiple of 64 to avoid OOB loads in tiled matmul.
+        // Pad seq_len to multiple of 64 for largest tile size.
         let block_m = 64;
         let padded_seq = cdiv(seq_len, block_m) * block_m;
         let mut hidden = x.reshape((seq_len, dim))?.to_dtype(DType::F16)?;
@@ -231,54 +231,29 @@ impl TritonEncoder {
                 padded_seq, kv_dim, dim,
             )?;
 
-            // Slice back to seq_len rows (drop padding) for attention
-            let q = q.narrow(0, 0, seq_len)?;
-            let k = k.narrow(0, 0, seq_len)?;
-            let v = v.narrow(0, 0, seq_len)?;
-
-            // Reshape to [n_heads, seq_len, head_dim] for Flash Attention
+            // Q/K/V are [padded_seq, kv_dim] = [padded_seq, n_heads * head_dim].
+            // The FA2 kernel supports arbitrary strides, so use the
+            // [seq, n_heads, D] layout directly — no transpose/copy needed.
             let nh = layer.self_attn.num_heads;
-            let nkv = layer.self_attn.num_kv_heads;
             let hd = layer.self_attn.head_dim;
 
-            let q = q.reshape((seq_len, nh, hd))?.transpose(0, 1)?.contiguous()?;
-            let k = k.reshape((seq_len, nkv, hd))?.transpose(0, 1)?.contiguous()?;
-            let v = v.reshape((seq_len, nkv, hd))?.transpose(0, 1)?.contiguous()?;
+            // stride_h = D (adjacent heads), stride_m = kv_dim (adjacent rows)
+            let stride_h = hd as i32;
+            let stride_m = kv_dim as i32;
+            let sm_scale = layer.self_attn.scale as f32;
 
-            // GQA repeat if needed
-            let (k, v) = if nkv != nh {
-                let repeats = nh / nkv;
-                let k = k.unsqueeze(1)?
-                    .expand((nkv, repeats, seq_len, hd))?
-                    .reshape((nh, seq_len, hd))?
-                    .contiguous()?;
-                let v = v.unsqueeze(1)?
-                    .expand((nkv, repeats, seq_len, hd))?
-                    .reshape((nh, seq_len, hd))?
-                    .contiguous()?;
-                (k, v)
-            } else {
-                (k, v)
-            };
+            // Allocate output as [padded_seq, kv_dim] — same layout as Q/K/V
+            let attn_flat = empty_f16(dev, (padded_seq, kv_dim))?;
 
             // Flash Attention 2: fused QK^T, softmax+mask, attn*V — all in F16
-            let sm_scale = layer.self_attn.scale as f32;
-            let attn_output = triton_flash_attention(
+            triton_flash_attention(
                 dev, &self.kernels.flash_attention,
-                &q, &k, &v,
+                &q, &k, &v, &attn_flat,
                 nh, seq_len, hd,
+                stride_h, stride_m,
                 sm_scale,
                 left as i32, right as i32,
             )?;
-
-            // Reshape back to [seq_len, kv_dim] for O projection
-            let mut attn_flat = attn_output
-                .transpose(0, 1)?.contiguous()?
-                .reshape((seq_len, kv_dim))?;
-            if padded_seq > seq_len {
-                let pad = Tensor::zeros((padded_seq - seq_len, kv_dim), DType::F16, x.device())?;
-                attn_flat = Tensor::cat(&[&attn_flat, &pad], 0)?;
-            }
 
             let attn_proj = triton_matmul(
                 dev, &self.kernels.matmul_64x64,
@@ -301,17 +276,22 @@ impl TritonEncoder {
                 padded_seq, dim,
             )?;
 
-            // ── FFN: fused matmul+bias+GELU for fc1, matmul+bias for fc2 ──
-            let fc1_out = triton_matmul_bias_gelu(
-                dev, &self.kernels.matmul_bias_gelu_32x32,
-                &normed, &layer.mlp.fc1.weight, &layer.mlp.fc1.bias,
+            // ── FFN ──
+            // Use 64×64 matmul (2× faster than 32×32) + separate bias/GELU.
+            // The bias-fused matmul exceeds 32KB threadgroup memory at 64×64,
+            // but bias add + GELU are O(M*N) vs O(M*N*K) — negligible cost.
+            let fc1_out = triton_matmul(
+                dev, &self.kernels.matmul_64x64,
+                &normed, &layer.mlp.fc1.weight,
                 padded_seq, layer.mlp.fc1.out_dim, layer.mlp.fc1.in_dim,
             )?;
-            let fc2_out = triton_matmul_bias(
-                dev, &self.kernels.matmul_bias_32x32,
-                &fc1_out, &layer.mlp.fc2.weight, &layer.mlp.fc2.bias,
+            let fc1_out = fc1_out.broadcast_add(&layer.mlp.fc1.bias)?.gelu_erf()?;
+            let fc2_out = triton_matmul(
+                dev, &self.kernels.matmul_64x64,
+                &fc1_out, &layer.mlp.fc2.weight,
                 padded_seq, layer.mlp.fc2.out_dim, layer.mlp.fc2.in_dim,
             )?;
+            let fc2_out = fc2_out.broadcast_add(&layer.mlp.fc2.bias)?;
 
             // ── Residual ──
             hidden = triton_residual_add(
