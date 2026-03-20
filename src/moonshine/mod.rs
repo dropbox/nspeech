@@ -22,6 +22,8 @@ pub mod decoder;
 pub mod encoder;
 pub mod frontend;
 pub mod model;
+#[cfg(feature = "triton-metal")]
+pub mod triton_encoder;
 
 pub use config::MoonshineConfig;
 pub use model::MoonshineModel;

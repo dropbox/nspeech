@@ -28,8 +28,8 @@ rustflags = [
 
 # Profile for release builds (used when building with --release)
 [profile.release]
-lto = "thin"              # Link-time optimization
-codegen-units = 1         # Single codegen unit for better optimization
+#lto = "thin"              # Link-time optimization
+#codegen-units = 1         # Single codegen unit for better optimization
 opt-level = 3             # Maximum optimization
 strip = false             # Keep symbols for better profiling
 panic = "abort"           # Smaller binary, faster panic handling
