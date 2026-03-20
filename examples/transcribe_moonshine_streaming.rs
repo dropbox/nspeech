@@ -8,9 +8,9 @@
 /// Final results are emitted on pause or end of audio.
 ///
 /// Usage:
-///   cargo run --example transcribe_moonshine_streaming --release -- MLKDream_16k.wav
 ///   cargo run --example transcribe_moonshine_streaming --release -- dots.wav
 ///   cargo run --example transcribe_moonshine_streaming --release -- dots.wav assets
+///   cargo run --example transcribe_moonshine_streaming --release -- dots.wav assets --json out.json
 ///   PARAKEET_DEVICE=cpu cargo run --example transcribe_moonshine_streaming --release -- audio.wav
 
 use anyhow::Result;
@@ -58,6 +58,11 @@ fn main() -> Result<()> {
     let wav_path = args.get(1).map(|s| s.as_str()).unwrap_or("dots.wav");
     let model_dir = args.get(2).map(|s| s.as_str()).unwrap_or("assets");
 
+    // Check for --json flag
+    let json_path = args.iter().position(|a| a == "--json")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.to_string());
+
     println!("=== Moonshine V2 Streaming Transcription ===\n");
 
     // Load audio
@@ -79,7 +84,8 @@ fn main() -> Result<()> {
     let t1 = Instant::now();
     println!("Loading Moonshine from GGUF assets ({})...", model_dir);
     let model = MoonshineModel::load_from_gguf_mmap(model_dir, &device)?;
-    println!("Model loaded in {:.0}ms\n", t1.elapsed().as_millis());
+    let model_load_ms = t1.elapsed().as_millis();
+    println!("Model loaded in {:.0}ms\n", model_load_ms);
 
     // Create streaming state
     let mut stream = model.stream_new(STREAM_UPDATE_INTERVAL_MS, STREAM_MIN_AUDIO_MS);
@@ -99,6 +105,9 @@ fn main() -> Result<()> {
     let mut total_partials: usize = 0;
     let mut total_finals: usize = 0;
     let mut full_text: Vec<String> = Vec::new();
+
+    // JSON event log
+    let mut events: Vec<serde_json::Value> = Vec::new();
 
     let t_start = Instant::now();
     let mut pos = 0;
@@ -131,16 +140,29 @@ fn main() -> Result<()> {
                 current_segment.extend_from_slice(chunk);
 
                 // Try streaming partial transcription
+                let t_partial = Instant::now();
                 match model.stream_try_update(&mut stream, &current_segment, &device)? {
                     Some(text) => {
+                        let elapsed_ms = t_partial.elapsed().as_millis() as f64;
                         let trimmed = text.trim();
                         if !trimmed.is_empty() {
                             total_partials += 1;
                             let seg_dur = current_segment.len() as f64 / 16000.0;
+                            let wall_time = t_start.elapsed().as_secs_f64();
                             print!("\r\x1b[K  [partial {:>2}] ({:.1}s) {}", total_partials, seg_dur, trimmed);
-                            // Flush stdout so the partial shows up immediately
                             use std::io::Write;
                             std::io::stdout().flush()?;
+
+                            events.push(serde_json::json!({
+                                "type": "partial",
+                                "segment": segment_idx,
+                                "index": total_partials,
+                                "text": trimmed,
+                                "segment_audio_sec": seg_dur,
+                                "segment_start_sec": segment_start.unwrap_or(0.0),
+                                "wall_time_sec": wall_time,
+                                "decode_ms": elapsed_ms,
+                            }));
                         }
                     }
                     None => {}
@@ -164,10 +186,20 @@ fn main() -> Result<()> {
                                 total_finals += 1;
                                 let start = segment_start.unwrap_or(0.0);
                                 let end_sec = start + current_segment.len() as f64 / 16000.0;
-                                // Clear the partial line and print final
+                                let wall_time = t_start.elapsed().as_secs_f64();
                                 println!("\r\x1b[K  [final]     [{:.2}s-{:.2}s] ({:.0}ms) {}",
                                     start, end_sec, fin_ms, trimmed);
                                 full_text.push(trimmed.to_string());
+
+                                events.push(serde_json::json!({
+                                    "type": "final",
+                                    "segment": segment_idx,
+                                    "text": trimmed,
+                                    "start_sec": start,
+                                    "end_sec": end_sec,
+                                    "wall_time_sec": wall_time,
+                                    "decode_ms": fin_ms as f64,
+                                }));
                             }
                         }
 
@@ -206,9 +238,20 @@ fn main() -> Result<()> {
                 total_finals += 1;
                 let start = segment_start.unwrap_or(0.0);
                 let end_sec = start + current_segment.len() as f64 / 16000.0;
+                let wall_time = t_start.elapsed().as_secs_f64();
                 println!("\r\x1b[K  [final]     [{:.2}s-{:.2}s] ({:.0}ms) {}",
                     start, end_sec, fin_ms, trimmed);
                 full_text.push(trimmed.to_string());
+
+                events.push(serde_json::json!({
+                    "type": "final",
+                    "segment": segment_idx,
+                    "text": trimmed,
+                    "start_sec": start,
+                    "end_sec": end_sec,
+                    "wall_time_sec": wall_time,
+                    "decode_ms": fin_ms as f64,
+                }));
             }
         }
     }
@@ -223,6 +266,27 @@ fn main() -> Result<()> {
     println!("Partials:     {}", total_partials);
     println!("Total:        {:.0}ms ({:.2}x realtime)",
         total_ms, (total_ms as f64 / 1000.0) / total_duration);
+
+    // Write JSON if requested
+    if let Some(path) = json_path {
+        let output = serde_json::json!({
+            "audio_file": wav_path,
+            "audio_duration_sec": total_duration,
+            "audio_samples": samples.len(),
+            "model": "moonshine-v2-streaming-medium",
+            "device": format!("{:?}", device),
+            "model_load_ms": model_load_ms as f64,
+            "total_ms": total_ms as f64,
+            "realtime_factor": (total_ms as f64 / 1000.0) / total_duration,
+            "num_segments": total_finals,
+            "num_partials": total_partials,
+            "full_text": full_text.join(" "),
+            "events": events,
+        });
+        let json = serde_json::to_string_pretty(&output)?;
+        std::fs::write(&path, &json)?;
+        println!("\nJSON written to {}", path);
+    }
 
     Ok(())
 }

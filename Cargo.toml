@@ -55,6 +55,9 @@ once_cell = "1.21.3"
 rayon = { version = "1", optional = true }
 fbgemm-rs = { path = "../fbgemm-rs", optional = true, features = ["rayon"] }
 
+# Audio input (for mic example)
+cpal = "0.15"
+
 [build-dependencies]
 napi-build = "2.2.3"
 

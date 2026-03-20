@@ -22,26 +22,8 @@ use hound::{WavWriter, WavSpec, SampleFormat};
 #[cfg(not(feature = "use-moonshine"))]
 use crate::parakeet;
 #[cfg(feature = "use-moonshine")]
-use crate::moonshine;
+use crate::streaming;
 use crate::silero;
-
-/// Returns the longest common prefix of two strings, splitting on a char boundary.
-#[allow(dead_code)]
-fn longest_common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
-    let len = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
-    // Ensure we don't split a multi-byte UTF-8 character
-    match a.get(..len) {
-        Some(s) => s,
-        None => {
-            // Back up to the previous char boundary
-            let mut end = len;
-            while end > 0 && !a.is_char_boundary(end) {
-                end -= 1;
-            }
-            &a[..end]
-        }
-    }
-}
 
 #[napi(object)]
 pub struct LogEvent {
@@ -182,35 +164,42 @@ pub struct Transcription {
 
 /// Inner state for transcription stream
 struct SpeechInner {
+    // Moonshine path: delegates entirely to StreamingTranscriber
+    #[cfg(feature = "use-moonshine")]
+    transcriber: Option<streaming::StreamingTranscriber>,
+
+    // Parakeet TDT path: manual VAD + segment management
+    #[cfg(not(feature = "use-moonshine"))]
     vad_stream: Option<silero::VadStream>,
     #[cfg(not(feature = "use-moonshine"))]
     tdt_model: Option<parakeet::TransducerModel>,
     #[cfg(not(feature = "use-moonshine"))]
     feat_extractor: parakeet::ParakeetFeatureExtractor,
-    #[cfg(feature = "use-moonshine")]
-    moonshine_model: Option<moonshine::MoonshineModel>,
-    #[cfg(feature = "use-moonshine")]
-    moonshine_stream: Option<moonshine::MoonshineStream>,
+    #[cfg(not(feature = "use-moonshine"))]
     device: candle_core::Device,
-
-    // VAD state
+    #[cfg(not(feature = "use-moonshine"))]
     current_segment: Vec<f32>,
+    #[cfg(not(feature = "use-moonshine"))]
     current_segment_start: Option<f64>,
+    #[cfg(not(feature = "use-moonshine"))]
     pre_buffer: std::collections::VecDeque<f32>,
+    #[cfg(not(feature = "use-moonshine"))]
     silence_frames: usize,
+    #[cfg(not(feature = "use-moonshine"))]
     was_speech_last_frame: bool,
+    #[cfg(not(feature = "use-moonshine"))]
     total_samples_processed: usize,
-
-    // Configuration
+    #[cfg(not(feature = "use-moonshine"))]
     speech_threshold: f32,
+    #[cfg(not(feature = "use-moonshine"))]
     #[allow(dead_code)]
-    period_pause_frames: usize,  // Frames of silence to trigger segment end (used with feature flag)
-
-    // Segment tracking for web UX
+    period_pause_frames: usize,
+    #[cfg(not(feature = "use-moonshine"))]
     segment_index: u32,
+    #[cfg(not(feature = "use-moonshine"))]
     last_partial_text: String,
 
-    // Debug WAV writer
+    // Debug WAV writer (both paths)
     #[allow(dead_code)]
     debug_wav_writer: Option<WavWriter<std::io::BufWriter<std::fs::File>>>,
 }
@@ -248,13 +237,13 @@ impl SpeechInner {
         // Feature extractor for TDT (128 mel bins for streaming TDT GGUF model)
         let feat_extractor = parakeet::ParakeetFeatureExtractor::new(128);
 
-        // Pre-buffer: 1 second of audio
-        let pre_buffer_samples = 16000;
+        // Pre-buffer: 0.5 seconds of audio
+        let pre_buffer_samples = 8000;
         let pre_buffer = std::collections::VecDeque::with_capacity(pre_buffer_samples);
 
         // Configuration
-        let speech_threshold = 0.1;  // Low threshold for better capture
-        let period_pause_ms = 500.0;  // 500ms silence = segment end
+        let speech_threshold = 0.3;
+        let period_pause_ms = 800.0;  // 800ms silence = segment end
         let period_pause_frames = (period_pause_ms / 32.0) as usize;  // 32ms per VAD frame (512 samples @ 16kHz)
 
         Self {
@@ -279,7 +268,7 @@ impl SpeechInner {
     #[cfg(feature = "use-moonshine")]
     fn new(
         vad: Option<silero::SileroVad>,
-        model: Option<moonshine::MoonshineModel>,
+        model: Option<crate::moonshine::MoonshineModel>,
         device: candle_core::Device,
     ) -> Self {
         // Create debug WAV writer
@@ -296,41 +285,31 @@ impl SpeechInner {
 
         info!("Moonshine + VAD streaming mode: enabled (VAD segmentation + Moonshine transcription)");
 
-        // Create VAD stream if VAD was loaded successfully
-        let vad_stream = vad.and_then(|v| match silero::VadStream::new(v, &device) {
-            Ok(stream) => Some(stream),
-            Err(e) => {
-                warn!("VAD stream could not be created: {}", e);
+        // Build StreamingTranscriber if both VAD and model are available
+        let transcriber = match (vad, model) {
+            (Some(vad), Some(model)) => {
+                match silero::VadStream::new(vad, &device) {
+                    Ok(vad_stream) => {
+                        let config = streaming::StreamingConfig {
+                            auto_transcribe_on_pause: cfg!(feature = "auto-transcribe-on-pause"),
+                            ..streaming::StreamingConfig::default()
+                        };
+                        Some(streaming::StreamingTranscriber::new(model, vad_stream, device, config))
+                    }
+                    Err(e) => {
+                        warn!("VAD stream could not be created: {}", e);
+                        None
+                    }
+                }
+            }
+            _ => {
+                warn!("Missing VAD or model — transcription disabled");
                 None
             }
-        });
-
-        // Pre-buffer: 1 second of audio
-        let pre_buffer_samples = 16000;
-        let pre_buffer = std::collections::VecDeque::with_capacity(pre_buffer_samples);
-
-        // Configuration
-        let speech_threshold = 0.1;  // Low threshold for better capture
-        let period_pause_ms = 500.0;  // 500ms silence = segment end
-        let period_pause_frames = (period_pause_ms / 32.0) as usize;  // 32ms per VAD frame (512 samples @ 16kHz)
-
-        let moonshine_stream = model.as_ref().map(|m| m.stream_new(500, 500));
+        };
 
         Self {
-            vad_stream,
-            moonshine_model: model,
-            moonshine_stream,
-            device: device.clone(),
-            current_segment: Vec::new(),
-            current_segment_start: None,
-            pre_buffer,
-            silence_frames: 0,
-            was_speech_last_frame: false,
-            total_samples_processed: 0,
-            speech_threshold,
-            period_pause_frames,
-            segment_index: 0,
-            last_partial_text: String::new(),
+            transcriber,
             debug_wav_writer,
         }
     }
@@ -345,6 +324,96 @@ impl SpeechInner {
         WavWriter::create("debug_input.wav", spec)
     }
 
+    // ---- Moonshine path: delegates to StreamingTranscriber ----
+
+    #[cfg(feature = "use-moonshine")]
+    fn process_samples<F>(&mut self, samples: &[f32], callback: &F) -> Result<()>
+    where
+        F: Fn(Transcription),
+    {
+        info!("process_samples {}", samples.len());
+
+        // Write raw audio to debug WAV
+        if let Some(writer) = self.debug_wav_writer.as_mut() {
+            for &s in samples {
+                let _ = writer.write_sample(s);
+            }
+        }
+
+        let transcriber = match self.transcriber.as_mut() {
+            Some(t) => t,
+            None => {
+                warn!("Transcriber not available");
+                return Ok(());
+            }
+        };
+
+        let events = transcriber.push_audio(samples)
+            .map_err(|e| napi::Error::from_reason(format!("Streaming error: {}", e)))?;
+
+        for evt in events {
+            info!("{}: \"{}\" ({:.2}s-{:.2}s, segment {})",
+                  if evt.is_partial { "Partial" } else { "Final" },
+                  evt.text, evt.start_time, evt.end_time, evt.segment_index);
+            callback(Transcription {
+                text: evt.text.clone(),
+                raw_text: evt.text,
+                start_time: evt.start_time,
+                end_time: evt.end_time,
+                is_partial: evt.is_partial,
+                segment_index: evt.segment_index,
+                stable_text: evt.stable_text,
+            });
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "use-moonshine")]
+    fn flush<F>(&mut self, callback: &F) -> Result<()>
+    where
+        F: Fn(Transcription),
+    {
+        info!("Flush called");
+
+        // Flush debug WAV writer so the file is readable
+        if let Some(writer) = self.debug_wav_writer.as_mut() {
+            let _ = writer.flush();
+        }
+
+        let transcriber = match self.transcriber.as_mut() {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+
+        match transcriber.flush() {
+            Ok(Some(evt)) => {
+                info!("Flush transcription: \"{}\" ({:.2}s-{:.2}s)",
+                      evt.text, evt.start_time, evt.end_time);
+                callback(Transcription {
+                    text: evt.text.clone(),
+                    raw_text: evt.text,
+                    start_time: evt.start_time,
+                    end_time: evt.end_time,
+                    is_partial: evt.is_partial,
+                    segment_index: evt.segment_index,
+                    stable_text: evt.stable_text,
+                });
+            }
+            Ok(None) => {
+                info!("Flush: no remaining segment to transcribe");
+            }
+            Err(e) => {
+                warn!("Flush error: {}", e);
+            }
+        }
+
+        Ok(())
+    }
+
+    // ---- Parakeet TDT path: manual VAD + segment management ----
+
+    #[cfg(not(feature = "use-moonshine"))]
     fn process_samples<F>(&mut self, samples: &[f32], _callback: &F) -> Result<()>
     where
         F: Fn(Transcription),
@@ -363,110 +432,54 @@ impl SpeechInner {
             Some(stream) => stream,
             None => {
                 warn!("VAD not available");
-                return Ok(()); // Fail silently if VAD not available
+                return Ok(());
             }
         };
 
-        // Push samples to VAD stream - it will process them in chunks and return probabilities
         let speech_probs = vad_stream.push(samples)
             .map_err(|e| napi::Error::from_reason(format!("VAD error: {}", e)))?;
 
-        // VAD processes in 512-sample chunks (32ms at 16kHz), so we must align with that
-        // Previously this was 160 samples (10ms), but that didn't match VAD's chunk size
-        const CHUNK_SIZE: usize = 512;  // Must match VAD chunk size!
+        const CHUNK_SIZE: usize = 512;
         let mut offset = 0;
         let mut prob_idx = 0;
-
-        // Track speech detection stats for this batch
-        let mut speech_chunks = 0;
-        let mut total_chunks = 0;
 
         while offset + CHUNK_SIZE <= samples.len() && prob_idx < speech_probs.len() {
             let chunk = &samples[offset..offset + CHUNK_SIZE];
             let speech_prob = speech_probs[prob_idx];
             let is_speech = speech_prob >= self.speech_threshold;
 
-            total_chunks += 1;
             if is_speech {
-                speech_chunks += 1;
-            }
-
-            // Update pre-buffer
-            self.pre_buffer.extend(chunk.iter().copied());
-            if self.pre_buffer.len() > 16000 {  // Keep 1s
-                self.pre_buffer.drain(0..(self.pre_buffer.len() - 16000));
-            }
-
-            if is_speech {
-                // Start new segment if needed
                 if self.current_segment.is_empty() {
                     self.segment_index += 1;
                     self.last_partial_text.clear();
-                    // Add pre-buffer to catch start of speech
                     self.current_segment.extend(self.pre_buffer.iter().copied());
-                    // Use saturating_sub to prevent underflow
                     let start_sample = self.total_samples_processed.saturating_sub(self.pre_buffer.len());
                     self.current_segment_start = Some(start_sample as f64 / 16000.0);
                     info!("Speech started at {:.2}s (segment {})", self.current_segment_start.unwrap(), self.segment_index);
                 }
 
-                // Add current chunk
                 self.current_segment.extend_from_slice(chunk);
                 self.silence_frames = 0;
-
-                // Streaming: try partial transcription (Moonshine only)
-                #[cfg(feature = "use-moonshine")]
-                if let (Some(model), Some(stream)) = (&self.moonshine_model, &mut self.moonshine_stream) {
-                    let start_time = self.current_segment_start.unwrap_or(0.0);
-                    match model.stream_try_update(stream, &self.current_segment, &self.device) {
-                        Ok(Some(text)) => {
-                            let trimmed = text.trim();
-                            if !trimmed.is_empty() {
-                                let stable_text = longest_common_prefix(&self.last_partial_text, trimmed).to_string();
-                                self.last_partial_text = trimmed.to_string();
-                                info!("Streaming partial: \"{}\" (stable: \"{}\")", trimmed, stable_text);
-                                _callback(Transcription {
-                                    text: trimmed.to_string(),
-                                    raw_text: trimmed.to_string(),
-                                    start_time,
-                                    end_time: start_time + (self.current_segment.len() as f64 / 16000.0),
-                                    is_partial: true,
-                                    segment_index: self.segment_index,
-                                    stable_text,
-                                });
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            warn!("Streaming partial transcription error: {}", e);
-                        }
-                    }
-                }
             } else if !self.current_segment.is_empty() {
-                // In silence but have active segment
                 self.current_segment.extend_from_slice(chunk);
                 self.silence_frames += 1;
 
-                // Automatic pause-based transcription (only with "auto-transcribe-on-pause" feature)
-                // When disabled: segment accumulates until explicit flush() call
-                // When enabled: segment auto-transcribes after period_pause_frames of silence
                 #[cfg(feature = "auto-transcribe-on-pause")]
                 if self.silence_frames >= self.period_pause_frames {
-                    info!("Segment ended at {:.2}s after {} frames of silence",
-                          self.total_samples_processed as f64 / 16000.0, self.silence_frames);
-
                     if let Some(transcription) = self.transcribe_segment()? {
-                        info!("Transcription: \"{}\" ({:.2}s-{:.2}s)",
-                              transcription.text, transcription.start_time, transcription.end_time);
                         _callback(transcription);
                     }
-
-                    // Reset for next segment
                     self.current_segment.clear();
                     self.current_segment_start = None;
                     self.silence_frames = 0;
                     self.last_partial_text.clear();
-                    info!("Ready for next segment");
+                }
+            }
+
+            if !is_speech && self.current_segment.is_empty() {
+                self.pre_buffer.extend(chunk.iter().copied());
+                if self.pre_buffer.len() > 8000 {
+                    self.pre_buffer.drain(0..(self.pre_buffer.len() - 8000));
                 }
             }
 
@@ -476,11 +489,6 @@ impl SpeechInner {
             prob_idx += 1;
         }
 
-        // Log batch summary
-        info!("Batch processed: {} chunks ({} speech, {} silence), total time: {:.1}s",
-              total_chunks, speech_chunks, total_chunks - speech_chunks,
-              self.total_samples_processed as f64 / 16000.0);
-
         Ok(())
     }
 
@@ -488,30 +496,21 @@ impl SpeechInner {
     fn transcribe_segment(&mut self) -> Result<Option<Transcription>> {
         use candle_core::DType;
 
-        // Check if TDT model is available
         let tdt_model = match self.tdt_model.as_ref() {
             Some(model) => model,
             None => return Ok(None),
         };
 
-        let segment_duration_ms = self.current_segment.len() as f64 / 16.0;
-
-        if self.current_segment.len() < 4000 {  // Skip very short segments (< 250ms)
-            info!("Skipping short segment: {:.0}ms ({} samples)", segment_duration_ms, self.current_segment.len());
+        if self.current_segment.len() < 4000 {
             return Ok(None);
         }
 
         let start_time = self.current_segment_start.unwrap_or(0.0);
         let end_time = start_time + (self.current_segment.len() as f64 / 16000.0);
 
-        info!("Transcribing segment: {:.2}s-{:.2}s ({:.1}s, {} samples)",
-              start_time, end_time, end_time - start_time, self.current_segment.len());
-
-        // Extract features
         let features = self.feat_extractor.extract_to_tensor(&self.current_segment, &self.device)
             .map_err(|e| napi::Error::from_reason(format!("Feature extraction error: {}", e)))?;
 
-        // Convert to BF16 if on GPU
         let features = if !self.device.is_cpu() {
             features.to_dtype(DType::BF16)
                 .map_err(|e| napi::Error::from_reason(format!("DType conversion error: {}", e)))?
@@ -519,11 +518,9 @@ impl SpeechInner {
             features
         };
 
-        // Run encoder
         let encoder_out = tdt_model.encoder.forward(&features, false)
             .map_err(|e| napi::Error::from_reason(format!("Encoder error: {}", e)))?;
 
-        // Run TDT beam decode with beam_size=2 for quality
         let tokens = tdt_model.beam_decode(&encoder_out, 2)
             .map_err(|e| napi::Error::from_reason(format!("TDT decode error: {}", e)))?;
 
@@ -531,7 +528,6 @@ impl SpeechInner {
             return Ok(None);
         }
 
-        // Decode tokens to text
         let text = tdt_model.decode_tokens(&tokens)
             .map_err(|e| napi::Error::from_reason(format!("Token decode error: {}", e)))?;
 
@@ -551,97 +547,33 @@ impl SpeechInner {
         }))
     }
 
-    #[cfg(feature = "use-moonshine")]
-    fn transcribe_segment(&mut self) -> Result<Option<Transcription>> {
-        // Check if Moonshine model is available
-        let model = match self.moonshine_model.as_ref() {
-            Some(model) => model,
-            None => return Ok(None),
-        };
-
-        let segment_duration_ms = self.current_segment.len() as f64 / 16.0;
-
-        if self.current_segment.len() < 4000 {  // Skip very short segments (< 250ms)
-            info!("Skipping short segment: {:.0}ms ({} samples)", segment_duration_ms, self.current_segment.len());
-            return Ok(None);
-        }
-
-        let start_time = self.current_segment_start.unwrap_or(0.0);
-        let end_time = start_time + (self.current_segment.len() as f64 / 16000.0);
-
-        info!("Transcribing segment: {:.2}s-{:.2}s ({:.1}s, {} samples)",
-              start_time, end_time, end_time - start_time, self.current_segment.len());
-
-        // Use stream_finalize if streaming state exists, otherwise fall back to transcribe
-        let text = if let Some(stream) = self.moonshine_stream.as_mut() {
-            model.stream_finalize(stream, &self.current_segment, &self.device)
-                .map_err(|e| napi::Error::from_reason(format!("Moonshine transcription error: {}", e)))?
-        } else {
-            model.transcribe(&self.current_segment, &self.device)
-                .map_err(|e| napi::Error::from_reason(format!("Moonshine transcription error: {}", e)))?
-        };
-
-        if text.trim().is_empty() {
-            return Ok(None);
-        }
-
-        let text = text.trim().to_string();
-        Ok(Some(Transcription {
-            stable_text: text.clone(),
-            text: text.clone(),
-            raw_text: text,
-            start_time,
-            end_time,
-            is_partial: false,
-            segment_index: self.segment_index,
-        }))
-    }
-
+    #[cfg(not(feature = "use-moonshine"))]
     fn flush<F>(&mut self, callback: &F) -> Result<()>
     where
         F: Fn(Transcription),
     {
-        info!("Flush called: current_segment has {} samples, total processed: {:.2}s",
-              self.current_segment.len(), self.total_samples_processed as f64 / 16000.0);
+        info!("Flush called: current_segment has {} samples", self.current_segment.len());
 
-        // Transcribe any remaining segment
         if !self.current_segment.is_empty() {
             if let Some(transcription) = self.transcribe_segment()? {
-                info!("Flush transcription: \"{}\" ({:.2}s-{:.2}s)",
-                      transcription.text, transcription.start_time, transcription.end_time);
                 callback(transcription);
             }
-        } else {
-            info!("Flush: no remaining segment to transcribe");
         }
 
-        // Flush debug WAV writer so the file is readable
+        // Flush debug WAV writer
         if let Some(writer) = self.debug_wav_writer.as_mut() {
             let _ = writer.flush();
         }
 
-        // Clear all state buffers to prevent audio bleed between utterances
         self.current_segment.clear();
         self.current_segment_start = None;
-        self.pre_buffer.clear();  // Critical: prevents previous utterance from bleeding into next
+        self.pre_buffer.clear();
         self.silence_frames = 0;
         self.was_speech_last_frame = false;
         self.last_partial_text.clear();
 
-        // Reset Moonshine streaming state
-        #[cfg(feature = "use-moonshine")]
-        if let Some(stream) = self.moonshine_stream.as_mut() {
-            stream.reset();
-            info!("Moonshine stream state reset");
-        }
-
-        // Reset VAD stream LSTM states to prevent context bleeding
         if let Some(vad_stream) = self.vad_stream.as_mut() {
-            if let Err(e) = vad_stream.reset() {
-                warn!("Failed to reset VAD stream: {}", e);
-            } else {
-                info!("VAD stream reset successfully");
-            }
+            let _ = vad_stream.reset();
         }
 
         Ok(())
@@ -740,7 +672,7 @@ impl Speech {
         #[cfg(feature = "use-moonshine")]
         let model = {
             info!("Loading Moonshine V2 model (quantized GGUF, mmap)...");
-            match moonshine::MoonshineModel::load_from_gguf_mmap(&assets, &device) {
+            match crate::moonshine::MoonshineModel::load_from_gguf_mmap(&assets, &device) {
                 Ok(model) => {
                     info!("Moonshine V2 model loaded");
                     Some(model)
