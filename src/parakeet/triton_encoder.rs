@@ -290,47 +290,50 @@ impl TritonParakeetEncoder {
         let scale = 1.0 / (hd as f64).sqrt();
 
         let context = if let Some(fa2_pipe) = &self.kernels.rel_pos_fa2 {
-            // ── Fused FA2 path: precompute rel_bias, then fused kernel ──
+            // ── Fused FA2 path: precompute rel_bias in F16, then fused kernel ──
 
-            // Reshape to [1, H, T, Dh] for bias computation (still needed for rel_bias)
-            let q_4d = q.reshape((1, padded_t, nh, hd))?.transpose(1, 2)?.contiguous()?;
-            let k_rel_4d = k_rel.reshape((1, pos_len, nh, hd))?.transpose(1, 2)?.contiguous()?;
+            // Reshape Q to per-head [nh, T, hd] in F16 — shared by Q_u and Q_v
+            let q_heads_f16 = q.reshape((padded_t, nh, hd))?
+                .transpose(0, 1)?.to_dtype(DType::F16)?.contiguous()?;
 
-            // Compute relative position bias in F32:
-            // rel_bias[h, i, j] = (Q[h,i,:] + bias_v[h,:]) · K_rel[h, T-1-i+j, :] * scale
-            // = rel_shift((Q+bias_v) @ K_rel^T)[h, :, :T] * scale
-            let bv = block.attn.bias_v.unsqueeze(0)?.unsqueeze(2)?;
-            let q_bias_v = q_4d.broadcast_add(&bv)?;
-            let mut attn_scores_r = q_bias_v.matmul(
-                &k_rel_4d.transpose(D::Minus2, D::Minus1)?.contiguous()?
-            )?;
-            attn_scores_r = Self::rel_shift(&attn_scores_r)?;
-            let last = attn_scores_r.dims4()?.3;
-            let take = last.min(padded_t);
-            attn_scores_r = attn_scores_r.narrow(D::Minus1, 0, take)?;
+            // Compute relative position bias via 3D batched matmul (all in F16)
+            let bv_f16 = block.attn.bias_v.to_dtype(DType::F16)?.unsqueeze(1)?;
+            let q_v = q_heads_f16.broadcast_add(&bv_f16)?; // [nh, T, hd] F16
+            let k_rel_f16 = k_rel.reshape((pos_len, nh, hd))?
+                .transpose(0, 1)?.to_dtype(DType::F16)?.contiguous()?;
+            let mut attn_scores_r = q_v.matmul(
+                &k_rel_f16.transpose(1, 2)?
+            )?; // [nh, T, 2T-1] F16
 
-            // Scale the relative bias
+            // rel_shift (3D version) — views only except the cat with zeros
+            let (rh, rt, rp) = attn_scores_r.dims3()?;
+            let zeros = Tensor::zeros((rh, rt, 1), DType::F16, attn_scores_r.device())?;
+            attn_scores_r = Tensor::cat(&[zeros, attn_scores_r], 2)?;
+            attn_scores_r = attn_scores_r.reshape((rh, rp + 1, rt))?;
+            attn_scores_r = attn_scores_r.narrow(1, 1, rp)?;
+            attn_scores_r = attn_scores_r.reshape((rh, rt, rp))?;
+            let take = rp.min(padded_t);
+            let rel_bias = attn_scores_r.narrow(2, 0, take)?.contiguous()?;
+            // rel_bias: [nh, T, T] F16 contiguous (unscaled)
+
+            // Kernel applies (QK + bias) * scale internally
             let scale_f = scale as f32;
-            let rel_bias = (attn_scores_r * scale)?.to_dtype(DType::F32)?;
-            // rel_bias: [1, nh, padded_t, padded_t] in F32
 
-            // Add bias_u to Q for the content scores
-            let bu = block.attn.bias_u.unsqueeze(0)?.unsqueeze(2)?;
-            let q_u_4d = q_4d.broadcast_add(&bu)?;
+            // Q + bias_u for content scores (already F16)
+            let bu_f16 = block.attn.bias_u.to_dtype(DType::F16)?.unsqueeze(1)?;
+            let q_u_f16 = q_heads_f16.broadcast_add(&bu_f16)?.contiguous()?;
 
-            // Reshape Q_u, K, V to contiguous [nh, padded_t, hd] for multi-head kernel
-            let q_u_f16 = q_u_4d.reshape((nh, padded_t, hd))?.to_dtype(DType::F16)?.contiguous()?;
-            let k_4d = k.reshape((1, padded_t, nh, hd))?.transpose(1, 2)?.contiguous()?;
-            let k_f16 = k_4d.reshape((nh, padded_t, hd))?.to_dtype(DType::F16)?.contiguous()?;
-            let v_4d = v.reshape((1, padded_t, nh, hd))?.transpose(1, 2)?.contiguous()?;
-            let v_f16 = v_4d.reshape((nh, padded_t, hd))?.to_dtype(DType::F16)?.contiguous()?;
-            let rel_bias_3d = rel_bias.reshape((nh, padded_t, padded_t))?.contiguous()?;
+            // K, V directly to [nh, T, hd] F16 (one copy each)
+            let k_f16 = k.reshape((padded_t, nh, hd))?
+                .transpose(0, 1)?.to_dtype(DType::F16)?.contiguous()?;
+            let v_f16 = v.reshape((padded_t, nh, hd))?
+                .transpose(0, 1)?.to_dtype(DType::F16)?.contiguous()?;
 
             // Single multi-head dispatch
             let out_f16 = empty_f16(&self.metal_device, (nh, padded_t, hd))?;
             triton_rel_pos_fa2(
                 &self.metal_device, fa2_pipe,
-                &q_u_f16, &k_f16, &v_f16, &rel_bias_3d, &out_f16,
+                &q_u_f16, &k_f16, &v_f16, &rel_bias, &out_f16,
                 nh, padded_t, hd, scale_f,
             )?;
 

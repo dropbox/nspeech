@@ -392,11 +392,11 @@ pub fn empty_f32(device: &MetalDevice, shape: impl Into<Shape>) -> Result<Tensor
 ///
 /// Q: [nh, seq_len, d] F16 (Q + bias_u already added)
 /// K, V: [nh, seq_len, d] F16
-/// bias: [nh, seq_len, seq_len] F32 (precomputed relative position bias, already scaled)
+/// bias: [nh, seq_len, seq_len] F16 (unscaled relative position bias)
 /// O: [nh, seq_len, d] F16 output
 ///
-/// This kernel fuses QK^T·scale + bias, online softmax, and attn·V
-/// in a single pass. Multi-head via program_id.y.
+/// Kernel computes (QK^T + bias) * scale, then online softmax and attn·V.
+/// Multi-head via program_id.y.
 pub fn triton_rel_pos_fa2(
     device: &MetalDevice,
     pipeline: &ComputePipeline,
