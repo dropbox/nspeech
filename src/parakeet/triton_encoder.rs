@@ -10,7 +10,7 @@ use candle_nn::{
     Conv1d, Conv1dConfig, LayerNorm, LayerNormConfig, VarBuilder,
 };
 
-use crate::triton_kernels::{TritonKernels, triton_matmul};
+use crate::triton_kernels::{TritonKernels, triton_matmul, triton_rel_pos_fa2, empty_f16};
 use super::fast_conformer::{ConvSubsampling, FastConformerConfig, relative_positional_encoding};
 
 fn cdiv(a: usize, b: usize) -> usize {
@@ -287,39 +287,90 @@ impl TritonParakeetEncoder {
             k_rel
         };
 
-        // Reshape to [1, H, T, Dh] for attention
-        let q = q.reshape((1, padded_t, nh, hd))?.transpose(1, 2)?.contiguous()?;
-        let k = k.reshape((1, padded_t, nh, hd))?.transpose(1, 2)?.contiguous()?;
-        let v = v.reshape((1, padded_t, nh, hd))?.transpose(1, 2)?.contiguous()?;
-        let k_rel = k_rel.reshape((1, pos_len, nh, hd))?.transpose(1, 2)?.contiguous()?;
+        let scale = 1.0 / (hd as f64).sqrt();
 
-        // Attention with relative position bias (Candle, in model_dtype)
-        let bu = block.attn.bias_u.unsqueeze(0)?.unsqueeze(2)?;
-        let bv = block.attn.bias_v.unsqueeze(0)?.unsqueeze(2)?;
-        let q_bias_u = q.broadcast_add(&bu)?;
-        let q_bias_v = q.broadcast_add(&bv)?;
+        let context = if let Some(fa2_pipe) = &self.kernels.rel_pos_fa2 {
+            // ── Fused FA2 path: precompute rel_bias, then fused kernel ──
 
-        let attn_scores_c = q_bias_u.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
-        let mut attn_scores_r = q_bias_v.matmul(&k_rel.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
-        attn_scores_r = Self::rel_shift(&attn_scores_r)?;
-        let last = attn_scores_r.dims4()?.3;
-        let take = last.min(padded_t);
-        attn_scores_r = attn_scores_r.narrow(D::Minus1, 0, take)?;
+            // Reshape to [1, H, T, Dh] for bias computation (still needed for rel_bias)
+            let q_4d = q.reshape((1, padded_t, nh, hd))?.transpose(1, 2)?.contiguous()?;
+            let k_rel_4d = k_rel.reshape((1, pos_len, nh, hd))?.transpose(1, 2)?.contiguous()?;
 
-        let mut attn_scores = (attn_scores_c + attn_scores_r)?;
-        let scale = (hd as f64).sqrt() as f32;
-        let scale_t = Tensor::from_slice(&[scale], (), xs.device())?.to_dtype(self.model_dtype)?;
-        let scale_t = scale_t.broadcast_as(attn_scores.shape())?;
-        attn_scores = (attn_scores / scale_t)?;
+            // Compute relative position bias in F32:
+            // rel_bias[h, i, j] = (Q[h,i,:] + bias_v[h,:]) · K_rel[h, T-1-i+j, :] * scale
+            // = rel_shift((Q+bias_v) @ K_rel^T)[h, :, :T] * scale
+            let bv = block.attn.bias_v.unsqueeze(0)?.unsqueeze(2)?;
+            let q_bias_v = q_4d.broadcast_add(&bv)?;
+            let mut attn_scores_r = q_bias_v.matmul(
+                &k_rel_4d.transpose(D::Minus2, D::Minus1)?.contiguous()?
+            )?;
+            attn_scores_r = Self::rel_shift(&attn_scores_r)?;
+            let last = attn_scores_r.dims4()?.3;
+            let take = last.min(padded_t);
+            attn_scores_r = attn_scores_r.narrow(D::Minus1, 0, take)?;
 
-        // Softmax in F32 for numerical stability
-        let needs_upcast = self.model_dtype == DType::F16 || self.model_dtype == DType::BF16;
-        let attn_f32 = if needs_upcast { attn_scores.to_dtype(DType::F32)? } else { attn_scores };
-        let attn_weights = candle_nn::ops::softmax(&attn_f32, D::Minus1)?;
-        let attn_weights = if needs_upcast { attn_weights.to_dtype(self.model_dtype)? } else { attn_weights };
+            // Scale the relative bias
+            let scale_f = scale as f32;
+            let rel_bias = (attn_scores_r * scale)?.to_dtype(DType::F32)?;
+            // rel_bias: [1, nh, padded_t, padded_t] in F32
 
-        let context = attn_weights.matmul(&v)?;
-        let context = context.transpose(1, 2)?.reshape((padded_t, d))?;
+            // Add bias_u to Q for the content scores
+            let bu = block.attn.bias_u.unsqueeze(0)?.unsqueeze(2)?;
+            let q_u_4d = q_4d.broadcast_add(&bu)?;
+
+            // Reshape Q_u, K, V to contiguous [nh, padded_t, hd] for multi-head kernel
+            let q_u_f16 = q_u_4d.reshape((nh, padded_t, hd))?.to_dtype(DType::F16)?.contiguous()?;
+            let k_4d = k.reshape((1, padded_t, nh, hd))?.transpose(1, 2)?.contiguous()?;
+            let k_f16 = k_4d.reshape((nh, padded_t, hd))?.to_dtype(DType::F16)?.contiguous()?;
+            let v_4d = v.reshape((1, padded_t, nh, hd))?.transpose(1, 2)?.contiguous()?;
+            let v_f16 = v_4d.reshape((nh, padded_t, hd))?.to_dtype(DType::F16)?.contiguous()?;
+            let rel_bias_3d = rel_bias.reshape((nh, padded_t, padded_t))?.contiguous()?;
+
+            // Single multi-head dispatch
+            let out_f16 = empty_f16(&self.metal_device, (nh, padded_t, hd))?;
+            triton_rel_pos_fa2(
+                &self.metal_device, fa2_pipe,
+                &q_u_f16, &k_f16, &v_f16, &rel_bias_3d, &out_f16,
+                nh, padded_t, hd, scale_f,
+            )?;
+
+            // Reshape back: [nh, padded_t, hd] -> [padded_t, d]
+            let out_reshaped = out_f16.transpose(0, 1)?
+                .reshape((padded_t, d))?.contiguous()?;
+            out_reshaped.to_dtype(self.model_dtype)?
+        } else {
+            // ── Candle fallback path ──
+            let q = q.reshape((1, padded_t, nh, hd))?.transpose(1, 2)?.contiguous()?;
+            let k = k.reshape((1, padded_t, nh, hd))?.transpose(1, 2)?.contiguous()?;
+            let v = v.reshape((1, padded_t, nh, hd))?.transpose(1, 2)?.contiguous()?;
+            let k_rel = k_rel.reshape((1, pos_len, nh, hd))?.transpose(1, 2)?.contiguous()?;
+
+            let bu = block.attn.bias_u.unsqueeze(0)?.unsqueeze(2)?;
+            let bv = block.attn.bias_v.unsqueeze(0)?.unsqueeze(2)?;
+            let q_bias_u = q.broadcast_add(&bu)?;
+            let q_bias_v = q.broadcast_add(&bv)?;
+
+            let attn_scores_c = q_bias_u.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
+            let mut attn_scores_r = q_bias_v.matmul(&k_rel.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
+            attn_scores_r = Self::rel_shift(&attn_scores_r)?;
+            let last = attn_scores_r.dims4()?.3;
+            let take = last.min(padded_t);
+            attn_scores_r = attn_scores_r.narrow(D::Minus1, 0, take)?;
+
+            let mut attn_scores = (attn_scores_c + attn_scores_r)?;
+            let scale_f = scale as f32;
+            let scale_t = Tensor::from_slice(&[scale_f], (), xs.device())?.to_dtype(self.model_dtype)?;
+            let scale_t = scale_t.broadcast_as(attn_scores.shape())?;
+            attn_scores = (attn_scores / scale_t)?;
+
+            let needs_upcast = self.model_dtype == DType::F16 || self.model_dtype == DType::BF16;
+            let attn_f32 = if needs_upcast { attn_scores.to_dtype(DType::F32)? } else { attn_scores };
+            let attn_weights = candle_nn::ops::softmax(&attn_f32, D::Minus1)?;
+            let attn_weights = if needs_upcast { attn_weights.to_dtype(self.model_dtype)? } else { attn_weights };
+
+            let context = attn_weights.matmul(&v)?;
+            context.transpose(1, 2)?.reshape((padded_t, d))?
+        };
 
         // O projection via Triton
         let attn_out = self.triton_linear(&context, &block.attn.o_w, &block.attn.o_b, padded_t, d, d)?;

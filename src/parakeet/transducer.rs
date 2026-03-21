@@ -385,11 +385,18 @@ impl TransducerModel {
 
     /// Run encoder, dispatching to Triton when available.
     pub fn run_encoder(&self, features: &Tensor, train: bool) -> Result<Tensor> {
+        let t0 = std::time::Instant::now();
         #[cfg(feature = "triton-metal")]
-        if let Some(te) = &self.triton_encoder {
-            return te.forward(features);
+        if !std::env::var("NO_TRITON").is_ok() {
+            if let Some(te) = &self.triton_encoder {
+                let out = te.forward(features)?;
+                eprintln!("  Triton encoder: {} ms", t0.elapsed().as_millis());
+                return Ok(out);
+            }
         }
-        self.encoder.forward(features, train)
+        let out = self.encoder.forward(features, train)?;
+        eprintln!("  Candle encoder: {} ms", t0.elapsed().as_millis());
+        Ok(out)
     }
 
     /// Load tokenizer from directory

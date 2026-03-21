@@ -22,6 +22,7 @@ pub struct TritonKernels {
     pub layernorm_unit_offset: ComputePipeline,
     pub residual_add: ComputePipeline,
     pub flash_attention: ComputePipeline,
+    pub rel_pos_fa2: Option<ComputePipeline>,
 }
 
 impl TritonKernels {
@@ -52,6 +53,7 @@ impl TritonKernels {
             layernorm_unit_offset: load("layernorm_unit_offset_768", "layernorm_unit_offset")?,
             residual_add: load("residual_add_fp16", "residual_add")?,
             flash_attention: load("flash_attention_fwd_32x32x64", "flash_attention_fwd")?,
+            rel_pos_fa2: load("rel_pos_fa2_fwd_16x32x128", "rel_pos_fa2_fwd").ok(),
         })
     }
 }
@@ -368,6 +370,85 @@ pub fn triton_flash_attention(
         encoder.dispatch_thread_groups(grid, tg);
         Ok::<(), anyhow::Error>(())
     })?;
+
+    Ok(())
+}
+
+/// Create an empty F32 output tensor on the Metal device.
+pub fn empty_f32(device: &MetalDevice, shape: impl Into<Shape>) -> Result<Tensor> {
+    let shape: Shape = shape.into();
+    let n = shape.elem_count();
+    let buffer = device.new_buffer(n, DType::F32, "triton_f32_out")?;
+    let storage = MetalStorage::new(buffer, device.clone(), n, DType::F32);
+    Ok(Tensor::from_storage(
+        Storage::Metal(storage),
+        shape,
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
+}
+
+/// Dispatch multi-head Flash Attention 2 with precomputed relative position bias.
+///
+/// Q: [nh, seq_len, d] F16 (Q + bias_u already added)
+/// K, V: [nh, seq_len, d] F16
+/// bias: [nh, seq_len, seq_len] F32 (precomputed relative position bias, already scaled)
+/// O: [nh, seq_len, d] F16 output
+///
+/// This kernel fuses QK^T·scale + bias, online softmax, and attn·V
+/// in a single pass. Multi-head via program_id.y.
+pub fn triton_rel_pos_fa2(
+    device: &MetalDevice,
+    pipeline: &ComputePipeline,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    bias: &Tensor,
+    out: &Tensor,
+    n_heads: usize,
+    seq_len: usize,
+    head_dim: usize,
+    sm_scale: f32,
+) -> Result<()> {
+    let (sq, lq) = q.storage_and_layout();
+    let (sk, lk) = k.storage_and_layout();
+    let (sv, lv) = v.storage_and_layout();
+    let (sb, lb) = bias.storage_and_layout();
+    let (so, lo) = out.storage_and_layout();
+    let q_off = lq.start_offset() * q.dtype().size_in_bytes();
+    let k_off = lk.start_offset() * k.dtype().size_in_bytes();
+    let v_off = lv.start_offset() * v.dtype().size_in_bytes();
+    let b_off = lb.start_offset() * bias.dtype().size_in_bytes();
+    let o_off = lo.start_offset() * out.dtype().size_in_bytes();
+
+    let stride_h = (seq_len * head_dim) as i32;
+    let bias_stride_h = (seq_len * seq_len) as i32;
+
+    match (&*sq, &*sk, &*sv, &*sb, &*so) {
+        (Storage::Metal(mq), Storage::Metal(mk), Storage::Metal(mv), Storage::Metal(mb), Storage::Metal(mo)) => {
+            let encoder = device.command_encoder()?;
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(0, Some(mq.buffer()), q_off);
+            encoder.set_buffer(1, Some(mk.buffer()), k_off);
+            encoder.set_buffer(2, Some(mv.buffer()), v_off);
+            encoder.set_buffer(3, Some(mb.buffer()), b_off);
+            encoder.set_buffer(4, Some(mo.buffer()), o_off);
+            encoder.set_bytes(5, &(seq_len as i32));
+            encoder.set_bytes(6, &(head_dim as i32));
+            encoder.set_bytes(7, &sm_scale);
+            encoder.set_bytes(8, &stride_h);
+            encoder.set_bytes(9, &bias_stride_h);
+
+            let grid = MTLSize {
+                width: cdiv(seq_len, 16),  // BM=16
+                height: n_heads,
+                depth: 1,
+            };
+            let tg = MTLSize { width: 512, height: 1, depth: 1 };
+            encoder.dispatch_thread_groups(grid, tg);
+        }
+        _ => anyhow::bail!("All tensors must be on Metal device"),
+    }
 
     Ok(())
 }
