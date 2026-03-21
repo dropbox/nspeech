@@ -16,6 +16,8 @@ use tokenizers::{Tokenizer, models::unigram::Unigram};
 use log::{info, warn, debug};
 
 use super::fast_conformer::{FastConformerConfig, FastConformerEncoder, HfEncoderConfig};
+#[cfg(feature = "triton-metal")]
+use super::triton_encoder::TritonParakeetEncoder;
 use std::path::Path;
 use std::collections::HashMap;
 
@@ -335,6 +337,8 @@ impl JointNetwork {
 /// Full Transducer Model
 pub struct TransducerModel {
     pub encoder: FastConformerEncoder,
+    #[cfg(feature = "triton-metal")]
+    triton_encoder: Option<TritonParakeetEncoder>,
     pub predictor: PredictionNetwork,
     pub joint: JointNetwork,
     pub config: TransducerConfig,
@@ -370,11 +374,22 @@ impl TransducerModel {
 
         Ok(Self {
             encoder,
+            #[cfg(feature = "triton-metal")]
+            triton_encoder: None,
             predictor,
             joint,
             config: tdt_config,
             tokenizer: None,
         })
+    }
+
+    /// Run encoder, dispatching to Triton when available.
+    pub fn run_encoder(&self, features: &Tensor, train: bool) -> Result<Tensor> {
+        #[cfg(feature = "triton-metal")]
+        if let Some(te) = &self.triton_encoder {
+            return te.forward(features);
+        }
+        self.encoder.forward(features, train)
     }
 
     /// Load tokenizer from directory
@@ -1670,6 +1685,26 @@ pub fn load_parakeet_tdt_from_gguf_local<P: AsRef<Path>>(
     info!("  Building encoder...");
     let encoder = FastConformerEncoder::new(encoder_cfg.clone(), vb.pp("encoder"))?;
 
+    // Build Triton encoder (optional, Metal only)
+    #[cfg(feature = "triton-metal")]
+    let triton_encoder = {
+        if let Device::Metal(_md) = device {
+            let kernel_dir = crate::triton_kernels::default_kernel_dir();
+            match TritonParakeetEncoder::new(encoder_cfg.clone(), vb.pp("encoder"), &kernel_dir) {
+                Ok(te) => {
+                    info!("  Triton encoder loaded ({})", kernel_dir.display());
+                    Some(te)
+                }
+                Err(e) => {
+                    info!("  Triton encoder unavailable: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
     // Build full transducer model
     info!("  Building transducer model...");
     let mut model = TransducerModel::new(
@@ -1678,6 +1713,11 @@ pub fn load_parakeet_tdt_from_gguf_local<P: AsRef<Path>>(
         encoder_cfg.d_model,
         vb,
     )?;
+
+    #[cfg(feature = "triton-metal")]
+    {
+        model.triton_encoder = triton_encoder;
+    }
 
     // Store tokenizer
     model.tokenizer = Some(tokenizer);
@@ -1966,6 +2006,26 @@ pub fn load_parakeet_tdt_from_gguf_mmap_local<P: AsRef<Path>>(
     info!("  Building encoder...");
     let encoder = FastConformerEncoder::new(encoder_cfg.clone(), vb.pp("encoder"))?;
 
+    // Build Triton encoder (optional, Metal only)
+    #[cfg(feature = "triton-metal")]
+    let triton_encoder = {
+        if let Device::Metal(_md) = device {
+            let kernel_dir = crate::triton_kernels::default_kernel_dir();
+            match TritonParakeetEncoder::new(encoder_cfg.clone(), vb.pp("encoder"), &kernel_dir) {
+                Ok(te) => {
+                    info!("  Triton encoder loaded ({})", kernel_dir.display());
+                    Some(te)
+                }
+                Err(e) => {
+                    info!("  Triton encoder unavailable: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
     // Build full transducer model
     info!("  Building transducer model...");
     let mut model = TransducerModel::new(
@@ -1974,6 +2034,11 @@ pub fn load_parakeet_tdt_from_gguf_mmap_local<P: AsRef<Path>>(
         encoder_cfg.d_model,
         vb,
     )?;
+
+    #[cfg(feature = "triton-metal")]
+    {
+        model.triton_encoder = triton_encoder;
+    }
 
     // Store tokenizer
     model.tokenizer = Some(tokenizer);

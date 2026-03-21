@@ -515,7 +515,7 @@ impl SpeechInner {
             features
         };
 
-        let encoder_out = tdt_model.encoder.forward(&features, false)
+        let encoder_out = tdt_model.run_encoder(&features, false)
             .map_err(|e| napi::Error::from_reason(format!("Encoder error: {}", e)))?;
 
         let tokens = tdt_model.beam_decode(&encoder_out, 2)

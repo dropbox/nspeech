@@ -66,7 +66,7 @@ impl Default for FastConformerConfig {
     }
 }
 
-fn relative_positional_encoding(batch: usize, seq: usize, dim: usize, device: &Device, dtype: DType) -> Result<Tensor> {
+pub fn relative_positional_encoding(batch: usize, seq: usize, dim: usize, device: &Device, dtype: DType) -> Result<Tensor> {
     // Relative positional encoding needs 2*seq-1 positions for all relative distances
     // Positions range from -(seq-1) to +(seq-1), centered at 0
     // Python uses symmetric encoding: sin(abs(pos)) with sign flip for negative positions

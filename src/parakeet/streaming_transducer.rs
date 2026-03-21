@@ -203,7 +203,7 @@ impl StreamingTransducer {
         assert_eq!(batch_size, 1, "Streaming only supports batch_size=1");
 
         // Run encoder on features (process full overlapping chunk for context)
-        let encoder_out = self.model.encoder.forward(features, false)?;
+        let encoder_out = self.model.run_encoder(features, false)?;
         let (_, enc_frames, _) = encoder_out.dims3()?;
 
         // Calculate overlap in encoder frames

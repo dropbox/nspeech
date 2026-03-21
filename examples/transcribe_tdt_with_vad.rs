@@ -338,7 +338,7 @@ fn transcribe_segment(
     };
 
     // Run encoder
-    let encoder_out = model.encoder.forward(&features, false)?;
+    let encoder_out = model.run_encoder(&features, false)?;
 
     // Beam decode with beam_size=2 (same as transcribe_tdt.rs)
     let tokens = model.beam_decode(&encoder_out, 2)?;

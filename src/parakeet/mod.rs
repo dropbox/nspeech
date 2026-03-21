@@ -8,6 +8,8 @@ pub mod features;
 pub mod transducer;
 pub mod streaming_transducer;
 pub mod streaming_encoder;
+#[cfg(feature = "triton-metal")]
+pub mod triton_encoder;
 
 // Re-export commonly used types and functions
 pub use fast_conformer::{
