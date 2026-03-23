@@ -14,6 +14,12 @@ fn cdiv(a: usize, b: usize) -> usize {
     (a + b - 1) / b
 }
 
+/// Clamp threadgroup size to pipeline's maximum (critical for Intel GPUs with < 1024 limit).
+fn tg_size(pipeline: &ComputePipeline, requested: usize) -> MTLSize {
+    let max = pipeline.max_total_threads_per_threadgroup();
+    MTLSize { width: requested.min(max), height: 1, depth: 1 }
+}
+
 /// All compiled Triton kernel pipelines for the Moonshine encoder.
 pub struct TritonKernels {
     pub matmul_64x64: ComputePipeline,
@@ -32,6 +38,7 @@ impl TritonKernels {
 
         let load = |name: &str, func_name: &str| -> Result<ComputePipeline> {
             let path = kernel_dir.join(format!("{name}.metal"));
+            eprint!("    {name}...");
             let source = std::fs::read_to_string(&path)
                 .map_err(|e| anyhow::anyhow!("Failed to read {}: {e}", path.display()))?;
             let lib = device
@@ -43,6 +50,7 @@ impl TritonKernels {
             let pipeline = device
                 .new_compute_pipeline_state_with_function(&func)
                 .map_err(|e| anyhow::anyhow!("Pipeline failed for {name}: {e}"))?;
+            eprintln!(" ok (max_threads={})", pipeline.max_total_threads_per_threadgroup());
             Ok(pipeline)
         };
 
@@ -156,8 +164,7 @@ pub fn triton_matmul(
             height: cdiv(n, 64) as usize,
             depth: 1,
         };
-        let tg = MTLSize { width: 1024, height: 1, depth: 1 };
-        encoder.dispatch_thread_groups(grid, tg);
+        encoder.dispatch_thread_groups(grid, tg_size(pipeline, 1024));
         Ok::<(), anyhow::Error>(())
     })?;
 
@@ -204,8 +211,7 @@ pub fn triton_matmul_bias(
             height: cdiv(n, block_n),
             depth: 1,
         };
-        let tg = MTLSize { width: 1024, height: 1, depth: 1 };
-        encoder.dispatch_thread_groups(grid, tg);
+        encoder.dispatch_thread_groups(grid, tg_size(pipeline, 1024));
         Ok::<(), anyhow::Error>(())
     })?;
 
@@ -252,8 +258,7 @@ pub fn triton_matmul_bias_gelu(
             height: cdiv(n, block_n),
             depth: 1,
         };
-        let tg = MTLSize { width: 1024, height: 1, depth: 1 };
-        encoder.dispatch_thread_groups(grid, tg);
+        encoder.dispatch_thread_groups(grid, tg_size(pipeline, 1024));
         Ok::<(), anyhow::Error>(())
     })?;
 
@@ -283,8 +288,7 @@ pub fn triton_layernorm_unit_offset(
         encoder.set_bytes(6, &(n_cols as i32));
 
         let grid = MTLSize { width: n_rows as usize, height: 1, depth: 1 };
-        let tg = MTLSize { width: 1024, height: 1, depth: 1 };
-        encoder.dispatch_thread_groups(grid, tg);
+        encoder.dispatch_thread_groups(grid, tg_size(pipeline, 1024));
         Ok::<(), anyhow::Error>(())
     })?;
 
@@ -309,9 +313,9 @@ pub fn triton_residual_add(
         encoder.set_buffer(2, Some(o_buf), o_off);
         encoder.set_bytes(3, &(n_elements as i32));
 
-        let grid = MTLSize { width: cdiv(n_elements, 1024) as usize, height: 1, depth: 1 };
-        let tg = MTLSize { width: 1024, height: 1, depth: 1 };
-        encoder.dispatch_thread_groups(grid, tg);
+        let tg_w = tg_size(pipeline, 1024).width;
+        let grid = MTLSize { width: cdiv(n_elements, tg_w) as usize, height: 1, depth: 1 };
+        encoder.dispatch_thread_groups(grid, MTLSize { width: tg_w, height: 1, depth: 1 });
         Ok::<(), anyhow::Error>(())
     })?;
 
@@ -366,8 +370,7 @@ pub fn triton_flash_attention(
             height: n_heads,
             depth: 1,
         };
-        let tg = MTLSize { width: 832, height: 1, depth: 1 };
-        encoder.dispatch_thread_groups(grid, tg);
+        encoder.dispatch_thread_groups(grid, tg_size(pipeline, 832));
         Ok::<(), anyhow::Error>(())
     })?;
 
@@ -444,8 +447,7 @@ pub fn triton_rel_pos_fa2(
                 height: n_heads,
                 depth: 1,
             };
-            let tg = MTLSize { width: 512, height: 1, depth: 1 };
-            encoder.dispatch_thread_groups(grid, tg);
+            encoder.dispatch_thread_groups(grid, tg_size(pipeline, 512));
         }
         _ => anyhow::bail!("All tensors must be on Metal device"),
     }
@@ -454,13 +456,20 @@ pub fn triton_rel_pos_fa2(
 }
 
 /// Default kernel directory.
+/// On x86_64 (Intel Mac), uses moonshine_metal_intel (scalar codegen, no simdgroup_matrix).
+/// On aarch64 (Apple Silicon), uses moonshine_metal (simdgroup_matrix optimized).
 pub fn default_kernel_dir() -> PathBuf {
+    let subdir = if cfg!(target_arch = "x86_64") {
+        "moonshine_metal_intel"
+    } else {
+        "moonshine_metal"
+    };
     let triton_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
-        .join("triton/third_party/metal/moonshine_metal");
+        .join(format!("triton/third_party/metal/{subdir}"));
     if triton_dir.exists() {
         return triton_dir;
     }
-    PathBuf::from("moonshine_metal")
+    PathBuf::from(subdir)
 }

@@ -1,11 +1,11 @@
 //! Moonshine V2 Encoder using Triton-compiled Metal kernels.
 //!
-//! All operations use pre-compiled Triton kernels dispatched directly via Metal:
-//! linear projections (matmul), layernorm, residual add, and Flash Attention 2
-//! (fused QK^T + softmax + sliding window mask + attn*V in a single kernel).
+//! Matmul and Flash Attention run on Metal GPU via Triton kernels.
+//! All other ops (layernorm, GELU, residual add, bias) run on CPU for correctness
+//! on Intel GPUs where candle's Metal backend has limited op support.
 //!
 //! Weights are stored as F16 tensors on the Metal device (dequantized from GGUF
-//! at load time).
+//! at load time). Activations shuttle between CPU (F32) and Metal (F16).
 
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
@@ -19,54 +19,54 @@ fn cdiv(a: usize, b: usize) -> usize {
     (a + b - 1) / b
 }
 
-/// Unit-offset layernorm in F32: LN(x) * (gamma + 1.0)
-/// x: [rows, cols] F32, gamma: [cols] F16 → output [rows, cols] F32
+/// Unit-offset layernorm in F32 on CPU: LN(x) * (gamma + 1.0)
 fn unit_offset_layernorm(x: &Tensor, gamma: &Tensor) -> Result<Tensor> {
     let eps = 1e-5f64;
+    let gamma_f32 = gamma.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
     let mean = x.mean_keepdim(1)?;
     let x_centered = x.broadcast_sub(&mean)?;
     let var = (&x_centered * &x_centered)?.mean_keepdim(1)?;
     let inv_std = (var + eps)?.sqrt()?.recip()?;
     let normed = x_centered.broadcast_mul(&inv_std)?;
-    let scale = (gamma.to_dtype(DType::F32)? + 1.0f64)?;
+    let scale = (gamma_f32 + 1.0f64)?;
     Ok(normed.broadcast_mul(&scale)?)
 }
 
 type QVarBuilder = candle_transformers::quantized_var_builder::VarBuilder;
 
-/// Load weight from GGUF, dequantize to F16 on the Metal device.
-/// Returns weight transposed to [in_dim, out_dim] for Triton matmul kernels
-/// which require B in [K, N] row-major layout (N contiguous for vec4 loads).
-fn load_f16_weight(shape: (usize, usize), vb: &QVarBuilder) -> Result<Tensor> {
+/// Load weight from GGUF, dequantize to F16 on Metal.
+fn load_f16_weight(shape: (usize, usize), vb: &QVarBuilder, metal: &Device) -> Result<Tensor> {
     let qt = vb.get(shape, "weight")?;
-    let t = qt.dequantize(vb.device())?;
-    Ok(t.to_dtype(DType::F16)?.t()?.contiguous()?)
+    let t = qt.dequantize(&Device::Cpu)?;
+    Ok(t.to_dtype(DType::F16)?.to_device(metal)?.t()?.contiguous()?)
 }
 
-/// Load 1D parameter (bias, gamma) from GGUF, dequantize to F16.
-fn load_f16_1d(dim: usize, name: &str, vb: &QVarBuilder) -> Result<Tensor> {
+/// Load 1D parameter from GGUF, keep on CPU as F32.
+fn load_f32_1d(dim: usize, name: &str, vb: &QVarBuilder) -> Result<Tensor> {
     let qt = vb.get(dim, name)?;
-    let t = qt.dequantize(vb.device())?;
-    Ok(t.to_dtype(DType::F16)?)
+    let t = qt.dequantize(&Device::Cpu)?;
+    Ok(t.to_dtype(DType::F32)?)
 }
 
-/// Unit-offset LayerNorm weights (gamma only, no bias).
+/// Load 1D parameter from GGUF, dequantize to F16 on Metal.
+fn load_f16_1d(dim: usize, name: &str, vb: &QVarBuilder, metal: &Device) -> Result<Tensor> {
+    let qt = vb.get(dim, name)?;
+    let t = qt.dequantize(&Device::Cpu)?;
+    Ok(t.to_dtype(DType::F16)?.to_device(metal)?)
+}
+
 struct LayerNormWeights {
-    gamma: Tensor, // [dim] F16
-    #[allow(dead_code)]
-    dim: usize,
+    gamma: Tensor, // [dim] F32 on CPU (for CPU layernorm)
 }
 
 impl LayerNormWeights {
     fn new(dim: usize, vb: &QVarBuilder) -> Result<Self> {
-        let gamma = load_f16_1d(dim, "gamma", vb)?;
-        Ok(Self { gamma, dim })
+        Ok(Self { gamma: load_f32_1d(dim, "gamma", vb)? })
     }
 }
 
-/// Linear projection weights (no bias).
 struct LinearWeights {
-    weight: Tensor, // [out_dim, in_dim] F16
+    weight: Tensor, // [in_dim, out_dim] F16 on Metal (transposed for Triton)
     #[allow(dead_code)]
     in_dim: usize,
     #[allow(dead_code)]
@@ -74,29 +74,33 @@ struct LinearWeights {
 }
 
 impl LinearWeights {
-    fn new(in_dim: usize, out_dim: usize, vb: &QVarBuilder) -> Result<Self> {
-        let weight = load_f16_weight((out_dim, in_dim), vb)?;
-        Ok(Self { weight, in_dim, out_dim })
+    fn new(in_dim: usize, out_dim: usize, vb: &QVarBuilder, metal: &Device) -> Result<Self> {
+        Ok(Self {
+            weight: load_f16_weight((out_dim, in_dim), vb, metal)?,
+            in_dim,
+            out_dim,
+        })
     }
 }
 
-/// Linear + bias weights.
 struct LinearBiasWeights {
-    weight: Tensor, // [out_dim, in_dim] F16
-    bias: Tensor,   // [out_dim] F16
+    weight: Tensor, // [in_dim, out_dim] F16 on Metal
+    bias: Tensor,   // [out_dim] F32 on CPU
     in_dim: usize,
     out_dim: usize,
 }
 
 impl LinearBiasWeights {
-    fn new(in_dim: usize, out_dim: usize, vb: &QVarBuilder) -> Result<Self> {
-        let weight = load_f16_weight((out_dim, in_dim), vb)?;
-        let bias = load_f16_1d(out_dim, "bias", vb)?;
-        Ok(Self { weight, bias, in_dim, out_dim })
+    fn new(in_dim: usize, out_dim: usize, vb: &QVarBuilder, metal: &Device) -> Result<Self> {
+        Ok(Self {
+            weight: load_f16_weight((out_dim, in_dim), vb, metal)?,
+            bias: load_f32_1d(out_dim, "bias", vb)?,
+            in_dim,
+            out_dim,
+        })
     }
 }
 
-/// Attention weights for one encoder layer.
 struct AttentionWeights {
     q_proj: LinearWeights,
     k_proj: LinearWeights,
@@ -108,13 +112,11 @@ struct AttentionWeights {
     scale: f64,
 }
 
-/// MLP weights for one encoder layer.
 struct MLPWeights {
     fc1: LinearBiasWeights,
     fc2: LinearBiasWeights,
 }
 
-/// One encoder layer's weights and config.
 struct EncoderLayerWeights {
     self_attn: AttentionWeights,
     mlp: MLPWeights,
@@ -123,32 +125,36 @@ struct EncoderLayerWeights {
 }
 
 /// Triton-accelerated Moonshine encoder.
+///
+/// Hybrid execution: matmul/FA2 on Metal GPU, everything else on CPU.
 pub struct TritonEncoder {
     kernels: TritonKernels,
     layers: Vec<EncoderLayerWeights>,
     final_norm: LayerNormWeights,
     sliding_windows: Vec<[usize; 2]>,
     metal_device: candle_core::MetalDevice,
+    metal_candle_device: Device,
     encoder_dim: usize,
 }
 
 impl TritonEncoder {
-    /// Load encoder weights from GGUF and compile Triton kernel pipelines.
     pub fn new(
         cfg: &MoonshineConfig,
         vb: QVarBuilder,
         kernel_dir: &std::path::Path,
     ) -> Result<Self> {
-        let device = vb.device();
-        let metal_device = match device {
+        let metal_candle_device = Device::new_metal(0)
+            .map_err(|e| anyhow::anyhow!("Metal device not available: {e}"))?;
+        let metal_device = match &metal_candle_device {
             Device::Metal(md) => md.clone(),
-            _ => anyhow::bail!("TritonEncoder requires Metal device"),
+            _ => unreachable!(),
         };
 
         println!("  Loading Triton kernel pipelines...");
         let kernels = TritonKernels::load(&metal_device, kernel_dir)?;
 
         let kv_dim = cfg.encoder_num_kv_heads * cfg.encoder_head_dim;
+        let metal = &metal_candle_device;
 
         let mut layers = Vec::with_capacity(cfg.encoder_num_layers);
         for i in 0..cfg.encoder_num_layers {
@@ -156,10 +162,10 @@ impl TritonEncoder {
             let avb = lvb.pp("self_attn");
 
             let self_attn = AttentionWeights {
-                q_proj: LinearWeights::new(cfg.encoder_dim, kv_dim, &avb.pp("q_proj"))?,
-                k_proj: LinearWeights::new(cfg.encoder_dim, kv_dim, &avb.pp("k_proj"))?,
-                v_proj: LinearWeights::new(cfg.encoder_dim, kv_dim, &avb.pp("v_proj"))?,
-                o_proj: LinearWeights::new(kv_dim, cfg.encoder_dim, &avb.pp("o_proj"))?,
+                q_proj: LinearWeights::new(cfg.encoder_dim, kv_dim, &avb.pp("q_proj"), metal)?,
+                k_proj: LinearWeights::new(cfg.encoder_dim, kv_dim, &avb.pp("k_proj"), metal)?,
+                v_proj: LinearWeights::new(cfg.encoder_dim, kv_dim, &avb.pp("v_proj"), metal)?,
+                o_proj: LinearWeights::new(kv_dim, cfg.encoder_dim, &avb.pp("o_proj"), metal)?,
                 num_heads: cfg.encoder_num_heads,
                 num_kv_heads: cfg.encoder_num_kv_heads,
                 head_dim: cfg.encoder_head_dim,
@@ -168,8 +174,8 @@ impl TritonEncoder {
 
             let mvb = lvb.pp("mlp");
             let mlp = MLPWeights {
-                fc1: LinearBiasWeights::new(cfg.encoder_dim, cfg.encoder_intermediate_size, &mvb.pp("fc1"))?,
-                fc2: LinearBiasWeights::new(cfg.encoder_intermediate_size, cfg.encoder_dim, &mvb.pp("fc2"))?,
+                fc1: LinearBiasWeights::new(cfg.encoder_dim, cfg.encoder_intermediate_size, &mvb.pp("fc1"), metal)?,
+                fc2: LinearBiasWeights::new(cfg.encoder_intermediate_size, cfg.encoder_dim, &mvb.pp("fc2"), metal)?,
             };
 
             layers.push(EncoderLayerWeights {
@@ -188,121 +194,101 @@ impl TritonEncoder {
             final_norm,
             sliding_windows: cfg.sliding_windows.clone(),
             metal_device,
+            metal_candle_device,
             encoder_dim: cfg.encoder_dim,
         })
     }
 
-    /// Run encoder forward pass.
-    ///
-    /// Input: `[1, seq_len, encoder_dim]` from frontend (any dtype).
-    /// Output: `[1, seq_len, encoder_dim]` F32 encoded features.
-    ///
-    /// Matmul and FA2 run in F16 via Triton kernels (compute-bound).
-    /// Residual stream, layernorm, bias, and GELU run in F32 via Candle (bandwidth-bound)
-    /// to maintain precision over 14 layers.
+    /// Triton matmul on Metal: CPU F32 input → Metal F16 → matmul → CPU F16 result.
+    fn gpu_matmul(&self, input_f32: &Tensor, weight: &Tensor, m: usize, n: usize, k: usize) -> Result<Tensor> {
+        let input_f16 = input_f32.to_dtype(DType::F16)?.to_device(&self.metal_candle_device)?;
+        let out_f16 = triton_matmul(
+            &self.metal_device, &self.kernels.matmul_64x64,
+            &input_f16, weight, m, n, k,
+        )?;
+        // Return F16 on CPU — caller converts to F32 as needed
+        Ok(out_f16.to_device(&Device::Cpu)?)
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (batch, seq_len, dim) = x.dims3()?;
         assert_eq!(batch, 1, "TritonEncoder only supports batch=1");
         assert_eq!(dim, self.encoder_dim);
 
-        let dev = &self.metal_device;
-
-        // Flatten to [seq_len, dim] for 2D matmul dispatch.
-        // Pad seq_len to multiple of 64 for largest tile size.
         let block_m = 64;
         let padded_seq = cdiv(seq_len, block_m) * block_m;
 
-        // Hidden state stays in F32 for precision; converted to F16 before each matmul.
-        let mut hidden = x.reshape((seq_len, dim))?.to_dtype(DType::F32)?;
+        // Everything on CPU in F32
+        let mut hidden = x.reshape((seq_len, dim))?.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
         if padded_seq > seq_len {
-            let pad = Tensor::zeros((padded_seq - seq_len, dim), DType::F32, x.device())?;
+            let pad = Tensor::zeros((padded_seq - seq_len, dim), DType::F32, &Device::Cpu)?;
             hidden = Tensor::cat(&[&hidden, &pad], 0)?;
         }
 
         for (i, layer) in self.layers.iter().enumerate() {
             let [left, right] = self.sliding_windows[i];
 
-            // ── Pre-norm (F32 via Candle) ──
+            // ── Pre-norm (CPU F32) ──
             let residual = hidden.clone();
             let normed = unit_offset_layernorm(&hidden, &layer.input_layernorm.gamma)?;
 
-            // ── Self-attention (Triton matmul for projections, Candle for attention) ──
+            // ── Q/K/V projections (GPU matmul) ──
             let kv_dim = layer.self_attn.num_kv_heads * layer.self_attn.head_dim;
             let nh = layer.self_attn.num_heads;
             let hd = layer.self_attn.head_dim;
-            let normed_f16 = normed.to_dtype(DType::F16)?;
 
-            let q = triton_matmul(
-                dev, &self.kernels.matmul_64x64,
-                &normed_f16, &layer.self_attn.q_proj.weight,
-                padded_seq, kv_dim, dim,
-            )?;
-            let k = triton_matmul(
-                dev, &self.kernels.matmul_64x64,
-                &normed_f16, &layer.self_attn.k_proj.weight,
-                padded_seq, kv_dim, dim,
-            )?;
-            let v = triton_matmul(
-                dev, &self.kernels.matmul_64x64,
-                &normed_f16, &layer.self_attn.v_proj.weight,
-                padded_seq, kv_dim, dim,
-            )?;
+            let q_f16 = self.gpu_matmul(&normed, &layer.self_attn.q_proj.weight, padded_seq, kv_dim, dim)?;
+            let k_f16 = self.gpu_matmul(&normed, &layer.self_attn.k_proj.weight, padded_seq, kv_dim, dim)?;
+            let v_f16 = self.gpu_matmul(&normed, &layer.self_attn.v_proj.weight, padded_seq, kv_dim, dim)?;
 
-            // FA2 kernel: fused QK^T + softmax + sliding window + attn*V
-            // Q, K, V are [padded_seq, kv_dim] F16 with interleaved heads
-            let attn_out = empty_f16(dev, (padded_seq, kv_dim))?;
+            // ── Flash Attention (GPU) ──
+            let q_metal = q_f16.to_device(&self.metal_candle_device)?;
+            let k_metal = k_f16.to_device(&self.metal_candle_device)?;
+            let v_metal = v_f16.to_device(&self.metal_candle_device)?;
+            let attn_out = empty_f16(&self.metal_device, (padded_seq, kv_dim))?;
             let sm_scale = layer.self_attn.scale as f32;
             triton_flash_attention(
-                dev, &self.kernels.flash_attention,
-                &q, &k, &v, &attn_out,
+                &self.metal_device, &self.kernels.flash_attention,
+                &q_metal, &k_metal, &v_metal, &attn_out,
                 nh, padded_seq, hd,
-                hd as i32,       // stride_h: head_dim
-                kv_dim as i32,   // stride_m: row stride
+                hd as i32,
+                kv_dim as i32,
                 sm_scale,
                 left as i32, right as i32,
             )?;
-            let attn_flat = attn_out;
+            let attn_cpu = attn_out.to_device(&Device::Cpu)?;
 
-            let attn_proj = triton_matmul(
-                dev, &self.kernels.matmul_64x64,
-                &attn_flat, &layer.self_attn.o_proj.weight,
+            // ── O projection (GPU matmul) ──
+            let attn_proj_f16 = self.gpu_matmul(
+                &attn_cpu.to_dtype(DType::F32)?,
+                &layer.self_attn.o_proj.weight,
                 padded_seq, dim, kv_dim,
             )?;
 
-            // ── Residual (F32) ──
-            hidden = (attn_proj.to_dtype(DType::F32)? + residual)?;
+            // ── Residual (CPU F32) ──
+            hidden = (attn_proj_f16.to_dtype(DType::F32)? + residual)?;
 
-            // ── Post-norm (F32 via Candle) ──
+            // ── Post-norm (CPU F32) ──
             let residual = hidden.clone();
             let normed = unit_offset_layernorm(&hidden, &layer.post_attention_layernorm.gamma)?;
 
-            // ── FFN (Triton matmul in F16, bias+GELU in F32) ──
-            let normed_f16 = normed.to_dtype(DType::F16)?;
-            let fc1_out = triton_matmul(
-                dev, &self.kernels.matmul_64x64,
-                &normed_f16, &layer.mlp.fc1.weight,
-                padded_seq, layer.mlp.fc1.out_dim, layer.mlp.fc1.in_dim,
-            )?;
-            let fc1_out = fc1_out.to_dtype(DType::F32)?
-                .broadcast_add(&layer.mlp.fc1.bias.to_dtype(DType::F32)?)?
+            // ── FFN: FC1 (GPU) + bias + GELU (CPU) ──
+            let fc1_f16 = self.gpu_matmul(&normed, &layer.mlp.fc1.weight, padded_seq, layer.mlp.fc1.out_dim, layer.mlp.fc1.in_dim)?;
+            let fc1_out = fc1_f16.to_dtype(DType::F32)?
+                .broadcast_add(&layer.mlp.fc1.bias)?
                 .gelu_erf()?;
-            let fc1_f16 = fc1_out.to_dtype(DType::F16)?;
-            let fc2_out = triton_matmul(
-                dev, &self.kernels.matmul_64x64,
-                &fc1_f16, &layer.mlp.fc2.weight,
-                padded_seq, layer.mlp.fc2.out_dim, layer.mlp.fc2.in_dim,
-            )?;
-            let fc2_out = fc2_out.to_dtype(DType::F32)?
-                .broadcast_add(&layer.mlp.fc2.bias.to_dtype(DType::F32)?)?;
 
-            // ── Residual (F32) ──
+            // ── FC2 (GPU) + bias (CPU) ──
+            let fc2_f16 = self.gpu_matmul(&fc1_out, &layer.mlp.fc2.weight, padded_seq, layer.mlp.fc2.out_dim, layer.mlp.fc2.in_dim)?;
+            let fc2_out = fc2_f16.to_dtype(DType::F32)?
+                .broadcast_add(&layer.mlp.fc2.bias)?;
+
+            // ── Residual (CPU F32) ──
             hidden = (fc2_out + residual)?;
         }
 
-        // Final norm (F32)
+        // Final norm (CPU F32)
         let out = unit_offset_layernorm(&hidden, &self.final_norm.gamma)?;
-
-        // Slice back to seq_len and reshape to [1, seq_len, dim]
         let out = out.narrow(0, 0, seq_len)?;
         Ok(out.reshape((1, seq_len, dim))?)
     }

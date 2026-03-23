@@ -166,20 +166,16 @@ impl MoonshineModel {
 
         #[cfg(feature = "triton-metal")]
         let triton_encoder = {
-            if let Device::Metal(_md) = device {
-                let kernel_dir = crate::triton_kernels::default_kernel_dir();
-                match TritonEncoder::new(&cfg, vb.pp("model.encoder"), &kernel_dir) {
-                    Ok(te) => {
-                        println!("  Triton encoder loaded ({})", kernel_dir.display());
-                        Some(te)
-                    }
-                    Err(e) => {
-                        println!("  Triton encoder unavailable: {e}");
-                        None
-                    }
+            let kernel_dir = crate::triton_kernels::default_kernel_dir();
+            match TritonEncoder::new(&cfg, vb.pp("model.encoder"), &kernel_dir) {
+                Ok(te) => {
+                    println!("  Triton encoder loaded ({})", kernel_dir.display());
+                    Some(te)
                 }
-            } else {
-                None
+                Err(e) => {
+                    println!("  Triton encoder unavailable: {e}");
+                    None
+                }
             }
         };
 
