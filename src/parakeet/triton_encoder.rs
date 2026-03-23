@@ -215,7 +215,7 @@ impl TritonParakeetEncoder {
 
     /// Triton matmul: A[M,K] @ B[K,N] → C[M,N] in F16.
     fn matmul_f16(&self, a_f16: &Tensor, b_f16: &Tensor, m: usize, n: usize, k: usize) -> Result<Tensor> {
-        triton_matmul(&self.metal_device, &self.kernels.matmul_64x64, a_f16, b_f16, m, n, k)
+        triton_matmul(&self.metal_device, &self.kernels.matmul_64x64, a_f16, b_f16, m, n, k, 64, 64)
     }
 
     /// Linear projection via Triton: input[M,K] @ W[K,N] + bias[N].

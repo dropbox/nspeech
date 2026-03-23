@@ -183,7 +183,12 @@ impl TritonEncoder {
         assert_eq!(batch, 1, "TritonEncoder only supports batch=1");
         assert_eq!(dim, self.encoder_dim);
 
-        let block_m = 64;
+        // Use 128×128 tiles if the kernel is available, otherwise fall back to 64×64
+        let (block_m, matmul_pipeline) = if let Some(ref p128) = self.kernels.matmul_128x128 {
+            (128, p128)
+        } else {
+            (64, &self.kernels.matmul_64x64)
+        };
         let padded_seq = cdiv(seq_len, block_m) * block_m;
 
         // Move input to Metal F16
@@ -223,9 +228,9 @@ impl TritonEncoder {
             )?;
 
             // ── Q/K/V projections (GPU matmul) ──
-            let q = triton_matmul(dev, &k.matmul_64x64, &normed, &layer.self_attn.q_proj.weight, padded_seq, kv_dim, dim)?;
-            let kk = triton_matmul(dev, &k.matmul_64x64, &normed, &layer.self_attn.k_proj.weight, padded_seq, kv_dim, dim)?;
-            let v = triton_matmul(dev, &k.matmul_64x64, &normed, &layer.self_attn.v_proj.weight, padded_seq, kv_dim, dim)?;
+            let q = triton_matmul(dev, matmul_pipeline, &normed, &layer.self_attn.q_proj.weight, padded_seq, kv_dim, dim, block_m, block_m)?;
+            let kk = triton_matmul(dev, matmul_pipeline, &normed, &layer.self_attn.k_proj.weight, padded_seq, kv_dim, dim, block_m, block_m)?;
+            let v = triton_matmul(dev, matmul_pipeline, &normed, &layer.self_attn.v_proj.weight, padded_seq, kv_dim, dim, block_m, block_m)?;
 
             // ── Flash Attention (GPU) ──
             // Layout: [padded_seq, kv_dim] = [padded_seq, nh*hd], interpreted as [nh, padded_seq, hd]
@@ -244,7 +249,7 @@ impl TritonEncoder {
             )?;
 
             // ── O projection (GPU matmul) ──
-            let attn_proj = triton_matmul(dev, &k.matmul_64x64, &attn_out, &layer.self_attn.o_proj.weight, padded_seq, dim, kv_dim)?;
+            let attn_proj = triton_matmul(dev, matmul_pipeline, &attn_out, &layer.self_attn.o_proj.weight, padded_seq, dim, kv_dim, block_m, block_m)?;
 
             // ── Residual add (GPU) ──
             hidden = triton_residual_add(dev, &k.residual_add, &attn_proj, &residual, n_elem)?;
@@ -259,12 +264,12 @@ impl TritonEncoder {
 
             // ── FFN: matmul → bias_add → gelu (GPU) ──
             let fc1_dim = layer.mlp.fc1.out_dim;
-            let fc1 = triton_matmul(dev, &k.matmul_64x64, &normed, &layer.mlp.fc1.weight, padded_seq, fc1_dim, layer.mlp.fc1.in_dim)?;
+            let fc1 = triton_matmul(dev, matmul_pipeline, &normed, &layer.mlp.fc1.weight, padded_seq, fc1_dim, layer.mlp.fc1.in_dim, block_m, block_m)?;
             let fc1 = triton_bias_add(dev, &k.bias_add, &fc1, &layer.mlp.fc1.bias, padded_seq * fc1_dim, fc1_dim)?;
             let fc1 = triton_gelu(dev, &k.gelu, &fc1, padded_seq * fc1_dim)?;
 
             // ── FC2: matmul → bias_add (GPU) ──
-            let fc2 = triton_matmul(dev, &k.matmul_64x64, &fc1, &layer.mlp.fc2.weight, padded_seq, layer.mlp.fc2.out_dim, layer.mlp.fc2.in_dim)?;
+            let fc2 = triton_matmul(dev, matmul_pipeline, &fc1, &layer.mlp.fc2.weight, padded_seq, layer.mlp.fc2.out_dim, layer.mlp.fc2.in_dim, block_m, block_m)?;
             let fc2 = triton_bias_add(dev, &k.bias_add, &fc2, &layer.mlp.fc2.bias, n_elem, dim)?;
 
             // ── Residual add (GPU) ──

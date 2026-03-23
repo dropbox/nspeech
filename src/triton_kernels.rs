@@ -23,6 +23,7 @@ fn tg_size(pipeline: &ComputePipeline, requested: usize) -> MTLSize {
 /// All compiled Triton kernel pipelines for the Moonshine encoder.
 pub struct TritonKernels {
     pub matmul_64x64: ComputePipeline,
+    pub matmul_128x128: Option<ComputePipeline>,
     pub matmul_bias_32x32: ComputePipeline,
     pub matmul_bias_gelu_32x32: ComputePipeline,
     pub layernorm_unit_offset: ComputePipeline,
@@ -58,6 +59,7 @@ impl TritonKernels {
 
         Ok(Self {
             matmul_64x64: load("matmul_fp16_64x64x32", "matmul_fp16")?,
+            matmul_128x128: load("matmul_fp16_128x128x32", "matmul_fp16").ok(),
             matmul_bias_32x32: load("matmul_bias_fp16_32x32x32", "matmul_bias_fp16")?,
             matmul_bias_gelu_32x32: load("matmul_bias_gelu_fp16_32x32x32", "matmul_bias_gelu_fp16")?,
             layernorm_unit_offset: load("layernorm_unit_offset_768", "layernorm_unit_offset")?,
@@ -144,6 +146,8 @@ pub fn triton_matmul(
     m: usize,
     n: usize,
     k: usize,
+    block_m: usize,
+    block_n: usize,
 ) -> Result<Tensor> {
     let out = empty_f16(device, (m, n))?;
 
@@ -164,8 +168,8 @@ pub fn triton_matmul(
         encoder.set_bytes(11, &1i32);           // stride_cn = 1
 
         let grid = MTLSize {
-            width: cdiv(m, 64) as usize,
-            height: cdiv(n, 64) as usize,
+            width: cdiv(m, block_m),
+            height: cdiv(n, block_n),
             depth: 1,
         };
         encoder.dispatch_thread_groups(grid, tg_size(pipeline, 1024));
