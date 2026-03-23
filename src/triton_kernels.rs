@@ -29,6 +29,8 @@ pub struct TritonKernels {
     pub residual_add: ComputePipeline,
     pub flash_attention: ComputePipeline,
     pub rel_pos_fa2: Option<ComputePipeline>,
+    pub gelu: ComputePipeline,
+    pub bias_add: ComputePipeline,
 }
 
 impl TritonKernels {
@@ -62,6 +64,8 @@ impl TritonKernels {
             residual_add: load("residual_add_fp16", "residual_add")?,
             flash_attention: load("flash_attention_fwd_32x32x64", "flash_attention_fwd")?,
             rel_pos_fa2: load("rel_pos_fa2_fwd_16x32x128", "rel_pos_fa2_fwd").ok(),
+            gelu: load("gelu_fp16", "gelu_forward")?,
+            bias_add: load("bias_add_fp16", "bias_add_fp16")?,
         })
     }
 }
@@ -315,6 +319,70 @@ pub fn triton_residual_add(
 
         let tg_w = tg_size(pipeline, 1024).width;
         let grid = MTLSize { width: cdiv(n_elements, tg_w) as usize, height: 1, depth: 1 };
+        encoder.dispatch_thread_groups(grid, MTLSize { width: tg_w, height: 1, depth: 1 });
+        Ok::<(), anyhow::Error>(())
+    })?;
+
+    Ok(out)
+}
+
+/// Dispatch GELU activation: out[i] = gelu(x[i]) (element-wise F16)
+///
+/// The kernel processes 1024 elements per threadgroup.
+pub fn triton_gelu(
+    device: &MetalDevice,
+    pipeline: &ComputePipeline,
+    x: &Tensor,
+    n_elements: usize,
+) -> Result<Tensor> {
+    let out = empty_f16(device, x.shape())?;
+
+    {
+        let (sx, lx) = x.storage_and_layout();
+        let (so, lo) = out.storage_and_layout();
+        let x_off = lx.start_offset() * x.dtype().size_in_bytes();
+        let o_off = lo.start_offset() * out.dtype().size_in_bytes();
+        match (&*sx, &*so) {
+            (Storage::Metal(mx), Storage::Metal(mo)) => {
+                let encoder = device.command_encoder()?;
+                encoder.set_compute_pipeline_state(pipeline);
+                encoder.set_buffer(0, Some(mx.buffer()), x_off);
+                encoder.set_buffer(1, Some(mo.buffer()), o_off);
+                encoder.set_bytes(2, &(n_elements as i32));
+
+                // Kernel hardcodes BLOCK_SIZE=1024
+                let grid = MTLSize { width: cdiv(n_elements, 1024), height: 1, depth: 1 };
+                encoder.dispatch_thread_groups(grid, tg_size(pipeline, 1024));
+            }
+            _ => anyhow::bail!("Tensors must be on Metal device"),
+        }
+    }
+
+    Ok(out)
+}
+
+/// Dispatch bias add: out[i] = x[i] + bias[i % n_cols] (element-wise F16)
+pub fn triton_bias_add(
+    device: &MetalDevice,
+    pipeline: &ComputePipeline,
+    x: &Tensor,
+    bias: &Tensor,
+    n_elements: usize,
+    n_cols: usize,
+) -> Result<Tensor> {
+    let out = empty_f16(device, x.shape())?;
+
+    with_metal_buffers!(x, bias, &out, |x_buf, x_off, b_buf, b_off, o_buf, o_off| {
+        let encoder = device.command_encoder()?;
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(x_buf), x_off);
+        encoder.set_buffer(1, Some(b_buf), b_off);
+        encoder.set_buffer(2, Some(o_buf), o_off);
+        encoder.set_bytes(3, &(n_elements as i32));
+        encoder.set_bytes(4, &(n_cols as i32));
+
+        let tg_w = tg_size(pipeline, 1024).width;
+        let grid = MTLSize { width: cdiv(n_elements, tg_w), height: 1, depth: 1 };
         encoder.dispatch_thread_groups(grid, MTLSize { width: tg_w, height: 1, depth: 1 });
         Ok::<(), anyhow::Error>(())
     })?;
