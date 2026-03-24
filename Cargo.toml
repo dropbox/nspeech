@@ -22,6 +22,7 @@ fast-cpu = ["dep:rayon"]  # CPU-optimized matmul: pre-dequantize to F32 + BLAS, 
 fbgemm = ["fast-cpu", "dep:fbgemm-rs"]  # Additionally use fbgemm-rs AVX2/Neon packed GEMM (f32 weights)
 fbgemm-bf16 = ["fbgemm"]               # Use bf16-packed weights with fbgemm-rs (half memory, ~0.4% accuracy loss)
 triton-metal = ["dep:candle-metal-kernels", "dep:objc2-metal"]  # Use Triton-compiled Metal kernels for encoder
+triton-d3d12 = ["dep:candle-d3d12-kernels"]  # Use Triton-compiled HLSL kernels for encoder on D3D12
 
 [dependencies]
 anyhow = "1"
@@ -60,6 +61,10 @@ fbgemm-rs = { path = "../fbgemm-rs", optional = true, features = ["rayon"] }
 candle-metal-kernels = { git = "https://github.com/huggingface/candle", branch = "main", optional = true }
 objc2-metal = { version = "0.3", optional = true }
 
+# Triton-compiled HLSL D3D12 kernels (optional, Windows only)
+candle-d3d12-kernels = { path = "../candle/windows/candle-d3d12-kernels", optional = true }
+half = "2.5"
+
 # Audio input (for mic example)
 cpal = "0.15"
 
@@ -73,4 +78,15 @@ candle-nn = { git = "https://github.com/huggingface/candle", branch = "main", fe
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 candle-core = { git = "https://github.com/huggingface/candle", branch = "main" }
 candle-nn = { git = "https://github.com/huggingface/candle", branch = "main" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+candle-core = { git = "https://github.com/huggingface/candle", branch = "main", features = ["d3d12"] }
+candle-nn = { git = "https://github.com/huggingface/candle", branch = "main" }
+
+# Override candle git deps with local worktree that has D3D12 backend
+[patch."https://github.com/huggingface/candle"]
+candle-core = { path = "../candle/windows/candle-core" }
+candle-nn = { path = "../candle/windows/candle-nn" }
+candle-transformers = { path = "../candle/windows/candle-transformers" }
+candle-metal-kernels = { path = "../candle/windows/candle-metal-kernels" }
 

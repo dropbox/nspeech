@@ -96,7 +96,12 @@ fn main() -> Result<()> {
     println!("Frontend output: [1, {seq_len}, {enc_dim}]\n");
 
     // ── Candle encoder ──
+    let skip_candle = std::env::var_os("TRITON_ONLY").is_some();
     let ref_flat;
+    if skip_candle {
+        println!("--- Candle Encoder: SKIPPED (TRITON_ONLY=1) ---");
+        ref_flat = Vec::new();
+    } else {
     println!("--- Candle Encoder (standard) ---");
     {
         use speech::moonshine::encoder::MoonshineEncoder;
@@ -131,6 +136,7 @@ fn main() -> Result<()> {
         ref_flat = ref_output.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
         println!("  Output: {} elements, first 5: {:?}", ref_flat.len(), &ref_flat[..5.min(ref_flat.len())]);
     }
+    } // skip_candle
     // Drop Candle encoder before Triton encoder to free GPU memory
 
     // ── Triton encoder ──
@@ -173,16 +179,18 @@ fn main() -> Result<()> {
         let tri_flat = triton_output.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
         println!("  Output: {} elements, first 5: {:?}", tri_flat.len(), &tri_flat[..5.min(tri_flat.len())]);
 
-        let max_err = ref_flat.iter().zip(tri_flat.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        let mean_err = ref_flat.iter().zip(tri_flat.iter())
-            .map(|(a, b)| (a - b).abs())
-            .sum::<f32>() / ref_flat.len() as f32;
+        if !ref_flat.is_empty() {
+            let max_err = ref_flat.iter().zip(tri_flat.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            let mean_err = ref_flat.iter().zip(tri_flat.iter())
+                .map(|(a, b)| (a - b).abs())
+                .sum::<f32>() / ref_flat.len() as f32;
 
-        println!("\n--- Comparison ---");
-        println!("  max_err:  {:.6}", max_err);
-        println!("  mean_err: {:.6}", mean_err);
+            println!("\n--- Comparison ---");
+            println!("  max_err:  {:.6}", max_err);
+            println!("  mean_err: {:.6}", mean_err);
+        }
     }
 
     #[cfg(not(feature = "triton-metal"))]

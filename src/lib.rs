@@ -9,5 +9,7 @@ pub mod fast_matmul;
 pub mod fast_ops;
 #[cfg(feature = "triton-metal")]
 pub mod triton_kernels;
+#[cfg(feature = "triton-d3d12")]
+pub mod triton_d3d12_kernels;
 
 mod napi;

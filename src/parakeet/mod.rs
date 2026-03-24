@@ -319,5 +319,11 @@ pub fn get_device() -> Result<Device> {
         }
     }
 
+    // D3D12 on Windows: use CPU as host device. The Triton D3D12 encoder
+    // manages its own GPU context internally (frontend/decoder stay on CPU).
+    if cfg!(target_os = "windows") {
+        println!("Windows: using CPU (D3D12 encoder accelerates GPU ops transparently)");
+    }
+
     Ok(Device::Cpu)
 }

@@ -211,6 +211,10 @@ impl TritonEncoder {
         let dev = &self.metal_device;
         let k = &self.kernels;
 
+        let mut t_matmul = 0u128;
+        let mut t_fa2 = 0u128;
+        let mut t_other = 0u128;
+
         for (i, layer) in self.layers.iter().enumerate() {
             let [left, right] = self.sliding_windows[i];
 
@@ -220,38 +224,48 @@ impl TritonEncoder {
             let n_elem = padded_seq * dim;
 
             // ── Pre-norm (GPU) ──
+            let t0 = std::time::Instant::now();
             let residual = hidden.clone();
             let normed = triton_layernorm_unit_offset(
                 dev, &k.layernorm_unit_offset,
                 &hidden, &layer.input_layernorm.gamma,
                 padded_seq, dim,
             )?;
+            if i == 0 { dev.wait_until_completed()?; }
+            t_other += t0.elapsed().as_micros();
 
             // ── Q/K/V projections (GPU matmul) ──
+            let t0 = std::time::Instant::now();
             let q = triton_matmul(dev, matmul_pipeline, &normed, &layer.self_attn.q_proj.weight, padded_seq, kv_dim, dim, block_m, block_m)?;
             let kk = triton_matmul(dev, matmul_pipeline, &normed, &layer.self_attn.k_proj.weight, padded_seq, kv_dim, dim, block_m, block_m)?;
             let v = triton_matmul(dev, matmul_pipeline, &normed, &layer.self_attn.v_proj.weight, padded_seq, kv_dim, dim, block_m, block_m)?;
+            if i == 0 { dev.wait_until_completed()?; }
+            t_matmul += t0.elapsed().as_micros();
 
             // ── Flash Attention (GPU) ──
-            // Layout: [padded_seq, kv_dim] = [padded_seq, nh*hd], interpreted as [nh, padded_seq, hd]
-            // stride_h = padded_seq * hd (skipping hd elements between consecutive head blocks? No...)
-            // Actually layout is [padded_seq, nh, hd] with stride_m = nh*hd = kv_dim, stride_h = hd
+            let t0 = std::time::Instant::now();
             let attn_out = empty_f16(dev, (padded_seq, kv_dim))?;
             let sm_scale = layer.self_attn.scale as f32;
             triton_flash_attention(
                 dev, &k.flash_attention,
                 &q, &kk, &v, &attn_out,
                 nh, padded_seq, hd,
-                hd as i32,      // stride_h: offset between heads = hd
-                kv_dim as i32,  // stride_m: offset between rows = nh * hd
+                hd as i32,
+                kv_dim as i32,
                 sm_scale,
                 left as i32, right as i32,
             )?;
+            if i == 0 { dev.wait_until_completed()?; }
+            t_fa2 += t0.elapsed().as_micros();
 
             // ── O projection (GPU matmul) ──
+            let t0 = std::time::Instant::now();
             let attn_proj = triton_matmul(dev, matmul_pipeline, &attn_out, &layer.self_attn.o_proj.weight, padded_seq, dim, kv_dim, block_m, block_m)?;
+            if i == 0 { dev.wait_until_completed()?; }
+            t_matmul += t0.elapsed().as_micros();
 
             // ── Residual add (GPU) ──
+            let t0 = std::time::Instant::now();
             hidden = triton_residual_add(dev, &k.residual_add, &attn_proj, &residual, n_elem)?;
 
             // ── Post-norm (GPU) ──
@@ -261,8 +275,11 @@ impl TritonEncoder {
                 &hidden, &layer.post_attention_layernorm.gamma,
                 padded_seq, dim,
             )?;
+            if i == 0 { dev.wait_until_completed()?; }
+            t_other += t0.elapsed().as_micros();
 
             // ── FFN: matmul → bias_add → gelu (GPU) ──
+            let t0 = std::time::Instant::now();
             let fc1_dim = layer.mlp.fc1.out_dim;
             let fc1 = triton_matmul(dev, matmul_pipeline, &normed, &layer.mlp.fc1.weight, padded_seq, fc1_dim, layer.mlp.fc1.in_dim, block_m, block_m)?;
             let fc1 = triton_bias_add(dev, &k.bias_add, &fc1, &layer.mlp.fc1.bias, padded_seq * fc1_dim, fc1_dim)?;
@@ -271,10 +288,21 @@ impl TritonEncoder {
             // ── FC2: matmul → bias_add (GPU) ──
             let fc2 = triton_matmul(dev, matmul_pipeline, &fc1, &layer.mlp.fc2.weight, padded_seq, layer.mlp.fc2.out_dim, layer.mlp.fc2.in_dim, block_m, block_m)?;
             let fc2 = triton_bias_add(dev, &k.bias_add, &fc2, &layer.mlp.fc2.bias, n_elem, dim)?;
+            if i == 0 { dev.wait_until_completed()?; }
+            t_matmul += t0.elapsed().as_micros();
 
             // ── Residual add (GPU) ──
+            let t0 = std::time::Instant::now();
             hidden = triton_residual_add(dev, &k.residual_add, &fc2, &residual, n_elem)?;
+            if i == 0 { dev.wait_until_completed()?; }
+            t_other += t0.elapsed().as_micros();
         }
+
+        let n_layers = self.layers.len() as f64;
+        eprintln!("  [profile layer0] matmul={:.1}ms fa2={:.1}ms other={:.1}ms",
+            t_matmul as f64 / 1000.0, t_fa2 as f64 / 1000.0, t_other as f64 / 1000.0);
+        eprintln!("  [profile est total] matmul={:.1}ms fa2={:.1}ms other={:.1}ms",
+            t_matmul as f64 / 1000.0 * n_layers, t_fa2 as f64 / 1000.0 * n_layers, t_other as f64 / 1000.0 * n_layers);
 
         // Final layernorm (GPU)
         let out = triton_layernorm_unit_offset(

@@ -38,6 +38,8 @@ use super::encoder::MoonshineEncoder;
 use super::frontend::MoonshineFrontend;
 #[cfg(feature = "triton-metal")]
 use super::triton_encoder::TritonEncoder;
+#[cfg(feature = "triton-d3d12")]
+use super::triton_d3d12_encoder::TritonD3D12Encoder;
 
 /// Streaming transcription state.
 ///
@@ -105,6 +107,8 @@ pub struct MoonshineModel {
     encoder: MoonshineEncoder,
     #[cfg(feature = "triton-metal")]
     triton_encoder: Option<TritonEncoder>,
+    #[cfg(feature = "triton-d3d12")]
+    triton_d3d12_encoder: Option<TritonD3D12Encoder>,
     decoder: MoonshineDecoder,
     proj_out: MM,
     tokenizer: Option<tokenizers::Tokenizer>,
@@ -179,6 +183,30 @@ impl MoonshineModel {
             }
         };
 
+        #[cfg(feature = "triton-d3d12")]
+        let triton_d3d12_encoder = {
+            use std::sync::Arc;
+            match candle_d3d12_kernels::Gpu::new(0) {
+                Ok(gpu) => {
+                    let gpu = Arc::new(gpu);
+                    match TritonD3D12Encoder::new(&cfg, vb.pp("model.encoder"), &gpu) {
+                        Ok(enc) => {
+                            println!("  Triton D3D12 encoder loaded");
+                            Some(enc)
+                        }
+                        Err(e) => {
+                            println!("  Triton D3D12 encoder unavailable: {e}");
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("  D3D12 GPU unavailable: {e}");
+                    None
+                }
+            }
+        };
+
         let decoder = MoonshineDecoder::new(&cfg, device, vb.pp("model.decoder"))?;
 
         // Output projection: decoder_dim -> vocab_size (quantized, no bias)
@@ -190,6 +218,8 @@ impl MoonshineModel {
             encoder,
             #[cfg(feature = "triton-metal")]
             triton_encoder,
+            #[cfg(feature = "triton-d3d12")]
+            triton_d3d12_encoder,
             decoder,
             proj_out,
             tokenizer,
@@ -206,6 +236,10 @@ impl MoonshineModel {
         if let Some(te) = &self.triton_encoder {
             // Triton encoder outputs F16; decoder expects F32
             return te.forward(features)?.to_dtype(candle_core::DType::F32).map_err(Into::into);
+        }
+        #[cfg(feature = "triton-d3d12")]
+        if let Some(te) = &self.triton_d3d12_encoder {
+            return te.forward(features);
         }
         self.encoder.forward(features)
     }
