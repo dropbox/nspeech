@@ -26,6 +26,8 @@ pub mod model;
 pub mod triton_encoder;
 #[cfg(feature = "triton-d3d12")]
 pub mod triton_d3d12_encoder;
+#[cfg(feature = "triton-d3d12")]
+pub mod triton_d3d12_decoder;
 
 pub use config::MoonshineConfig;
 pub use model::MoonshineModel;

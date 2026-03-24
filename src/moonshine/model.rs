@@ -40,6 +40,8 @@ use super::frontend::MoonshineFrontend;
 use super::triton_encoder::TritonEncoder;
 #[cfg(feature = "triton-d3d12")]
 use super::triton_d3d12_encoder::TritonD3D12Encoder;
+#[cfg(feature = "triton-d3d12")]
+use super::triton_d3d12_decoder::TritonD3D12Decoder;
 
 /// Streaming transcription state.
 ///
@@ -109,6 +111,8 @@ pub struct MoonshineModel {
     triton_encoder: Option<TritonEncoder>,
     #[cfg(feature = "triton-d3d12")]
     triton_d3d12_encoder: Option<TritonD3D12Encoder>,
+    #[cfg(feature = "triton-d3d12")]
+    triton_d3d12_decoder: Option<TritonD3D12Decoder>,
     decoder: MoonshineDecoder,
     proj_out: MM,
     tokenizer: Option<tokenizers::Tokenizer>,
@@ -184,12 +188,12 @@ impl MoonshineModel {
         };
 
         #[cfg(feature = "triton-d3d12")]
-        let triton_d3d12_encoder = {
+        let (triton_d3d12_encoder, triton_d3d12_decoder) = {
             use std::sync::Arc;
             match candle_d3d12_kernels::Gpu::new(0) {
                 Ok(gpu) => {
                     let gpu = Arc::new(gpu);
-                    match TritonD3D12Encoder::new(&cfg, vb.pp("model.encoder"), &gpu) {
+                    let enc = match TritonD3D12Encoder::new(&cfg, vb.pp("model.encoder"), &gpu) {
                         Ok(enc) => {
                             println!("  Triton D3D12 encoder loaded");
                             Some(enc)
@@ -198,11 +202,22 @@ impl MoonshineModel {
                             println!("  Triton D3D12 encoder unavailable: {e}");
                             None
                         }
-                    }
+                    };
+                    let dec = match TritonD3D12Decoder::new(&cfg, vb.pp("model.decoder"), vb.pp("proj_out"), &gpu) {
+                        Ok(dec) => {
+                            println!("  Triton D3D12 decoder loaded");
+                            Some(dec)
+                        }
+                        Err(e) => {
+                            println!("  Triton D3D12 decoder unavailable: {e}");
+                            None
+                        }
+                    };
+                    (enc, dec)
                 }
                 Err(e) => {
                     println!("  D3D12 GPU unavailable: {e}");
-                    None
+                    (None, None)
                 }
             }
         };
@@ -220,6 +235,8 @@ impl MoonshineModel {
             triton_encoder,
             #[cfg(feature = "triton-d3d12")]
             triton_d3d12_encoder,
+            #[cfg(feature = "triton-d3d12")]
+            triton_d3d12_decoder,
             decoder,
             proj_out,
             tokenizer,
@@ -257,6 +274,12 @@ impl MoonshineModel {
         encoder_hidden: &Tensor,
         max_tokens: usize,
     ) -> Result<Vec<u32>> {
+        // Dispatch to D3D12 decoder if available
+        #[cfg(feature = "triton-d3d12")]
+        if let Some(dec) = &self.triton_d3d12_decoder {
+            return dec.greedy_decode(encoder_hidden, max_tokens);
+        }
+
         let device = encoder_hidden.device();
         let mut cache = DecoderCache::new(self.cfg.decoder_num_layers);
         let mut generated = Vec::new();
@@ -516,14 +539,20 @@ impl MoonshineModel {
         let audio = Tensor::from_vec(padded, (1, audio_samples.len() + pad_len), device)?;
 
         // Encode
+        let t_enc = std::time::Instant::now();
         let encoder_hidden = self.encode(&audio)?;
+        let enc_ms = t_enc.elapsed().as_millis();
 
         // Compute max tokens based on audio duration
         let duration_sec = audio_samples.len() as f64 / self.cfg.sample_rate as f64;
         let max_tokens = (duration_sec * 6.5).ceil() as usize + 10; // 6.5 tokens/sec + margin
 
         // Decode
+        let t_dec = std::time::Instant::now();
         let tokens = self.greedy_decode(&encoder_hidden, max_tokens)?;
+        let dec_ms = t_dec.elapsed().as_millis();
+        eprintln!("  Encoder: {enc_ms}ms, Decoder: {dec_ms}ms ({} tokens, {:.0}ms/token)",
+            tokens.len(), dec_ms as f64 / tokens.len().max(1) as f64);
 
         // Remove EOS token if present
         let tokens: Vec<u32> = tokens
