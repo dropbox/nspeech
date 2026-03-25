@@ -182,6 +182,11 @@ fn uav_f16<'a>(buf: &'a GpuBuffer, count: u32) -> BufferBinding<'a> {
     BufferBinding::structured_f16(buf, count)
 }
 
+/// Bind a buffer as RWStructuredBuffer<half4> UAV (8 bytes per element, count/4 elements).
+fn uav_f16x4<'a>(buf: &'a GpuBuffer, half_count: u32) -> BufferBinding<'a> {
+    BufferBinding::structured(buf, half_count / 4, 8)
+}
+
 /// Bind a buffer as RWStructuredBuffer<float> UAV.
 fn uav_f32<'a>(buf: &'a GpuBuffer, count: u32) -> BufferBinding<'a> {
     BufferBinding::structured_f32(buf, count)
@@ -253,9 +258,9 @@ pub fn triton_d3d12_matmul(
     ];
 
     let uavs = [
-        uav_f16(a, (m * k) as u32),
-        uav_f16(b, (k * n) as u32),
-        uav_f16(out, (m * n) as u32),
+        uav_f16x4(a, (m * k) as u32),
+        uav_f16x4(b, (k * n) as u32),
+        uav_f16x4(out, (m * n) as u32),
     ];
 
     kernels.gpu.dispatch_uav_only(pso, &root_constants, &uavs, [grid_x, grid_y, 1])
@@ -299,8 +304,8 @@ pub fn triton_d3d12_matmul_bias(
     ];
 
     let uavs = [
-        uav_f16(a, (m * k) as u32),
-        uav_f16(b, (k * n) as u32),
+        uav_f16x4(a, (m * k) as u32),
+        uav_f16x4(b, (k * n) as u32),
         uav_f16(bias, n as u32),
         uav_f16(out, (m * n) as u32),
     ];
@@ -423,9 +428,9 @@ pub fn triton_d3d12_matmul_f32w(
     ];
 
     let uavs = [
-        uav_f16(a, (m * k) as u32),
+        uav_f16x4(a, (m * k) as u32),
         uav_f32(b, (k * n) as u32),
-        uav_f16(out, (m * n) as u32),
+        uav_f16x4(out, (m * n) as u32),
     ];
 
     kernels.gpu.dispatch_uav_only(&kernels.matmul_f32w_64x64, &root_constants, &uavs, [grid_x, grid_y, 1])
@@ -461,7 +466,7 @@ pub fn triton_d3d12_matmul_bias_f32w(
     ];
 
     let uavs = [
-        uav_f16(a, (m * k) as u32),
+        uav_f16x4(a, (m * k) as u32),
         uav_f32(b, (k * n) as u32),
         uav_f32(bias, n as u32),
         uav_f16(out, (m * n) as u32),

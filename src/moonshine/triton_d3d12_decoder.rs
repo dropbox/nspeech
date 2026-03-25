@@ -35,6 +35,10 @@ fn uav_f16<'a>(buf: &'a GpuBuffer, count: u32) -> BufferBinding<'a> {
     BufferBinding::structured_f16(buf, count)
 }
 
+fn uav_f16x4<'a>(buf: &'a GpuBuffer, half_count: u32) -> BufferBinding<'a> {
+    BufferBinding::structured(buf, half_count / 4, 8)
+}
+
 fn uav_f32<'a>(buf: &'a GpuBuffer, count: u32) -> BufferBinding<'a> {
     BufferBinding::structured_f32(buf, count)
 }
@@ -63,25 +67,25 @@ const HLSL_GEMV_F16W: &str =
 const HLSL_GEMV_BIAS_F16W: &str =
     include_str!("../../../triton/third_party/metal/moonshine_hlsl/gemv_bias_f16w.hlsl");
 
-// Handwritten decoder kernels
+// Triton-compiled decoder kernels (replacing hand-written HLSL)
 const HLSL_ATTENTION_DECODE: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/attention_decode.hlsl");
+    include_str!("../../../triton/third_party/metal/moonshine_hlsl/attention_decode_1d_d80.hlsl");
 const HLSL_ROPE_INTERLEAVED: &str =
     include_str!("../../../triton/third_party/metal/moonshine_hlsl/rope_interleaved.hlsl");
 const HLSL_KV_CACHE_APPEND: &str =
     include_str!("../../../triton/third_party/metal/moonshine_hlsl/kv_cache_append.hlsl");
+const HLSL_ROPE_CACHE_FUSED: &str =
+    include_str!("../../../triton/third_party/metal/moonshine_hlsl/rope_cache_fused.hlsl");
+const HLSL_ROPE_QK_CACHE_FUSED: &str =
+    include_str!("../../../triton/third_party/metal/moonshine_hlsl/rope_qk_cache_fused.hlsl");
 const HLSL_GLU_SILU: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/glu_silu.hlsl");
+    include_str!("../../../triton/third_party/metal/moonshine_hlsl/glu_silu_fused.hlsl");
 const HLSL_RESIDUAL_ADD_LAYERNORM: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/residual_add_layernorm.hlsl");
-const HLSL_ROPE_KV_APPEND: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/rope_kv_append.hlsl");
+    include_str!("../../../triton/third_party/metal/moonshine_hlsl/residual_add_layernorm_fused.hlsl");
 const HLSL_GEMV_BIAS_GLU: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/gemv_bias_glu.hlsl");
-const HLSL_GEMV_QKV: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/gemv_qkv.hlsl");
+    include_str!("../../../triton/third_party/metal/moonshine_hlsl/gemv_bias_glu_fused.hlsl");
 const HLSL_GEMV_RESADD_LN: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/gemv_resadd_ln.hlsl");
+    include_str!("../../../triton/third_party/metal/moonshine_hlsl/gemv_resadd_ln_fused.hlsl");
 
 // ── Kernel PSOs ──
 
@@ -100,11 +104,11 @@ struct DecoderKernels {
     attention_decode: ID3D12PipelineState,
     rope_interleaved: ID3D12PipelineState,
     kv_cache_append: ID3D12PipelineState,
+    rope_cache_fused: ID3D12PipelineState,
+    rope_qk_cache_fused: ID3D12PipelineState,
     glu_silu: ID3D12PipelineState,
     residual_add_layernorm: ID3D12PipelineState,
-    rope_kv_append: ID3D12PipelineState,
     gemv_bias_glu: ID3D12PipelineState,
-    gemv_qkv: ID3D12PipelineState,
     gemv_resadd_ln: ID3D12PipelineState,
 }
 
@@ -133,15 +137,15 @@ impl DecoderKernels {
             residual_add_f32: compile("dec_residual_add_f32", HLSL_RESIDUAL_ADD_F32, "residual_add_f32")?,
             add_bias_f32: compile("dec_add_bias_f32", HLSL_ADD_BIAS_F32, "add_bias_f32")?,
             convert_f32_to_f16: compile("dec_convert_f32_to_f16", HLSL_CONVERT_F32_TO_F16, "convert_f32_to_f16")?,
-            attention_decode: compile("dec_attention_decode", HLSL_ATTENTION_DECODE, "attention_decode")?,
+            attention_decode: compile("dec_attention_decode", HLSL_ATTENTION_DECODE, "attention_decode_1d_masked")?,
             rope_interleaved: compile("dec_rope_interleaved", HLSL_ROPE_INTERLEAVED, "rope_interleaved")?,
             kv_cache_append: compile("dec_kv_cache_append", HLSL_KV_CACHE_APPEND, "kv_cache_append")?,
-            glu_silu: compile("dec_glu_silu", HLSL_GLU_SILU, "glu_silu")?,
-            residual_add_layernorm: compile("dec_resadd_ln", HLSL_RESIDUAL_ADD_LAYERNORM, "residual_add_layernorm")?,
-            rope_kv_append: compile("dec_rope_kv_append", HLSL_ROPE_KV_APPEND, "rope_kv_append")?,
-            gemv_bias_glu: compile("dec_gemv_bias_glu", HLSL_GEMV_BIAS_GLU, "gemv_bias_glu")?,
-            gemv_qkv: compile("dec_gemv_qkv", HLSL_GEMV_QKV, "gemv_qkv")?,
-            gemv_resadd_ln: compile("dec_gemv_resadd_ln", HLSL_GEMV_RESADD_LN, "gemv_resadd_ln")?,
+            rope_cache_fused: compile("dec_rope_cache_fused", HLSL_ROPE_CACHE_FUSED, "rope_cache_fused")?,
+            rope_qk_cache_fused: compile("dec_rope_qk_cache_fused", HLSL_ROPE_QK_CACHE_FUSED, "rope_qk_cache_fused")?,
+            glu_silu: compile("dec_glu_silu", HLSL_GLU_SILU, "glu_silu_fused")?,
+            residual_add_layernorm: compile("dec_resadd_ln", HLSL_RESIDUAL_ADD_LAYERNORM, "residual_add_layernorm_fused")?,
+            gemv_bias_glu: compile("dec_gemv_bias_glu", HLSL_GEMV_BIAS_GLU, "gemv_bias_glu_fused")?,
+            gemv_resadd_ln: compile("dec_gemv_resadd_ln", HLSL_GEMV_RESADD_LN, "gemv_resadd_ln_fused")?,
         })
     }
 }
@@ -156,11 +160,12 @@ fn dispatch_gemv_f16w(
 ) -> Result<()> {
     let block_n = 128u32;
     let grid_x = cdiv(n, block_n as usize) as u32;
-    // cbuffer: N, K, stride_wk, grid_dims
+    // cbuffer: N, K, stride_wn, stride_wk, grid_dims — W stored [K,N] (transposed)
     let root_constants: Vec<u32> = vec![
         i32_as_u32(n as i32),
         i32_as_u32(kk as i32),
-        i32_as_u32(n as i32), // stride_wk = N (row-major W[K,N])
+        1,                      // stride_wn = 1 (W[K,N] row-major, cols adjacent)
+        i32_as_u32(n as i32),   // stride_wk = N
         grid_x, 1, 1,
     ];
     let uavs = [
@@ -170,37 +175,6 @@ fn dispatch_gemv_f16w(
     ];
     k.gpu.record_dispatch(&k.gemv_f16w, &root_constants, &uavs, [grid_x, 1, 1])
         .map_err(|e| anyhow::anyhow!("gemv_f16w dispatch: {e}"))
-}
-
-/// Fused QKV GEMV: computes Q, K, V projections in a single dispatch.
-/// All projections must have the same output dimension N.
-fn dispatch_gemv_qkv(
-    k: &DecoderKernels,
-    x: &GpuBuffer,
-    wq: &GpuBuffer, wk: &GpuBuffer, wv: &GpuBuffer,
-    oq: &GpuBuffer, ok: &GpuBuffer, ov: &GpuBuffer,
-    n: usize, kk: usize,
-) -> Result<()> {
-    let block_n = 128u32;
-    let grid_x = cdiv(n * 3, block_n as usize) as u32;
-    let root_constants: Vec<u32> = vec![
-        i32_as_u32(n as i32),
-        i32_as_u32(kk as i32),
-        i32_as_u32(n as i32), // stride_wk = N
-        grid_x, 1, 1,
-    ];
-    let w_elems = (kk * n) as u32;
-    let uavs = [
-        uav_f16(x, kk as u32),
-        uav_f16(wq, w_elems),
-        uav_f16(wk, w_elems),
-        uav_f16(wv, w_elems),
-        uav_f16(oq, n as u32),
-        uav_f16(ok, n as u32),
-        uav_f16(ov, n as u32),
-    ];
-    k.gpu.record_dispatch(&k.gemv_qkv, &root_constants, &uavs, [grid_x, 1, 1])
-        .map_err(|e| anyhow::anyhow!("gemv_qkv dispatch: {e}"))
 }
 
 /// Fused GEMV + residual-add + layernorm.
@@ -215,8 +189,9 @@ fn dispatch_gemv_resadd_ln(
     let root_constants: Vec<u32> = vec![
         i32_as_u32(dim as i32),
         i32_as_u32(gemv_k as i32),
-        i32_as_u32(dim as i32),  // stride_wk = dim
-        1, 1, 1,                 // grid_dim
+        1,                           // stride_wn = 1 (W[K,N])
+        i32_as_u32(dim as i32),      // stride_wk = dim
+        1, 1, 1,                     // grid_dim
     ];
     let uavs = [
         uav_f16(x, gemv_k as u32),
@@ -230,7 +205,7 @@ fn dispatch_gemv_resadd_ln(
         .map_err(|e| anyhow::anyhow!("gemv_resadd_ln dispatch: {e}"))
 }
 
-/// GEMV + bias: out_f16[N] = x_f16[K] @ W_f16[K,N] + bias_f32[N]
+/// GEMV + bias: out_f16[N] = x_f16[K] @ W_f16[N,K] + bias_f32[N]
 fn dispatch_gemv_bias_f16w(
     k: &DecoderKernels,
     x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
@@ -238,11 +213,12 @@ fn dispatch_gemv_bias_f16w(
 ) -> Result<()> {
     let block_n = 128u32;
     let grid_x = cdiv(n, block_n as usize) as u32;
-    // cbuffer: N, K, stride_wk, grid_dims
+    // cbuffer: N, K, stride_wn, stride_wk, grid_dims — W stored [K,N]
     let root_constants: Vec<u32> = vec![
         i32_as_u32(n as i32),
         i32_as_u32(kk as i32),
-        i32_as_u32(n as i32), // stride_wk = N
+        1,                      // stride_wn = 1 (W[K,N])
+        i32_as_u32(n as i32),   // stride_wk = N
         grid_x, 1, 1,
     ];
     let uavs = [
@@ -278,10 +254,16 @@ fn dispatch_matmul_f32w(
         grid_x, grid_y, 1,
     ];
 
+    // 64x64 kernel uses half4 for A and C; 32x32 only uses half4 for A
+    let out_uav = if bm >= 64 {
+        uav_f16x4(out, (m * n) as u32)
+    } else {
+        uav_f16(out, (m * n) as u32)
+    };
     let uavs = [
-        uav_f16(a, (m * kk) as u32),
+        uav_f16x4(a, (m * kk) as u32),
         uav_f32(b, (kk * n) as u32),
-        uav_f16(out, (m * n) as u32),
+        out_uav,
     ];
 
     k.gpu.record_dispatch(pso, &root_constants, &uavs, [grid_x, grid_y, 1])
@@ -308,7 +290,7 @@ fn dispatch_matmul_bias_f32w(
     ];
 
     let uavs = [
-        uav_f16(a, (m * kk) as u32),
+        uav_f16x4(a, (m * kk) as u32),
         uav_f32(b, (kk * n) as u32),
         uav_f32(bias, n as u32),
         uav_f16(out, (m * n) as u32),
@@ -364,11 +346,12 @@ fn dispatch_gemv_bias_glu(
 ) -> Result<()> {
     let block_n = 128u32;
     let grid_x = cdiv(n_intermediate, block_n as usize) as u32;
-    // N = intermediate_size, K = input dim, stride_wk = 2*N
+    // N = intermediate_size, K = input dim, W stored [K, 2*N]
     let root_constants: Vec<u32> = vec![
         i32_as_u32(n_intermediate as i32),
         i32_as_u32(kk as i32),
-        i32_as_u32((n_intermediate * 2) as i32), // stride_wk = 2*N
+        1,                                        // stride_wn = 1 (W[K, 2*N])
+        i32_as_u32((n_intermediate * 2) as i32),  // stride_wk = 2*N
         grid_x, 1, 1,
     ];
     let uavs = [
@@ -379,36 +362,6 @@ fn dispatch_gemv_bias_glu(
     ];
     k.gpu.record_dispatch(&k.gemv_bias_glu, &root_constants, &uavs, [grid_x, 1, 1])
         .map_err(|e| anyhow::anyhow!("gemv_bias_glu dispatch: {e}"))
-}
-
-/// Fused RoPE(Q) + RoPE(K) + KV_append(K) + KV_append(V): saves 3 dispatches + 1 barrier.
-fn dispatch_rope_kv_append(
-    k: &DecoderKernels,
-    q: &GpuBuffer, k_buf: &GpuBuffer, v: &GpuBuffer,
-    rope_table: &GpuBuffer, cache_k: &GpuBuffer, cache_v: &GpuBuffer,
-    n_q_heads: usize, n_kv_heads: usize, head_dim: usize,
-    half_rot: usize, pos: usize, max_kv_len: usize,
-) -> Result<()> {
-    let root_constants: Vec<u32> = vec![
-        i32_as_u32(n_q_heads as i32),
-        i32_as_u32(n_kv_heads as i32),
-        i32_as_u32(head_dim as i32),
-        i32_as_u32(half_rot as i32),
-        i32_as_u32(pos as i32),
-        i32_as_u32(max_kv_len as i32),
-        1, 1, 1,  // grid dims
-    ];
-    let cache_elems = (n_kv_heads * max_kv_len * head_dim) as u32;
-    let uavs = [
-        uav_f16(q, (n_q_heads * head_dim) as u32),
-        uav_f16(k_buf, (n_kv_heads * head_dim) as u32),
-        uav_f16(v, (n_kv_heads * head_dim) as u32),
-        uav_f32(rope_table, (512 * half_rot * 2) as u32),  // max_pos * half_rot * 2
-        uav_f16(cache_k, cache_elems),
-        uav_f16(cache_v, cache_elems),
-    ];
-    k.gpu.record_dispatch(&k.rope_kv_append, &root_constants, &uavs, [1, 1, 1])
-        .map_err(|e| anyhow::anyhow!("rope_kv_append dispatch: {e}"))
 }
 
 /// Fused residual-add + layernorm: saves 1 dispatch + 1 barrier per occurrence.
@@ -477,26 +430,25 @@ fn dispatch_convert_f32_to_f16(
         .map_err(|e| anyhow::anyhow!("convert_f32_to_f16 dispatch: {e}"))
 }
 
-/// Fused attention decode: single-query attention with online softmax
+/// Triton-compiled 1D attention decode with masked head_dim (BLOCK_D=128, head_dim=runtime)
+/// cbuffer: kv_len, n_q_heads, n_kv_heads, sm_scale, stride_kv_head, stride_kv_seq, head_dim, grid_dims
 fn dispatch_attention_decode(
     k: &DecoderKernels,
     q: &GpuBuffer, kk: &GpuBuffer, v: &GpuBuffer, out: &GpuBuffer,
     kv_len: usize, head_dim: usize, n_kv_heads: usize, n_q_heads: usize,
-    sm_scale: f32, is_causal: bool, q_pos: usize,
+    sm_scale: f32, _is_causal: bool, _q_pos: usize,
     stride_kv_head: usize, stride_kv_seq: usize,
-    kv_buf_elems: usize, // actual element count of the KV buffer
+    kv_buf_elems: usize,
 ) -> Result<()> {
     let grid_x = n_q_heads as u32;
     let root_constants: Vec<u32> = vec![
         i32_as_u32(kv_len as i32),
-        i32_as_u32(head_dim as i32),
-        i32_as_u32(n_kv_heads as i32),
         i32_as_u32(n_q_heads as i32),
+        i32_as_u32(n_kv_heads as i32),
         sm_scale.to_bits(),
-        i32_as_u32(if is_causal { 1 } else { 0 }),
-        i32_as_u32(q_pos as i32),
         i32_as_u32(stride_kv_head as i32),
         i32_as_u32(stride_kv_seq as i32),
+        i32_as_u32(head_dim as i32),
         grid_x, 1, 1,
     ];
     let q_count = (n_q_heads * head_dim) as u32;
@@ -511,56 +463,121 @@ fn dispatch_attention_decode(
         .map_err(|e| anyhow::anyhow!("attention_decode dispatch: {e}"))
 }
 
-/// RoPE interleaved: in-place rotary position encoding
+/// Triton-compiled RoPE interleaved: in-place rotary position encoding
+/// cbuffer: total_pairs, head_dim, half_rot, pos, grid_dims
 fn dispatch_rope(
     k: &DecoderKernels,
     x: &GpuBuffer, rope_table: &GpuBuffer,
     n_heads: usize, head_dim: usize, half_rot: usize, pos: usize,
 ) -> Result<()> {
+    let total_pairs = n_heads * half_rot;
+    let grid_x = cdiv(total_pairs, 256) as u32;
     let root_constants: Vec<u32> = vec![
-        i32_as_u32(n_heads as i32),
+        i32_as_u32(total_pairs as i32),
         i32_as_u32(head_dim as i32),
         i32_as_u32(half_rot as i32),
         i32_as_u32(pos as i32),
-        1, 1, 1, // grid dims
+        grid_x, 1, 1,
     ];
     let uavs = [
         uav_f16(x, (n_heads * head_dim) as u32),
-        uav_f32(rope_table, (512 * half_rot * 2) as u32), // max_pos estimate
+        uav_f32(rope_table, (512 * half_rot * 2) as u32),
     ];
-    k.gpu.record_dispatch(&k.rope_interleaved, &root_constants, &uavs, [1, 1, 1])
+    k.gpu.record_dispatch(&k.rope_interleaved, &root_constants, &uavs, [grid_x, 1, 1])
         .map_err(|e| anyhow::anyhow!("rope dispatch: {e}"))
 }
 
-/// KV cache append: write new K/V at position
+/// Fused RoPE + KV cache append: rotate in-place AND copy to cache in one dispatch
+/// cbuffer: total_pairs, head_dim, half_rot, pos, max_kv_len, grid_dims
+fn dispatch_rope_cache_fused(
+    k: &DecoderKernels,
+    x: &GpuBuffer, cache: &GpuBuffer, rope_table: &GpuBuffer,
+    n_heads: usize, head_dim: usize, half_rot: usize, pos: usize, max_kv_len: usize,
+) -> Result<()> {
+    let total_pairs = n_heads * half_rot;
+    let grid_x = cdiv(total_pairs, 256) as u32;
+    let root_constants: Vec<u32> = vec![
+        i32_as_u32(total_pairs as i32),
+        i32_as_u32(head_dim as i32),
+        i32_as_u32(half_rot as i32),
+        i32_as_u32(pos as i32),
+        i32_as_u32(max_kv_len as i32),
+        grid_x, 1, 1,
+    ];
+    let cache_total = (n_heads * max_kv_len * head_dim) as u32;
+    let uavs = [
+        uav_f16(x, (n_heads * head_dim) as u32),
+        uav_f16(cache, cache_total),
+        uav_f32(rope_table, (512 * half_rot * 2) as u32),
+    ];
+    k.gpu.record_dispatch(&k.rope_cache_fused, &root_constants, &uavs, [grid_x, 1, 1])
+        .map_err(|e| anyhow::anyhow!("rope_cache_fused dispatch: {e}"))
+}
+
+/// Fused RoPE(Q) + RoPE(K) + KV cache append(K,V) in one dispatch.
+/// Single threadgroup (grid 1,1,1). Replaces separate RoPE Q + rope_cache K + kv_cache V.
+/// cbuffer: n_q_heads, n_kv_heads, head_dim, half_rot, pos, max_kv_len, grid_dims
+/// Fused Q RoPE + K RoPE + K cache copy (4 UAVs)
+/// V cache handled by separate kv_cache_append dispatch
+fn dispatch_rope_qk_cache_fused(
+    k: &DecoderKernels,
+    q: &GpuBuffer, kk: &GpuBuffer,
+    rope_table: &GpuBuffer, cache_k: &GpuBuffer,
+    n_q_heads: usize, n_kv_heads: usize, head_dim: usize, half_rot: usize,
+    pos: usize, max_kv_len: usize,
+) -> Result<()> {
+    let root_constants: Vec<u32> = vec![
+        i32_as_u32(n_q_heads as i32),
+        i32_as_u32(n_kv_heads as i32),
+        i32_as_u32(head_dim as i32),
+        i32_as_u32(half_rot as i32),
+        i32_as_u32(pos as i32),
+        i32_as_u32(max_kv_len as i32),
+        1, 1, 1,
+    ];
+    let kv_cache_total = (n_kv_heads * max_kv_len * head_dim) as u32;
+    let uavs = [
+        uav_f16(q, (n_q_heads * head_dim) as u32),
+        uav_f16(kk, (n_kv_heads * head_dim) as u32),
+        uav_f32(rope_table, (512 * half_rot * 2) as u32),
+        uav_f16(cache_k, kv_cache_total),
+    ];
+    k.gpu.record_dispatch(&k.rope_qk_cache_fused, &root_constants, &uavs, [1, 1, 1])
+        .map_err(|e| anyhow::anyhow!("rope_qk_cache_fused dispatch: {e}"))
+}
+
+/// Triton-compiled KV cache append: write new K/V at position
+/// cbuffer: total_elems, max_kv_len, head_dim, pos, grid_dims
 fn dispatch_kv_cache_append(
     k: &DecoderKernels,
     new_kv: &GpuBuffer, cache: &GpuBuffer,
     n_kv_heads: usize, head_dim: usize, max_kv_len: usize, pos: usize,
 ) -> Result<()> {
+    let total_elems = n_kv_heads * head_dim;
+    let grid_x = cdiv(total_elems, 256) as u32;
     let root_constants: Vec<u32> = vec![
-        i32_as_u32(n_kv_heads as i32),
-        i32_as_u32(head_dim as i32),
+        i32_as_u32(total_elems as i32),
         i32_as_u32(max_kv_len as i32),
+        i32_as_u32(head_dim as i32),
         i32_as_u32(pos as i32),
-        1, 1, 1,
+        grid_x, 1, 1,
     ];
-    let total = (n_kv_heads * max_kv_len * head_dim) as u32;
+    let cache_total = (n_kv_heads * max_kv_len * head_dim) as u32;
     let uavs = [
-        uav_f16(new_kv, (n_kv_heads * head_dim) as u32),
-        uav_f16(cache, total),
+        uav_f16(new_kv, total_elems as u32),
+        uav_f16(cache, cache_total),
     ];
-    k.gpu.record_dispatch(&k.kv_cache_append, &root_constants, &uavs, [1, 1, 1])
+    k.gpu.record_dispatch(&k.kv_cache_append, &root_constants, &uavs, [grid_x, 1, 1])
         .map_err(|e| anyhow::anyhow!("kv_cache_append dispatch: {e}"))
 }
 
-/// GLU SiLU: out = SiLU(gate) * x, where gate/x are second/first half of fc1_buf
+/// Triton-compiled GLU SiLU: out = SiLU(gate) * x
 fn dispatch_glu_silu(
     k: &DecoderKernels,
     fc1_buf: &GpuBuffer, out: &GpuBuffer,
     n_elements: usize,
 ) -> Result<()> {
-    let grid_x = cdiv(n_elements, 256) as u32;
+    let grid_x = cdiv(n_elements, 1024) as u32;
     let root_constants: Vec<u32> = vec![i32_as_u32(n_elements as i32), grid_x, 1, 1];
     let uavs = [
         uav_f16(fc1_buf, (2 * n_elements) as u32),
@@ -1134,19 +1151,20 @@ impl TritonD3D12Decoder {
                 dispatch_layernorm_std_f32in(k, cur_f32, &layer.input_layernorm, &s.f16_norm, 1, dim)?;
             }
 
-            b(); // barrier: f16_norm written → fused QKV read it
-            dispatch_gemv_qkv(k, &s.f16_norm,
-                &layer.self_attn.q_proj.weight, &layer.self_attn.k_proj.weight, &layer.self_attn.v_proj.weight,
-                &s.f16_q, &s.f16_k, &s.f16_v,
-                q_dim, dim)?;
+            // Self-attention Q/K/V projections (3 independent GEMVs, no barriers between)
+            b(); // barrier: f16_norm written → Q/K/V read it
+            dispatch_gemv_f16w(k, &s.f16_norm, &layer.self_attn.q_proj.weight, &s.f16_q, q_dim, dim)?;
+            dispatch_gemv_f16w(k, &s.f16_norm, &layer.self_attn.k_proj.weight, &s.f16_k, kv_dim, dim)?;
+            dispatch_gemv_f16w(k, &s.f16_norm, &layer.self_attn.v_proj.weight, &s.f16_v, kv_dim, dim)?;
 
-            b(); // barrier: Q/K/V written → fused RoPE + KV append
-            dispatch_rope_kv_append(
-                k, &s.f16_q, &s.f16_k, &s.f16_v, &self.rope_table,
-                &cache.self_k[layer_idx], &cache.self_v[layer_idx],
-                self.n_q_heads, self.n_kv_heads, self.head_dim,
-                self.half_rot, pos, self.max_kv_len,
-            )?;
+            // Fused Q RoPE + K RoPE + K cache (1 dispatch) + separate V cache (1 dispatch)
+            b(); // barrier: Q/K/V written → RoPE/cache reads them
+            dispatch_rope_qk_cache_fused(k, &s.f16_q, &s.f16_k,
+                &self.rope_table, &cache.self_k[layer_idx],
+                self.n_q_heads, self.n_kv_heads, self.head_dim, self.half_rot,
+                pos, self.max_kv_len)?;
+            dispatch_kv_cache_append(k, &s.f16_v, &cache.self_v[layer_idx],
+                self.n_kv_heads, self.head_dim, self.max_kv_len, pos)?;
 
             b(); // barrier: cache updated, Q ready → attention reads all
             let self_kv_len = pos + 1;
