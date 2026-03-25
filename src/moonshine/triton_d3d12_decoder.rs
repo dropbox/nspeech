@@ -1291,3 +1291,94 @@ impl TritonD3D12Decoder {
         Ok(generated)
     }
 }
+
+// ── Q8 packed quantization (dead code, kept for future use) ──
+
+#[allow(dead_code)]
+const HLSL_GEMV_Q8: &str =
+    include_str!("../../../triton/third_party/metal/moonshine_hlsl/gemv_q8_v2.hlsl");
+#[allow(dead_code)]
+const HLSL_GEMV_Q8_BIAS: &str =
+    include_str!("../../../triton/third_party/metal/moonshine_hlsl/gemv_q8_bias_v2.hlsl");
+#[allow(dead_code)]
+const HLSL_GEMV_Q8_BIAS_GLU: &str =
+    include_str!("../../../triton/third_party/metal/moonshine_hlsl/gemv_q8_bias_glu_v2.hlsl");
+#[allow(dead_code)]
+const HLSL_GEMV_Q8_RESADD_LN: &str =
+    include_str!("../../../triton/third_party/metal/moonshine_hlsl/gemv_q8_resadd_ln_v2.hlsl");
+
+/// Q8 packed weights: int8 values packed 4-per-u32 + f16 per-block scales.
+/// Layout: qs[K, cols/4] (i32), scales[K/32, cols] (f16).
+#[allow(dead_code)]
+struct Q8Weights {
+    qs: GpuBuffer,
+    scales: GpuBuffer,
+    cols: usize,
+    k: usize,
+}
+
+/// Load 2D weight from GGUF → dequantize → Q8 packed format → GPU buffers.
+#[allow(dead_code)]
+fn load_q8_weight(
+    gpu: &Gpu, shape: (usize, usize), vb: &QVarBuilder,
+) -> Result<Q8Weights> {
+    let (n, k) = shape;
+    assert!(k % 32 == 0, "K={k} must be multiple of 32 for Q8 blocks");
+    assert!(n % 4 == 0, "N={n} must be multiple of 4 for Q8 packing");
+
+    let qt = vb.get(shape, "weight")?;
+    let t = qt.dequantize(&Device::Cpu)?;
+    let data = t.to_vec2::<f32>()?;
+
+    let n_k_blocks = k / 32;
+    let n_div4 = n / 4;
+
+    let mut int8_vals = vec![0i8; n * k];
+    let mut scales_nk = vec![0.0f32; n * n_k_blocks];
+
+    for ni in 0..n {
+        for kb in 0..n_k_blocks {
+            let mut max_abs = 0.0f32;
+            for ki in 0..32 {
+                max_abs = max_abs.max(data[ni][kb * 32 + ki].abs());
+            }
+            let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+            scales_nk[ni * n_k_blocks + kb] = scale;
+            let inv_scale = if max_abs > 0.0 { 127.0 / max_abs } else { 0.0 };
+            for ki in 0..32 {
+                let val = data[ni][kb * 32 + ki];
+                int8_vals[ni * k + kb * 32 + ki] = (val * inv_scale).round().clamp(-127.0, 127.0) as i8;
+            }
+        }
+    }
+
+    // Transpose [N,K] → [K,N] and pack 4 cols per u32
+    let mut qs_packed = vec![0u32; k * n_div4];
+    for ki in 0..k {
+        for ni4 in 0..n_div4 {
+            let b0 = int8_vals[(ni4 * 4) * k + ki] as u8 as u32;
+            let b1 = int8_vals[(ni4 * 4 + 1) * k + ki] as u8 as u32;
+            let b2 = int8_vals[(ni4 * 4 + 2) * k + ki] as u8 as u32;
+            let b3 = int8_vals[(ni4 * 4 + 3) * k + ki] as u8 as u32;
+            qs_packed[ki * n_div4 + ni4] = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+        }
+    }
+
+    // Transpose scales [N, K/32] → [K/32, N]
+    let mut scales_transposed = vec![half::f16::ZERO; n_k_blocks * n];
+    for ni in 0..n {
+        for kb in 0..n_k_blocks {
+            scales_transposed[kb * n + ni] = half::f16::from_f32(scales_nk[ni * n_k_blocks + kb]);
+        }
+    }
+
+    let qs_bytes: Vec<u8> = qs_packed.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let qs_buf = create_f32_buffer(gpu, k * n_div4)?;
+    upload_f32(gpu, &qs_bytes, &qs_buf)?;
+
+    let scales_bytes: Vec<u8> = scales_transposed.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let scales_buf = create_f16_buffer(gpu, n_k_blocks * n)?;
+    upload_f16(gpu, &scales_bytes, &scales_buf)?;
+
+    Ok(Q8Weights { qs: qs_buf, scales: scales_buf, cols: n, k })
+}
