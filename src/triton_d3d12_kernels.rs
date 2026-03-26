@@ -258,9 +258,9 @@ pub fn triton_d3d12_matmul(
     ];
 
     let uavs = [
-        uav_f16x4(a, (m * k) as u32),
-        uav_f16x4(b, (k * n) as u32),
-        uav_f16x4(out, (m * n) as u32),
+        uav_f16(a, (m * k) as u32),
+        uav_f16(b, (k * n) as u32),
+        uav_f16(out, (m * n) as u32),
     ];
 
     kernels.gpu.dispatch_uav_only(pso, &root_constants, &uavs, [grid_x, grid_y, 1])
@@ -304,8 +304,8 @@ pub fn triton_d3d12_matmul_bias(
     ];
 
     let uavs = [
-        uav_f16x4(a, (m * k) as u32),
-        uav_f16x4(b, (k * n) as u32),
+        uav_f16(a, (m * k) as u32),
+        uav_f16(b, (k * n) as u32),
         uav_f16(bias, n as u32),
         uav_f16(out, (m * n) as u32),
     ];
@@ -428,9 +428,9 @@ pub fn triton_d3d12_matmul_f32w(
     ];
 
     let uavs = [
-        uav_f16x4(a, (m * k) as u32),
+        uav_f16(a, (m * k) as u32),
         uav_f32(b, (k * n) as u32),
-        uav_f16x4(out, (m * n) as u32),
+        uav_f16(out, (m * n) as u32),
     ];
 
     kernels.gpu.dispatch_uav_only(&kernels.matmul_f32w_64x64, &root_constants, &uavs, [grid_x, grid_y, 1])
@@ -466,7 +466,7 @@ pub fn triton_d3d12_matmul_bias_f32w(
     ];
 
     let uavs = [
-        uav_f16x4(a, (m * k) as u32),
+        uav_f16(a, (m * k) as u32),
         uav_f32(b, (k * n) as u32),
         uav_f32(bias, n as u32),
         uav_f16(out, (m * n) as u32),

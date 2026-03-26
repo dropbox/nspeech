@@ -254,16 +254,10 @@ fn dispatch_matmul_f32w(
         grid_x, grid_y, 1,
     ];
 
-    // 64x64 kernel uses half4 for A and C; 32x32 only uses half4 for A
-    let out_uav = if bm >= 64 {
-        uav_f16x4(out, (m * n) as u32)
-    } else {
-        uav_f16(out, (m * n) as u32)
-    };
     let uavs = [
-        uav_f16x4(a, (m * kk) as u32),
+        uav_f16(a, (m * kk) as u32),
         uav_f32(b, (kk * n) as u32),
-        out_uav,
+        uav_f16(out, (m * n) as u32),
     ];
 
     k.gpu.record_dispatch(pso, &root_constants, &uavs, [grid_x, grid_y, 1])
@@ -290,7 +284,7 @@ fn dispatch_matmul_bias_f32w(
     ];
 
     let uavs = [
-        uav_f16x4(a, (m * kk) as u32),
+        uav_f16(a, (m * kk) as u32),
         uav_f32(b, (kk * n) as u32),
         uav_f32(bias, n as u32),
         uav_f16(out, (m * n) as u32),

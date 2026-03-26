@@ -10,17 +10,17 @@
 //!  - Final-norm → GLU MLP (fc1 → chunk → silu·x → fc2) → residual
 
 use anyhow::Result;
-use candle_core::{DType, Device, IndexOp, Tensor};
+use candle_core::{DType, Device, Tensor};
 
 use super::config::MoonshineConfig;
 use crate::triton_kernels::{
     DecoderKernels, empty_f16, empty_f32, triton_matmul,
-    enc_gemv_f16w, enc_gemv_bias_f16w,
+    enc_gemv_f16w,
     enc_layernorm_std_f32in, enc_attention_decode, enc_attention_splitkv,
     enc_rope_qk_cache_fused, enc_kv_cache_append,
-    enc_gemv_bias_glu, enc_gemv_resadd_ln,
     enc_residual_add_layernorm,
-    enc_gemv_splitk, enc_gemv_splitk_bias, enc_gemv_glu_splitk,
+    enc_gemv_splitk, enc_gemv_qkv_splitk, enc_gemv_splitk_bias,
+    enc_gemv_glu_splitk,
 };
 
 type QVarBuilder = candle_transformers::quantized_var_builder::VarBuilder;
@@ -109,7 +109,7 @@ struct DecoderScratch {
     f32_b: Tensor,          // [dim] F32 — residual stream pong
     f16_logits: Tensor,     // [vocab_size]
     f32_splitkv_partial: Tensor, // [n_q_heads * n_splits * 3 * BLOCK_D] F32 — split-KV partials
-    f32_mlp_partial: Tensor,    // F32 scratch for K-split GEMV partials (fc1 and fc2)
+    f16_partial: Tensor,        // F16 scratch for K-split GEMV partials (QKV, O, fc1, fc2)
 }
 
 // ── Main decoder struct ──
@@ -268,8 +268,8 @@ impl TritonMetalDecoder {
             f16_logits: empty_f16(&md, (cfg.vocab_size,))?,
             // n_splits=32, BLOCK_D=128, 3 arrays (m, l, acc) per partial
             f32_splitkv_partial: empty_f32(&md, (n_q_heads * 32 * 3 * 128,))?,
-            // K-split MLP partial: supports up to 16 splits × 2 × intermediate_size
-            f32_mlp_partial: empty_f32(&md, (16 * 2 * intermediate_size,))?,
+            // F16 partial buffer for split-K GEMV: QKV (3×8×N), O (8×N), fc1 (8×2×N_int), fc2 (16×N)
+            f16_partial: empty_f16(&md, (3 * 16 * 2 * intermediate_size,))?,
         };
 
         // Precompute RoPE table
@@ -491,8 +491,7 @@ impl TritonMetalDecoder {
         let k = &self.kernels;
         let s = &self.scratch;
         let dim = self.decoder_dim;
-        let kv_dim = self.n_kv_heads * self.head_dim;
-        let q_dim = self.n_q_heads * self.head_dim;
+        let q_dim = self.n_q_heads * self.head_dim;  // == kv_dim in Moonshine v2
         let pos = cache.self_len;
         let dev = &self.device;
 
@@ -532,47 +531,22 @@ impl TritonMetalDecoder {
             let write_f32 = buffers[write_idx];
 
             // ── Self-attention QKV GEMVs (split-K for parallelism) ──
-            let qkv_splits = 8usize;
+            let qkv_splits = 16usize;
             let tp = std::time::Instant::now();
             if layer_idx == 0 {
                 enc_layernorm_std_f32in(&enc, &k.layernorm_std_f32in,
                     read_f32, &layer.input_layernorm, &s.f16_norm, 1, dim)?;
             }
 
-            enc_gemv_splitk(&enc,
-                &k.gemv_splitk_partial, &k.gemv_splitk_reduce,
-                &s.f16_norm, &layer.self_attn.q_proj.weight, &s.f16_q, &s.f32_mlp_partial,
+            // Fused Q/K/V split-K: single dispatch for all 3 projections (saves 4 dispatches)
+            enc_gemv_qkv_splitk(&enc,
+                &k.gemv_qkv_splitk_partial, &k.gemv_qkv_splitk_reduce,
+                &s.f16_norm,
+                &layer.self_attn.q_proj.weight, &layer.self_attn.k_proj.weight, &layer.self_attn.v_proj.weight,
+                &s.f16_q, &s.f16_k, &s.f16_v,
+                &s.f16_partial,
                 q_dim, dim, qkv_splits)?;
-            if profile && layer_idx == 0 {
-                enc = gpu_sync!(enc, dev);
-                let t_q = tp.elapsed().as_secs_f64() * 1000.0;
-                let tp2 = std::time::Instant::now();
-                enc_gemv_splitk(&enc,
-                    &k.gemv_splitk_partial, &k.gemv_splitk_reduce,
-                    &s.f16_norm, &layer.self_attn.k_proj.weight, &s.f16_k, &s.f32_mlp_partial,
-                    kv_dim, dim, qkv_splits)?;
-                enc = gpu_sync!(enc, dev);
-                let t_k = tp2.elapsed().as_secs_f64() * 1000.0;
-                let tp2 = std::time::Instant::now();
-                enc_gemv_splitk(&enc,
-                    &k.gemv_splitk_partial, &k.gemv_splitk_reduce,
-                    &s.f16_norm, &layer.self_attn.v_proj.weight, &s.f16_v, &s.f32_mlp_partial,
-                    kv_dim, dim, qkv_splits)?;
-                enc = gpu_sync!(enc, dev);
-                let t_v = tp2.elapsed().as_secs_f64() * 1000.0;
-                eprintln!("  [layer0] LN+Q={:.3}ms K={:.3}ms V={:.3}ms", t_q, t_k, t_v);
-                t_gemv += t_q + t_k + t_v;
-            } else {
-                enc_gemv_splitk(&enc,
-                    &k.gemv_splitk_partial, &k.gemv_splitk_reduce,
-                    &s.f16_norm, &layer.self_attn.k_proj.weight, &s.f16_k, &s.f32_mlp_partial,
-                    kv_dim, dim, qkv_splits)?;
-                enc_gemv_splitk(&enc,
-                    &k.gemv_splitk_partial, &k.gemv_splitk_reduce,
-                    &s.f16_norm, &layer.self_attn.v_proj.weight, &s.f16_v, &s.f32_mlp_partial,
-                    kv_dim, dim, qkv_splits)?;
-                if profile { enc = gpu_sync!(enc, dev); t_gemv += tp.elapsed().as_secs_f64() * 1000.0; }
-            }
+            if profile { enc = gpu_sync!(enc, dev); t_gemv += tp.elapsed().as_secs_f64() * 1000.0; }
 
             let tp = std::time::Instant::now();
             enc_rope_qk_cache_fused(&enc, &k.rope_qk_cache_fused,
@@ -599,7 +573,7 @@ impl TritonMetalDecoder {
             let tp = std::time::Instant::now();
             enc_gemv_splitk(&enc,
                 &k.gemv_splitk_partial, &k.gemv_splitk_reduce,
-                &s.f16_attn, &layer.self_attn.o_proj.weight, &s.f16_act, &s.f32_mlp_partial,
+                &s.f16_attn, &layer.self_attn.o_proj.weight, &s.f16_act, &s.f16_partial,
                 dim, q_dim, qkv_splits)?;
             enc_residual_add_layernorm(&enc, &k.residual_add_layernorm,
                 &s.f16_act, read_f32, write_f32,
@@ -615,7 +589,7 @@ impl TritonMetalDecoder {
             let tp = std::time::Instant::now();
             enc_gemv_splitk(&enc,
                 &k.gemv_splitk_partial, &k.gemv_splitk_reduce,
-                &s.f16_norm, &layer.cross_attn.q_proj.weight, &s.f16_q, &s.f32_mlp_partial,
+                &s.f16_norm, &layer.cross_attn.q_proj.weight, &s.f16_q, &s.f16_partial,
                 q_dim, dim, qkv_splits)?;
             if profile { enc = gpu_sync!(enc, dev); t_gemv += tp.elapsed().as_secs_f64() * 1000.0;
                 if layer_idx == 0 { eprintln!("  [layer0] cross_Q={:.3}ms", tp.elapsed().as_secs_f64() * 1000.0); }
@@ -639,7 +613,7 @@ impl TritonMetalDecoder {
             let tp = std::time::Instant::now();
             enc_gemv_splitk(&enc,
                 &k.gemv_splitk_partial, &k.gemv_splitk_reduce,
-                &s.f16_attn, &layer.cross_attn.o_proj.weight, &s.f16_act, &s.f32_mlp_partial,
+                &s.f16_attn, &layer.cross_attn.o_proj.weight, &s.f16_act, &s.f16_partial,
                 dim, q_dim, qkv_splits)?;
             enc_residual_add_layernorm(&enc, &k.residual_add_layernorm,
                 &s.f16_act, read_f32, write_f32,
@@ -654,17 +628,15 @@ impl TritonMetalDecoder {
             let read_f32 = buffers[1 - write_idx];
             let write_f32 = buffers[write_idx];
 
-            // fc1_glu: split-K with 8 splits (640/8=80 K per split, 160 TGs)
-            // fc2: split-K with 16 splits (2560/16=160 K per split, 80 TGs)
-            let fc1_splits = 8usize;
-            let fc2_splits = 16usize;
+            let fc1_splits = 16usize;
+            let fc2_splits = 32usize;
 
             if profile && layer_idx == 0 {
                 let tp2 = std::time::Instant::now();
                 enc_gemv_glu_splitk(&enc,
                     &k.gemv_glu_splitk_partial, &k.gemv_glu_splitk_reduce,
                     &s.f16_norm, &layer.mlp.fc1.weight, &layer.mlp.fc1.bias, &s.f16_act,
-                    &s.f32_mlp_partial,
+                    &s.f16_partial,
                     self.intermediate_size, dim, fc1_splits)?;
                 enc = gpu_sync!(enc, dev);
                 let t_fc1 = tp2.elapsed().as_secs_f64() * 1000.0;
@@ -672,7 +644,7 @@ impl TritonMetalDecoder {
                 enc_gemv_splitk_bias(&enc,
                     &k.gemv_splitk_partial, &k.gemv_splitk_bias_reduce,
                     &s.f16_act, &layer.mlp.fc2.weight, &layer.mlp.fc2.bias, &s.f16_norm,
-                    &s.f32_mlp_partial,
+                    &s.f16_partial,
                     dim, self.intermediate_size, fc2_splits)?;
                 enc = gpu_sync!(enc, dev);
                 let t_fc2 = tp2.elapsed().as_secs_f64() * 1000.0;
@@ -695,13 +667,13 @@ impl TritonMetalDecoder {
                 enc_gemv_glu_splitk(&enc,
                     &k.gemv_glu_splitk_partial, &k.gemv_glu_splitk_reduce,
                     &s.f16_norm, &layer.mlp.fc1.weight, &layer.mlp.fc1.bias, &s.f16_act,
-                    &s.f32_mlp_partial,
+                    &s.f16_partial,
                     self.intermediate_size, dim, fc1_splits)?;
 
                 enc_gemv_splitk_bias(&enc,
                     &k.gemv_splitk_partial, &k.gemv_splitk_bias_reduce,
                     &s.f16_act, &layer.mlp.fc2.weight, &layer.mlp.fc2.bias, &s.f16_norm,
-                    &s.f32_mlp_partial,
+                    &s.f16_partial,
                     dim, self.intermediate_size, fc2_splits)?;
 
                 let next_ln_weight = if layer_idx + 1 < self.num_layers {

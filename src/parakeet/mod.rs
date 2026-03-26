@@ -298,15 +298,30 @@ pub fn add_punctuation(text: &str) -> String {
 }
 
 /// Select the best available device for inference.
-/// Metal on aarch64 macOS, CPU everywhere else.
-/// Override with PARAKEET_DEVICE=cpu.
+/// Metal on Apple Silicon, CPU on Intel Mac / Windows / Linux.
+/// Override with PARAKEET_DEVICE=cpu or PARAKEET_DEVICE=metal.
 pub fn get_device() -> Result<Device> {
-    if std::env::var("PARAKEET_DEVICE").as_deref() == Ok("cpu") {
+    let env_device = std::env::var("PARAKEET_DEVICE").unwrap_or_default();
+    if env_device == "cpu" {
         println!("Using CPU (forced by PARAKEET_DEVICE=cpu)");
         return Ok(Device::Cpu);
     }
+    if env_device == "metal" {
+        match Device::new_metal(0) {
+            Ok(device) => {
+                println!("Using Metal GPU (forced by PARAKEET_DEVICE=metal)");
+                return Ok(device);
+            }
+            Err(e) => {
+                println!("Metal not available ({e}), falling back to CPU");
+                return Ok(Device::Cpu);
+            }
+        }
+    }
 
-    // Metal only works on Apple Silicon (ARM), not Intel x86_64
+    // Metal on Apple Silicon only — Candle's Metal kernels are fast here.
+    // On Intel Macs, Candle Metal is very slow; use CPU for decoder/frontend
+    // and let the Triton encoder create its own Metal device for the encoder.
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         match Device::new_metal(0) {
             Ok(device) => {
@@ -319,9 +334,11 @@ pub fn get_device() -> Result<Device> {
         }
     }
 
-    // D3D12 on Windows: use CPU as host device. The Triton D3D12 encoder
-    // manages its own GPU context internally (frontend/decoder stay on CPU).
-    if cfg!(target_os = "windows") {
+    // D3D12 on Windows / Intel Mac: use CPU as host device.
+    // Triton encoder manages its own GPU context internally.
+    if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        println!("Intel Mac: using CPU (Triton encoder accelerates via Metal GPU)");
+    } else if cfg!(target_os = "windows") {
         println!("Windows: using CPU (D3D12 encoder accelerates GPU ops transparently)");
     }
 

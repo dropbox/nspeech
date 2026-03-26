@@ -38,6 +38,8 @@ use super::encoder::MoonshineEncoder;
 use super::frontend::MoonshineFrontend;
 #[cfg(feature = "triton-metal")]
 use super::triton_encoder::TritonEncoder;
+#[cfg(feature = "triton-metal")]
+use super::triton_decoder::TritonMetalDecoder;
 #[cfg(feature = "triton-d3d12")]
 use super::triton_d3d12_encoder::TritonD3D12Encoder;
 #[cfg(feature = "triton-d3d12")]
@@ -109,6 +111,8 @@ pub struct MoonshineModel {
     encoder: MoonshineEncoder,
     #[cfg(feature = "triton-metal")]
     triton_encoder: Option<TritonEncoder>,
+    #[cfg(feature = "triton-metal")]
+    triton_metal_decoder: Option<TritonMetalDecoder>,
     #[cfg(feature = "triton-d3d12")]
     triton_d3d12_encoder: Option<TritonD3D12Encoder>,
     #[cfg(feature = "triton-d3d12")]
@@ -173,9 +177,9 @@ impl MoonshineModel {
         let encoder = MoonshineEncoder::new(&cfg, vb.pp("model.encoder"))?;
 
         #[cfg(feature = "triton-metal")]
-        let triton_encoder = {
+        let (triton_encoder, triton_metal_decoder) = {
             let kernel_dir = crate::triton_kernels::default_kernel_dir();
-            match TritonEncoder::new(&cfg, vb.pp("model.encoder"), &kernel_dir, device) {
+            let enc = match TritonEncoder::new(&cfg, vb.pp("model.encoder"), &kernel_dir, device) {
                 Ok(te) => {
                     println!("  Triton encoder loaded ({})", kernel_dir.display());
                     Some(te)
@@ -184,7 +188,24 @@ impl MoonshineModel {
                     println!("  Triton encoder unavailable: {e}");
                     None
                 }
-            }
+            };
+            // Get the Metal device from the encoder, or create one
+            let metal_dev = enc.as_ref()
+                .map(|e| e.metal_device().clone())
+                .or_else(|| Device::new_metal(0).ok());
+            let dec = metal_dev.as_ref().and_then(|md| {
+                match TritonMetalDecoder::new(&cfg, vb.pp("model.decoder"), vb.pp("proj_out"), md, &kernel_dir) {
+                    Ok(dec) => {
+                        println!("  Triton Metal decoder loaded");
+                        Some(dec)
+                    }
+                    Err(e) => {
+                        println!("  Triton Metal decoder unavailable: {e}");
+                        None
+                    }
+                }
+            });
+            (enc, dec)
         };
 
         #[cfg(feature = "triton-d3d12")]
@@ -233,6 +254,8 @@ impl MoonshineModel {
             encoder,
             #[cfg(feature = "triton-metal")]
             triton_encoder,
+            #[cfg(feature = "triton-metal")]
+            triton_metal_decoder,
             #[cfg(feature = "triton-d3d12")]
             triton_d3d12_encoder,
             #[cfg(feature = "triton-d3d12")]
@@ -251,10 +274,9 @@ impl MoonshineModel {
     fn run_encoder(&self, features: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "triton-metal")]
         if let Some(te) = &self.triton_encoder {
-            // Triton encoder outputs F16 on Metal; decoder expects F32 on model device
-            let out = te.forward(features)?.to_dtype(candle_core::DType::F32)?;
-            // Move to the same device the decoder's weights are on
-            return out.to_device(features.device()).map_err(Into::into);
+            let cpu_out = te.forward(features)?;
+            let out = cpu_out.to_dtype(candle_core::DType::F32)?;
+            return Ok(out.to_device(features.device())?);
         }
         #[cfg(feature = "triton-d3d12")]
         if let Some(te) = &self.triton_d3d12_encoder {
@@ -276,7 +298,11 @@ impl MoonshineModel {
         encoder_hidden: &Tensor,
         max_tokens: usize,
     ) -> Result<Vec<u32>> {
-        // Dispatch to D3D12 decoder if available
+        // Dispatch to GPU decoder if available
+        #[cfg(feature = "triton-metal")]
+        if let Some(dec) = &self.triton_metal_decoder {
+            return dec.greedy_decode(encoder_hidden, max_tokens);
+        }
         #[cfg(feature = "triton-d3d12")]
         if let Some(dec) = &self.triton_d3d12_decoder {
             return dec.greedy_decode(encoder_hidden, max_tokens);
@@ -292,10 +318,21 @@ impl MoonshineModel {
         let logits = self.proj_out.forward(&hidden)?;
 
         // Get first token
+        {
+            let l = logits.i((0, 0))?.to_device(&candle_core::Device::Cpu)?.to_vec1::<f32>()?;
+            let top5: Vec<(usize, f32)> = {
+                let mut indexed: Vec<(usize, f32)> = l.iter().copied().enumerate().collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                indexed.into_iter().take(5).collect()
+            };
+            eprintln!("  [cpu-dec] step0 logits first5={:.4?} top5={:?}", &l[..5], top5);
+        }
         let mut next_token = logits.i((0, 0))?.argmax(0)?.to_scalar::<u32>()?;
         generated.push(next_token);
+        eprint!("  [cpu-dec] tokens: {}", next_token);
 
         if next_token == self.cfg.eos_id as u32 {
+            eprintln!();
             return Ok(generated);
         }
 
@@ -305,13 +342,25 @@ impl MoonshineModel {
             let hidden = self.decoder.forward(&input_ids, encoder_hidden, &mut cache)?;
             let logits = self.proj_out.forward(&hidden)?;
 
+            if _step < 5 {
+                let l = logits.i((0, 0))?.to_device(&candle_core::Device::Cpu)?.to_vec1::<f32>()?;
+                let top5: Vec<(usize, f32)> = {
+                    let mut indexed: Vec<(usize, f32)> = l.iter().copied().enumerate().collect();
+                    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                    indexed.into_iter().take(5).collect()
+                };
+                eprintln!("  [cpu-dec] step{} top5={:?}", _step + 1, top5);
+            }
+
             next_token = logits.i((0, 0))?.argmax(0)?.to_scalar::<u32>()?;
             generated.push(next_token);
+            eprint!(" {}", next_token);
 
             if next_token == self.cfg.eos_id as u32 {
                 break;
             }
         }
+        eprintln!();
 
         Ok(generated)
     }
