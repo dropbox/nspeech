@@ -36,14 +36,22 @@ fn new_mm(in_dim: usize, out_dim: usize, vb: QVarBuilder) -> Result<MM> {
 use super::decoder::{DecoderCache, KVCache, MoonshineDecoder};
 use super::encoder::MoonshineEncoder;
 use super::frontend::MoonshineFrontend;
+// GPU backend type aliases — unify Metal and D3D12 behind common names
 #[cfg(feature = "triton-metal")]
-use super::triton_encoder::TritonEncoder;
+use super::{triton_encoder::TritonEncoder as GpuEnc, triton_decoder::TritonMetalDecoder as GpuDec};
+#[cfg(feature = "triton-d3d12")]
+use super::{triton_d3d12_encoder::TritonD3D12Encoder as GpuEnc, triton_d3d12_decoder::TritonD3D12Decoder as GpuDec};
+
+/// Dispatch GPU encoder (Metal needs F32 conversion, D3D12 returns directly).
 #[cfg(feature = "triton-metal")]
-use super::triton_decoder::TritonMetalDecoder;
+fn gpu_encode(enc: &GpuEnc, features: &Tensor) -> Result<Tensor> {
+    let out = enc.forward(features)?;
+    Ok(out.to_dtype(candle_core::DType::F32)?.to_device(features.device())?)
+}
 #[cfg(feature = "triton-d3d12")]
-use super::triton_d3d12_encoder::TritonD3D12Encoder;
-#[cfg(feature = "triton-d3d12")]
-use super::triton_d3d12_decoder::TritonD3D12Decoder;
+fn gpu_encode(enc: &GpuEnc, features: &Tensor) -> Result<Tensor> {
+    enc.forward(features)
+}
 
 /// Streaming transcription state.
 ///
@@ -109,14 +117,10 @@ pub struct MoonshineModel {
     frontend: MoonshineFrontend,
     #[allow(dead_code)] // fallback when triton_encoder is None
     encoder: MoonshineEncoder,
-    #[cfg(feature = "triton-metal")]
-    triton_encoder: Option<TritonEncoder>,
-    #[cfg(feature = "triton-metal")]
-    triton_metal_decoder: Option<TritonMetalDecoder>,
-    #[cfg(feature = "triton-d3d12")]
-    triton_d3d12_encoder: Option<TritonD3D12Encoder>,
-    #[cfg(feature = "triton-d3d12")]
-    triton_d3d12_decoder: Option<TritonD3D12Decoder>,
+    #[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
+    gpu_encoder: Option<GpuEnc>,
+    #[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
+    gpu_decoder: Option<GpuDec>,
     decoder: MoonshineDecoder,
     proj_out: MM,
     tokenizer: Option<tokenizers::Tokenizer>,
@@ -177,9 +181,9 @@ impl MoonshineModel {
         let encoder = MoonshineEncoder::new(&cfg, vb.pp("model.encoder"))?;
 
         #[cfg(feature = "triton-metal")]
-        let (triton_encoder, triton_metal_decoder) = {
+        let (gpu_encoder, gpu_decoder): (Option<GpuEnc>, Option<GpuDec>) = {
             let kernel_dir = crate::triton_kernels::default_kernel_dir();
-            let enc = match TritonEncoder::new(&cfg, vb.pp("model.encoder"), &kernel_dir, device) {
+            let enc = match GpuEnc::new(&cfg, vb.pp("model.encoder"), &kernel_dir, device) {
                 Ok(te) => {
                     println!("  Triton encoder loaded ({})", kernel_dir.display());
                     Some(te)
@@ -194,7 +198,7 @@ impl MoonshineModel {
                 .map(|e| e.metal_device().clone())
                 .or_else(|| Device::new_metal(0).ok());
             let dec = metal_dev.as_ref().and_then(|md| {
-                match TritonMetalDecoder::new(&cfg, vb.pp("model.decoder"), vb.pp("proj_out"), md, &kernel_dir) {
+                match GpuDec::new(&cfg, vb.pp("model.decoder"), vb.pp("proj_out"), md, &kernel_dir) {
                     Ok(dec) => {
                         println!("  Triton Metal decoder loaded");
                         Some(dec)
@@ -209,12 +213,12 @@ impl MoonshineModel {
         };
 
         #[cfg(feature = "triton-d3d12")]
-        let (triton_d3d12_encoder, triton_d3d12_decoder) = {
+        let (gpu_encoder, gpu_decoder): (Option<GpuEnc>, Option<GpuDec>) = {
             use std::sync::Arc;
             match candle_d3d12_kernels::Gpu::new(0) {
                 Ok(gpu) => {
                     let gpu = Arc::new(gpu);
-                    let enc = match TritonD3D12Encoder::new(&cfg, vb.pp("model.encoder"), &gpu) {
+                    let enc = match GpuEnc::new(&cfg, vb.pp("model.encoder"), &gpu) {
                         Ok(enc) => {
                             println!("  Triton D3D12 encoder loaded");
                             Some(enc)
@@ -224,7 +228,7 @@ impl MoonshineModel {
                             None
                         }
                     };
-                    let dec = match TritonD3D12Decoder::new(&cfg, vb.pp("model.decoder"), vb.pp("proj_out"), &gpu) {
+                    let dec = match GpuDec::new(&cfg, vb.pp("model.decoder"), vb.pp("proj_out"), &gpu) {
                         Ok(dec) => {
                             println!("  Triton D3D12 decoder loaded");
                             Some(dec)
@@ -252,14 +256,10 @@ impl MoonshineModel {
             cfg,
             frontend,
             encoder,
-            #[cfg(feature = "triton-metal")]
-            triton_encoder,
-            #[cfg(feature = "triton-metal")]
-            triton_metal_decoder,
-            #[cfg(feature = "triton-d3d12")]
-            triton_d3d12_encoder,
-            #[cfg(feature = "triton-d3d12")]
-            triton_d3d12_decoder,
+            #[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
+            gpu_encoder,
+            #[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
+            gpu_decoder,
             decoder,
             proj_out,
             tokenizer,
@@ -270,17 +270,11 @@ impl MoonshineModel {
     ///
     /// Input: raw audio samples `[1, audio_len]` (padded to multiple of frame_len).
     /// Output: `[1, enc_seq_len, encoder_dim]`.
-    /// Run encoder on features (dispatches to Triton when available).
+    /// Run encoder on features (dispatches to GPU when available).
     fn run_encoder(&self, features: &Tensor) -> Result<Tensor> {
-        #[cfg(feature = "triton-metal")]
-        if let Some(te) = &self.triton_encoder {
-            let cpu_out = te.forward(features)?;
-            let out = cpu_out.to_dtype(candle_core::DType::F32)?;
-            return Ok(out.to_device(features.device())?);
-        }
-        #[cfg(feature = "triton-d3d12")]
-        if let Some(te) = &self.triton_d3d12_encoder {
-            return te.forward(features);
+        #[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
+        if let Some(enc) = &self.gpu_encoder {
+            return gpu_encode(enc, features);
         }
         self.encoder.forward(features)
     }
@@ -298,13 +292,8 @@ impl MoonshineModel {
         encoder_hidden: &Tensor,
         max_tokens: usize,
     ) -> Result<Vec<u32>> {
-        // Dispatch to GPU decoder if available
-        #[cfg(feature = "triton-metal")]
-        if let Some(dec) = &self.triton_metal_decoder {
-            return dec.greedy_decode(encoder_hidden, max_tokens);
-        }
-        #[cfg(feature = "triton-d3d12")]
-        if let Some(dec) = &self.triton_d3d12_decoder {
+        #[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
+        if let Some(dec) = &self.gpu_decoder {
             return dec.greedy_decode(encoder_hidden, max_tokens);
         }
 

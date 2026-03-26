@@ -25,90 +25,58 @@ macro_rules! embed_kernels {
     }
 }
 
+// Shared kernel list — only the directory and arch-specific extras differ.
+macro_rules! metal_kernels {
+    ($dir:literal $(, $extra:literal)*) => {
+        embed_kernels!($dir;
+            // Encoder
+            "matmul_fp16_64x64x32",
+            "matmul_fp16_128x128x32",
+            "matmul_bias_fp16_32x32x32",
+            "matmul_bias_fp16_64x64x32",
+            "matmul_bias_fp16_128x128x32",
+            "matmul_bias_gelu_fp16_32x32x32",
+            "matmul_bias_gelu_fp16_64x64x32",
+            "matmul_bias_gelu_fp16_128x128x32",
+            "layernorm_unit_offset_768",
+            "layernorm_bare_768",
+            "residual_add_fp16",
+            "flash_attention_fwd_32x32x64",
+            "gelu_fp16",
+            "bias_add_fp16",
+            // Decoder
+            "gemv_f16w",
+            "gemv_bias_f16w",
+            "layernorm_standard_f32in_640",
+            "residual_add_f32",
+            "convert_f32_to_f16",
+            "attention_decode_1d_d80",
+            "attention_decode_splitkv_partial",
+            "attention_decode_splitkv_reduce",
+            "rope_qk_cache_fused",
+            "kv_cache_append",
+            "glu_silu_fused",
+            "residual_add_layernorm_fused",
+            "gemv_bias_glu_fused",
+            "gemv_resadd_ln_fused",
+            "gemv_splitk_partial",
+            "gemv_splitk_bias_reduce",
+            "gemv_splitk_reduce",
+            "gemv_splitk_reduce_resadd_ln",
+            "gemv_qkv_splitk_partial",
+            "gemv_qkv_splitk_reduce",
+            "gemv_glu_splitk_partial",
+            "gemv_glu_splitk_reduce",
+            $($extra,)*
+        );
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
-embed_kernels!("moonshine_metal";
-    // Encoder kernels
-    "matmul_fp16_64x64x32",
-    "matmul_fp16_128x128x32",
-    "matmul_bias_fp16_32x32x32",
-    "matmul_bias_fp16_64x64x32",
-    "matmul_bias_fp16_128x128x32",
-    "matmul_bias_gelu_fp16_32x32x32",
-    "matmul_bias_gelu_fp16_64x64x32",
-    "matmul_bias_gelu_fp16_128x128x32",
-    "layernorm_unit_offset_768",
-    "layernorm_bare_768",
-    "residual_add_fp16",
-    "flash_attention_fwd_32x32x64",
-    "gelu_fp16",
-    "bias_add_fp16",
-    // Decoder kernels
-    "gemv_f16w",
-    "gemv_bias_f16w",
-    "layernorm_standard_f32in_640",
-    "residual_add_f32",
-    "convert_f32_to_f16",
-    "attention_decode_1d_d80",
-    "attention_decode_splitkv_partial",
-    "attention_decode_splitkv_reduce",
-    "rope_qk_cache_fused",
-    "kv_cache_append",
-    "glu_silu_fused",
-    "residual_add_layernorm_fused",
-    "gemv_bias_glu_fused",
-    "gemv_resadd_ln_fused",
-    "gemv_splitk_partial",
-    "gemv_splitk_bias_reduce",
-    "gemv_splitk_reduce",
-    "gemv_splitk_reduce_resadd_ln",
-    "gemv_qkv_splitk_partial",
-    "gemv_qkv_splitk_reduce",
-    "gemv_glu_splitk_partial",
-    "gemv_glu_splitk_reduce",
-);
+metal_kernels!("moonshine_metal");
 
 #[cfg(target_arch = "x86_64")]
-embed_kernels!("moonshine_metal_intel";
-    // Encoder kernels
-    "matmul_fp16_64x64x32",
-    "matmul_fp16_128x128x32",
-    "matmul_bias_fp16_32x32x32",
-    "matmul_bias_fp16_64x64x32",
-    "matmul_bias_fp16_128x128x32",
-    "matmul_bias_gelu_fp16_32x32x32",
-    "matmul_bias_gelu_fp16_64x64x32",
-    "matmul_bias_gelu_fp16_128x128x32",
-    "layernorm_unit_offset_768",
-    "layernorm_bare_768",
-    "residual_add_fp16",
-    "flash_attention_fwd_32x32x64",
-    "rel_pos_fa2_fwd_16x32x128",
-    "gelu_fp16",
-    "bias_add_fp16",
-    // Decoder kernels (full set including split-K)
-    "gemv_f16w",
-    "gemv_bias_f16w",
-    "layernorm_standard_f32in_640",
-    "residual_add_f32",
-    "convert_f32_to_f16",
-    "attention_decode_1d_d80",
-    "attention_decode_splitkv_partial",
-    "attention_decode_splitkv_reduce",
-    "rope_qk_cache_fused",
-    "kv_cache_append",
-    "glu_silu_fused",
-    "residual_add_layernorm_fused",
-    "gemv_bias_glu_fused",
-    "gemv_resadd_ln_fused",
-    "gemv_splitk_partial",
-    "gemv_splitk_bias_reduce",
-    "gemv_splitk_reduce",
-    "gemv_splitk_reduce_resadd_ln",
-    "gemv_qkv_splitk_partial",
-    "gemv_qkv_splitk_reduce",
-    "gemv_glu_splitk_partial",
-    "gemv_glu_splitk_reduce",
-);
+metal_kernels!("moonshine_metal_intel", "rel_pos_fa2_fwd_16x32x128");
 
 fn cdiv(a: usize, b: usize) -> usize {
     (a + b - 1) / b
