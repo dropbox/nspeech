@@ -31,6 +31,7 @@ assets/*
 !assets/README.md
 
 # Model files anywhere in the project
+hf_moonshine/
 hf_parakeet/
 model.safetensors
 *.gguf

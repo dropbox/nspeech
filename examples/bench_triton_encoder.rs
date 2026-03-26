@@ -149,7 +149,7 @@ fn main() -> Result<()> {
         println!("  Kernel dir: {}", kernel_dir.display());
 
         let t0 = Instant::now();
-        let triton_encoder = TritonEncoder::new(&cfg, vb.pp("model.encoder"), &kernel_dir)?;
+        let triton_encoder = TritonEncoder::new(&cfg, vb.pp("model.encoder"), &kernel_dir, &device)?;
         println!("  Load: {:.0}ms (incl. kernel compilation)", t0.elapsed().as_millis());
 
         // Warmup

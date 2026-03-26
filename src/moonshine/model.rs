@@ -175,7 +175,7 @@ impl MoonshineModel {
         #[cfg(feature = "triton-metal")]
         let triton_encoder = {
             let kernel_dir = crate::triton_kernels::default_kernel_dir();
-            match TritonEncoder::new(&cfg, vb.pp("model.encoder"), &kernel_dir) {
+            match TritonEncoder::new(&cfg, vb.pp("model.encoder"), &kernel_dir, device) {
                 Ok(te) => {
                     println!("  Triton encoder loaded ({})", kernel_dir.display());
                     Some(te)
@@ -251,8 +251,10 @@ impl MoonshineModel {
     fn run_encoder(&self, features: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "triton-metal")]
         if let Some(te) = &self.triton_encoder {
-            // Triton encoder outputs F16; decoder expects F32
-            return te.forward(features)?.to_dtype(candle_core::DType::F32).map_err(Into::into);
+            // Triton encoder outputs F16 on Metal; decoder expects F32 on model device
+            let out = te.forward(features)?.to_dtype(candle_core::DType::F32)?;
+            // Move to the same device the decoder's weights are on
+            return out.to_device(features.device()).map_err(Into::into);
         }
         #[cfg(feature = "triton-d3d12")]
         if let Some(te) = &self.triton_d3d12_encoder {

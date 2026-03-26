@@ -121,12 +121,13 @@ impl TritonEncoder {
         cfg: &MoonshineConfig,
         vb: QVarBuilder,
         kernel_dir: &std::path::Path,
+        device: &Device,
     ) -> Result<Self> {
-        let metal_candle_device = Device::new_metal(0)
-            .map_err(|e| anyhow::anyhow!("Metal device not available: {e}"))?;
+        // Use the same Metal device as the rest of the model
+        let metal_candle_device = device.clone();
         let metal_device = match &metal_candle_device {
             Device::Metal(md) => md.clone(),
-            _ => unreachable!(),
+            _ => return Err(anyhow::anyhow!("TritonEncoder requires a Metal device")),
         };
 
         println!("  Loading Triton kernel pipelines...");
