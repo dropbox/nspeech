@@ -29,6 +29,7 @@ debug_input.wav
 # Assets directory (all model files - too large for git)
 assets/*
 !assets/README.md
+assets.bak/
 
 # Model files anywhere in the project
 hf_moonshine/
