@@ -92,7 +92,8 @@ def gen_ninja():
     w.append("")
     w.append("rule msl_apple\n  command = $python $step msl_apple $in $out\n  description = MSL(apple) $out")
     w.append("rule msl_intel\n  command = $python $step msl_intel $in $out\n  description = MSL(intel) $out")
-    w.append("rule metallib\n  command = $python $step metallib $in $out\n  description = METALLIB $out")
+    w.append("rule metallib_apple\n  command = $python $step metallib_apple $in $out\n  description = METALLIB(apple) $out")
+    w.append("rule metallib_intel\n  command = $python $step metallib_intel $in $out\n  description = METALLIB(intel) $out")
     w.append("rule hlsl\n  command = $python $step hlsl $in $out\n  description = HLSL $out")
     w.append("")
 
@@ -108,9 +109,9 @@ def gen_ninja():
         im = intel / f"{name}.metal"
         il = intel / f"{name}.metallib"
         w.append(f"build {am}: msl_apple {t}")
-        w.append(f"build {al}: metallib {am}")
+        w.append(f"build {al}: metallib_apple {am}")
         w.append(f"build {im}: msl_intel {t}")
-        w.append(f"build {il}: metallib {im}")
+        w.append(f"build {il}: metallib_intel {im}")
         apple_libs.append(str(al))
         intel_libs.append(str(il))
 

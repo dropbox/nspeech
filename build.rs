@@ -40,6 +40,12 @@ fn main() {
         println!("cargo:rerun-if-changed={}", triton_metal_dir.join(src).display());
     }
 
+    // Track output directories so cargo recompiles when metallib/hlsl files change
+    // (include_bytes!/include_str! files need explicit tracking)
+    for subdir in &["kernels/out/apple", "kernels/out/intel", "kernels/out/hlsl"] {
+        println!("cargo:rerun-if-changed={}", manifest_dir.join(subdir).display());
+    }
+
     // Check stamp — skip if up to date
     let stamp = kernels_dir.join("out/.stamp");
     if stamp.exists() {
