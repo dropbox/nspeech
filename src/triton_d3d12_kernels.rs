@@ -109,7 +109,7 @@ impl TritonD3D12Kernels {
             // Flash Attention 2
             flash_attn_d64: compile("flash_attn_d64", HLSL_FLASH_ATTN_D64, "flash_attention_fwd")?,
             // Other kernels
-            layernorm_unit_offset: compile("layernorm_unit_offset", HLSL_LAYERNORM, "layernorm_unit_offset")?,
+            layernorm_unit_offset: compile("layernorm_unit_offset", HLSL_LAYERNORM, "layernorm")?,
             gelu: compile("gelu_fp16", HLSL_GELU, "gelu_forward")?,
             residual_add: compile("residual_add_fp16", HLSL_RESIDUAL_ADD, "residual_add")?,
             softmax: compile("softmax_fp16", HLSL_SOFTMAX, "softmax_rows")?,
@@ -117,7 +117,7 @@ impl TritonD3D12Kernels {
             matmul_f32w_64x64: compile("matmul_f16a_f32w_64x64", HLSL_MATMUL_F32W_64, "matmul_f16a_f32w")?,
             matmul_bias_f32w_32x32: compile("matmul_bias_f16a_f32w_32x32", HLSL_MATMUL_BIAS_F32W_32, "matmul_bias_f16a_f32w")?,
             // Mixed-precision layernorm/residual
-            layernorm_f32in: compile("layernorm_f32in", HLSL_LAYERNORM_F32IN, "layernorm_unit_offset_f32in")?,
+            layernorm_f32in: compile("layernorm_f32in", HLSL_LAYERNORM_F32IN, "layernorm")?,
             residual_add_f32: compile("residual_add_f32", HLSL_RESIDUAL_ADD_F32, "residual_add_f32")?,
             convert_f16_to_f32: compile("convert_f16_to_f32", HLSL_CONVERT_F16_TO_F32, "convert_f16_to_f32")?,
             prefer_fp16_acc: use_fp16_acc,

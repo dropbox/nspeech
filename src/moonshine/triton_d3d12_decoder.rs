@@ -128,7 +128,7 @@ impl DecoderKernels {
             matmul_bias_f32w_32: compile("dec_matmul_bias_f32w_32", HLSL_MATMUL_BIAS_F32W_32, "matmul_bias_f16a_f32w")?,
             gemv_f16w: compile("dec_gemv_f16w", HLSL_GEMV_F16W, "gemv_f16w")?,
             gemv_bias_f16w: compile("dec_gemv_bias_f16w", HLSL_GEMV_BIAS_F16W, "gemv_bias_f16w")?,
-            layernorm_std_f32in: compile("dec_layernorm_std_f32in", HLSL_LAYERNORM_STD_F32IN, "layernorm_standard")?,
+            layernorm_std_f32in: compile("dec_layernorm_std_f32in", HLSL_LAYERNORM_STD_F32IN, "layernorm")?,
             residual_add_f32: compile("dec_residual_add_f32", HLSL_RESIDUAL_ADD_F32, "residual_add_f32")?,
             add_bias_f32: compile("dec_add_bias_f32", HLSL_ADD_BIAS_F32, "add_bias_f32")?,
             convert_f32_to_f16: compile("dec_convert_f32_to_f16", HLSL_CONVERT_F32_TO_F16, "convert_f32_to_f16")?,

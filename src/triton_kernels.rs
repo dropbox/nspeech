@@ -166,7 +166,7 @@ impl TritonKernels {
                     Err(e) => { eprintln!(" SKIP ({e})"); None }
                 }
             },
-            layernorm_unit_offset: load("layernorm_unit_offset_768", "layernorm_unit_offset")?,
+            layernorm_unit_offset: load("layernorm_unit_offset_768", "layernorm")?,
             layernorm_bare: load("layernorm_bare_768", "layernorm_bare").ok(),
             residual_add: load("residual_add_fp16", "residual_add")?,
             flash_attention: load("flash_attention_fwd_32x32x64", "flash_attention_fwd")?,
@@ -732,7 +732,7 @@ impl DecoderKernels {
         Ok(Self {
             gemv_f16w: load("gemv_f16w", "gemv_f16w")?,
             gemv_bias_f16w: load("gemv_bias_f16w", "gemv_bias_f16w")?,
-            layernorm_std_f32in: load("layernorm_standard_f32in_640", "layernorm_standard")?,
+            layernorm_std_f32in: load("layernorm_standard_f32in_640", "layernorm")?,
             residual_add_f32: load("residual_add_f32", "residual_add_f32")?,
             convert_f32_to_f16: load("convert_f32_to_f16", "convert_f32_to_f16")?,
             attention_decode: load("attention_decode_1d_d80", "attention_decode_1d_masked")?,
