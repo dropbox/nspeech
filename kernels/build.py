@@ -92,8 +92,8 @@ def gen_ninja():
     w.append("")
     w.append("rule msl_apple\n  command = $python $step msl_apple $in $out\n  description = MSL(apple) $out")
     w.append("rule msl_intel\n  command = $python $step msl_intel $in $out\n  description = MSL(intel) $out")
-    w.append("rule metallib_apple\n  command = $python $step metallib_apple $in $out\n  description = METALLIB(apple) $out")
-    w.append("rule metallib_intel\n  command = $python $step metallib_intel $in $out\n  description = METALLIB(intel) $out")
+    w.append("rule metallib_apple\n  command = xcrun metal -std=metal3.1 -O3 -ffast-math -w -o $out $in\n  description = METALLIB(apple) $out")
+    w.append("rule metallib_intel\n  command = xcrun metal -std=macos-metal2.4 -mmacosx-version-min=14.0 -ffast-math -w -o $out $in\n  description = METALLIB(intel) $out")
     w.append("rule hlsl\n  command = $python $step hlsl $in $out\n  description = HLSL $out")
     w.append("")
 
