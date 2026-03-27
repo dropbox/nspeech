@@ -583,15 +583,17 @@ pub fn triton_d3d12_flash_attention(
     let stride_h = head_dim as i32;
     let stride_m = (n_heads * head_dim) as i32;
 
-    // cbuffer layout: arg4..arg9 (6 scalars) + grid_dim_x/y/z (3)
+    // cbuffer layout: arg4..arg10 (7 scalars) + grid_dim_x/y/z (3)
     // arg4 = seq_len (for masking), NOT padded_seq
+    let stride_o = stride_m; // output has same layout as Q/K/V for encoder
     let root_constants: Vec<u32> = vec![
         i32_as_u32(seq_len as i32),       // arg4: seq_len (mask bound)
         i32_as_u32(stride_h),             // arg5: stride_h
-        i32_as_u32(stride_m),             // arg6: stride_m
-        sm_scale.to_bits(),               // arg7: sm_scale (as float bits)
-        i32_as_u32(window_left),          // arg8: window_left
-        i32_as_u32(window_right),         // arg9: window_right
+        i32_as_u32(stride_m),             // arg6: stride_qkv
+        i32_as_u32(stride_o),             // arg7: stride_o
+        sm_scale.to_bits(),               // arg8: sm_scale (as float bits)
+        i32_as_u32(window_left),          // arg9: window_left
+        i32_as_u32(window_right),         // arg10: window_right
         grid_x, grid_y, 1,               // grid dims
     ];
 
