@@ -17,7 +17,6 @@ use std::sync::Arc;
 use super::config::MoonshineConfig;
 use crate::triton_d3d12_kernels::{
     create_f16_buffer, create_f32_buffer, upload_f16, upload_f32,
-    download_f16,
 };
 
 type QVarBuilder = candle_transformers::quantized_var_builder::VarBuilder;
@@ -33,10 +32,6 @@ fn i32_as_u32(v: i32) -> u32 {
 
 fn uav_f16<'a>(buf: &'a GpuBuffer, count: u32) -> BufferBinding<'a> {
     BufferBinding::structured_f16(buf, count)
-}
-
-fn uav_f16x4<'a>(buf: &'a GpuBuffer, half_count: u32) -> BufferBinding<'a> {
-    BufferBinding::structured(buf, half_count / 4, 8)
 }
 
 fn uav_f32<'a>(buf: &'a GpuBuffer, count: u32) -> BufferBinding<'a> {
@@ -315,23 +310,6 @@ fn dispatch_layernorm_std_f32in(
         .map_err(|e| anyhow::anyhow!("layernorm_std_f32in dispatch: {e}"))
 }
 
-/// Residual add: out_f32 = x_f16 + residual_f32
-fn dispatch_residual_add_f32(
-    k: &DecoderKernels,
-    x: &GpuBuffer, residual: &GpuBuffer, out: &GpuBuffer,
-    n_elements: usize,
-) -> Result<()> {
-    let grid_x = cdiv(n_elements, 1024) as u32;
-    let root_constants: Vec<u32> = vec![i32_as_u32(n_elements as i32), grid_x, 1, 1];
-    let uavs = [
-        uav_f16(x, n_elements as u32),
-        uav_f32(residual, n_elements as u32),
-        uav_f32(out, n_elements as u32),
-    ];
-    k.gpu.record_dispatch(&k.residual_add_f32, &root_constants, &uavs, [grid_x, 1, 1])
-        .map_err(|e| anyhow::anyhow!("residual_add_f32 dispatch: {e}"))
-}
-
 /// Fused GEMV+bias+GLU: fc1 output is immediately GLU-reduced. Saves 1 dispatch + 1 barrier.
 fn dispatch_gemv_bias_glu(
     k: &DecoderKernels,
@@ -457,56 +435,6 @@ fn dispatch_attention_decode(
         .map_err(|e| anyhow::anyhow!("attention_decode dispatch: {e}"))
 }
 
-/// Triton-compiled RoPE interleaved: in-place rotary position encoding
-/// cbuffer: total_pairs, head_dim, half_rot, pos, grid_dims
-fn dispatch_rope(
-    k: &DecoderKernels,
-    x: &GpuBuffer, rope_table: &GpuBuffer,
-    n_heads: usize, head_dim: usize, half_rot: usize, pos: usize,
-) -> Result<()> {
-    let total_pairs = n_heads * half_rot;
-    let grid_x = cdiv(total_pairs, 256) as u32;
-    let root_constants: Vec<u32> = vec![
-        i32_as_u32(total_pairs as i32),
-        i32_as_u32(head_dim as i32),
-        i32_as_u32(half_rot as i32),
-        i32_as_u32(pos as i32),
-        grid_x, 1, 1,
-    ];
-    let uavs = [
-        uav_f16(x, (n_heads * head_dim) as u32),
-        uav_f32(rope_table, (512 * half_rot * 2) as u32),
-    ];
-    k.gpu.record_dispatch(&k.rope_interleaved, &root_constants, &uavs, [grid_x, 1, 1])
-        .map_err(|e| anyhow::anyhow!("rope dispatch: {e}"))
-}
-
-/// Fused RoPE + KV cache append: rotate in-place AND copy to cache in one dispatch
-/// cbuffer: total_pairs, head_dim, half_rot, pos, max_kv_len, grid_dims
-fn dispatch_rope_cache_fused(
-    k: &DecoderKernels,
-    x: &GpuBuffer, cache: &GpuBuffer, rope_table: &GpuBuffer,
-    n_heads: usize, head_dim: usize, half_rot: usize, pos: usize, max_kv_len: usize,
-) -> Result<()> {
-    let total_pairs = n_heads * half_rot;
-    let grid_x = cdiv(total_pairs, 256) as u32;
-    let root_constants: Vec<u32> = vec![
-        i32_as_u32(total_pairs as i32),
-        i32_as_u32(head_dim as i32),
-        i32_as_u32(half_rot as i32),
-        i32_as_u32(pos as i32),
-        i32_as_u32(max_kv_len as i32),
-        grid_x, 1, 1,
-    ];
-    let cache_total = (n_heads * max_kv_len * head_dim) as u32;
-    let uavs = [
-        uav_f16(x, (n_heads * head_dim) as u32),
-        uav_f16(cache, cache_total),
-        uav_f32(rope_table, (512 * half_rot * 2) as u32),
-    ];
-    k.gpu.record_dispatch(&k.rope_cache_fused, &root_constants, &uavs, [grid_x, 1, 1])
-        .map_err(|e| anyhow::anyhow!("rope_cache_fused dispatch: {e}"))
-}
 
 /// Fused RoPE(Q) + RoPE(K) + KV cache append(K,V) in one dispatch.
 /// Single threadgroup (grid 1,1,1). Replaces separate RoPE Q + rope_cache K + kv_cache V.
@@ -563,22 +491,6 @@ fn dispatch_kv_cache_append(
     ];
     k.gpu.record_dispatch(&k.kv_cache_append, &root_constants, &uavs, [grid_x, 1, 1])
         .map_err(|e| anyhow::anyhow!("kv_cache_append dispatch: {e}"))
-}
-
-/// Triton-compiled GLU SiLU: out = SiLU(gate) * x
-fn dispatch_glu_silu(
-    k: &DecoderKernels,
-    fc1_buf: &GpuBuffer, out: &GpuBuffer,
-    n_elements: usize,
-) -> Result<()> {
-    let grid_x = cdiv(n_elements, 1024) as u32;
-    let root_constants: Vec<u32> = vec![i32_as_u32(n_elements as i32), grid_x, 1, 1];
-    let uavs = [
-        uav_f16(fc1_buf, (2 * n_elements) as u32),
-        uav_f16(out, n_elements as u32),
-    ];
-    k.gpu.record_dispatch(&k.glu_silu, &root_constants, &uavs, [grid_x, 1, 1])
-        .map_err(|e| anyhow::anyhow!("glu_silu dispatch: {e}"))
 }
 
 // ── Weight structures ──
@@ -725,8 +637,6 @@ struct DecoderScratch {
     f16_k: GpuBuffer,          // kv_dim - k_buf
     f16_v: GpuBuffer,          // kv_dim - v_buf
     f16_attn: GpuBuffer,       // q_dim - attn_out/cross_attn_out
-    f16_proj: GpuBuffer,       // dim - o_buf/cross_o
-    f16_fc1: GpuBuffer,        // intermediate_size * 2 - fc1_biased
     f16_act: GpuBuffer,        // intermediate_size - activated
     // F32 ping-pong for hidden state
     f32_a: GpuBuffer,          // dim
@@ -750,8 +660,6 @@ impl DecoderScratch {
             f16_k: create_f16_buffer(gpu, kv_dim)?,
             f16_v: create_f16_buffer(gpu, kv_dim)?,
             f16_attn: create_f16_buffer(gpu, q_dim)?,
-            f16_proj: create_f16_buffer(gpu, dim)?,
-            f16_fc1: create_f16_buffer(gpu, intermediate_size * 2)?,
             f16_act: create_f16_buffer(gpu, intermediate_size)?,
             f32_a: create_f32_buffer(gpu, dim)?,
             f32_b: create_f32_buffer(gpu, dim)?,
