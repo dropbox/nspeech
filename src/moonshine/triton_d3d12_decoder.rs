@@ -42,45 +42,45 @@ fn uav_f32<'a>(buf: &'a GpuBuffer, count: u32) -> BufferBinding<'a> {
 
 // Triton-compiled kernels
 const HLSL_MATMUL_F32W_64: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/matmul_f16a_f32w_64x64x32.hlsl");
+    include_str!("../../kernels/out/hlsl/matmul_f16a_f32w_64x64x32.hlsl");
 const HLSL_MATMUL_F32W_32: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/matmul_f16a_f32w_32x32x32.hlsl");
+    include_str!("../../kernels/out/hlsl/matmul_f16a_f32w_32x32x32.hlsl");
 const HLSL_MATMUL_BIAS_F32W_32: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/matmul_bias_f16a_f32w_32x32x32.hlsl");
+    include_str!("../../kernels/out/hlsl/matmul_bias_f16a_f32w_32x32x32.hlsl");
 const HLSL_LAYERNORM_STD_F32IN: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/layernorm_standard_f32in_640.hlsl");
+    include_str!("../../kernels/out/hlsl/layernorm_standard_f32in_640.hlsl");
 const HLSL_RESIDUAL_ADD_F32: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/residual_add_f32.hlsl");
+    include_str!("../../kernels/out/hlsl/residual_add_f32.hlsl");
 const HLSL_ADD_BIAS_F32: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/add_bias_f32_fp16.hlsl");
+    include_str!("../../kernels/out/hlsl/add_bias_f32_fp16.hlsl");
 const HLSL_CONVERT_F32_TO_F16: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/convert_f32_to_f16.hlsl");
+    include_str!("../../kernels/out/hlsl/convert_f32_to_f16.hlsl");
 
 // GEMV kernels — Triton-compiled, f16 weights (2x bandwidth vs f32)
 const HLSL_GEMV_F16W: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/gemv_f16w.hlsl");
+    include_str!("../../kernels/out/hlsl/gemv_f16w.hlsl");
 const HLSL_GEMV_BIAS_F16W: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/gemv_bias_f16w.hlsl");
+    include_str!("../../kernels/out/hlsl/gemv_bias_f16w.hlsl");
 
 // Triton-compiled decoder kernels (replacing hand-written HLSL)
 const HLSL_ATTENTION_DECODE: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/attention_decode_1d_d80.hlsl");
+    include_str!("../../kernels/out/hlsl/attention_decode_1d_d80.hlsl");
 const HLSL_ROPE_INTERLEAVED: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/rope_interleaved.hlsl");
+    include_str!("../../kernels/out/hlsl/rope_interleaved.hlsl");
 const HLSL_KV_CACHE_APPEND: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/kv_cache_append.hlsl");
+    include_str!("../../kernels/out/hlsl/kv_cache_append.hlsl");
 const HLSL_ROPE_CACHE_FUSED: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/rope_cache_fused.hlsl");
+    include_str!("../../kernels/out/hlsl/rope_cache_fused.hlsl");
 const HLSL_ROPE_QK_CACHE_FUSED: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/rope_qk_cache_fused.hlsl");
+    include_str!("../../kernels/out/hlsl/rope_qk_cache_fused.hlsl");
 const HLSL_GLU_SILU: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/glu_silu_fused.hlsl");
+    include_str!("../../kernels/out/hlsl/glu_silu_fused.hlsl");
 const HLSL_RESIDUAL_ADD_LAYERNORM: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/residual_add_layernorm_fused.hlsl");
+    include_str!("../../kernels/out/hlsl/residual_add_layernorm_fused.hlsl");
 const HLSL_GEMV_BIAS_GLU: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/gemv_bias_glu_fused.hlsl");
+    include_str!("../../kernels/out/hlsl/gemv_bias_glu_fused.hlsl");
 const HLSL_GEMV_RESADD_LN: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/gemv_resadd_ln_fused.hlsl");
+    include_str!("../../kernels/out/hlsl/gemv_resadd_ln_fused.hlsl");
 
 // ── Kernel PSOs ──
 
@@ -1216,16 +1216,16 @@ impl TritonD3D12Decoder {
 
 #[allow(dead_code)]
 const HLSL_GEMV_Q8: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/gemv_q8_v2.hlsl");
+    include_str!("../../kernels/out/hlsl/gemv_q8_v2.hlsl");
 #[allow(dead_code)]
 const HLSL_GEMV_Q8_BIAS: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/gemv_q8_bias_v2.hlsl");
+    include_str!("../../kernels/out/hlsl/gemv_q8_bias_v2.hlsl");
 #[allow(dead_code)]
 const HLSL_GEMV_Q8_BIAS_GLU: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/gemv_q8_bias_glu_v2.hlsl");
+    include_str!("../../kernels/out/hlsl/gemv_q8_bias_glu_v2.hlsl");
 #[allow(dead_code)]
 const HLSL_GEMV_Q8_RESADD_LN: &str =
-    include_str!("../../../triton/third_party/metal/moonshine_hlsl/gemv_q8_resadd_ln_v2.hlsl");
+    include_str!("../../kernels/out/hlsl/gemv_q8_resadd_ln_v2.hlsl");
 
 /// Q8 packed weights: int8 values packed 4-per-u32 + f16 per-block scales.
 /// Layout: qs[K, cols/4] (i32), scales[K/32, cols] (f16).

@@ -1696,10 +1696,9 @@ pub fn load_parakeet_tdt_from_gguf_local<P: AsRef<Path>>(
     #[cfg(feature = "triton-metal")]
     let triton_encoder = {
         if let Device::Metal(_md) = device {
-            let kernel_dir = crate::triton_kernels::default_kernel_dir();
-            match TritonParakeetEncoder::new(encoder_cfg.clone(), vb.pp("encoder"), &kernel_dir) {
+            match TritonParakeetEncoder::new(encoder_cfg.clone(), vb.pp("encoder")) {
                 Ok(te) => {
-                    info!("  Triton encoder loaded ({})", kernel_dir.display());
+                    info!("  Triton encoder loaded");
                     Some(te)
                 }
                 Err(e) => {
@@ -2017,10 +2016,9 @@ pub fn load_parakeet_tdt_from_gguf_mmap_local<P: AsRef<Path>>(
     #[cfg(feature = "triton-metal")]
     let triton_encoder = {
         if let Device::Metal(_md) = device {
-            let kernel_dir = crate::triton_kernels::default_kernel_dir();
-            match TritonParakeetEncoder::new(encoder_cfg.clone(), vb.pp("encoder"), &kernel_dir) {
+            match TritonParakeetEncoder::new(encoder_cfg.clone(), vb.pp("encoder")) {
                 Ok(te) => {
-                    info!("  Triton encoder loaded ({})", kernel_dir.display());
+                    info!("  Triton encoder loaded");
                     Some(te)
                 }
                 Err(e) => {

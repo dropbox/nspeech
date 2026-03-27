@@ -164,16 +164,15 @@ impl TritonMetalDecoder {
         dec_vb: QVarBuilder,
         proj_out_vb: QVarBuilder,
         metal_device: &Device,
-        kernel_dir: &std::path::Path,
     ) -> Result<Self> {
         let md = match metal_device {
             Device::Metal(md) => md.clone(),
             _ => return Err(anyhow::anyhow!("TritonMetalDecoder requires Metal device")),
         };
 
-        println!("  Compiling decoder Metal kernels...");
-        let kernels = DecoderKernels::load(&md, kernel_dir)?;
-        let encoder_kernels = crate::triton_kernels::TritonKernels::load(&md, kernel_dir)?;
+        println!("  Loading decoder Metal kernels...");
+        let kernels = DecoderKernels::load(&md)?;
+        let encoder_kernels = crate::triton_kernels::TritonKernels::load(&md)?;
 
         let decoder_dim = cfg.decoder_dim;
         let encoder_dim = cfg.encoder_dim;

@@ -182,10 +182,9 @@ impl MoonshineModel {
 
         #[cfg(feature = "triton-metal")]
         let (gpu_encoder, gpu_decoder): (Option<GpuEnc>, Option<GpuDec>) = {
-            let kernel_dir = crate::triton_kernels::default_kernel_dir();
-            let enc = match GpuEnc::new(&cfg, vb.pp("model.encoder"), &kernel_dir, device) {
+            let enc = match GpuEnc::new(&cfg, vb.pp("model.encoder"), device) {
                 Ok(te) => {
-                    println!("  Triton encoder loaded ({})", kernel_dir.display());
+                    println!("  Triton encoder loaded");
                     Some(te)
                 }
                 Err(e) => {
@@ -198,7 +197,7 @@ impl MoonshineModel {
                 .map(|e| e.metal_device().clone())
                 .or_else(|| Device::new_metal(0).ok());
             let dec = metal_dev.as_ref().and_then(|md| {
-                match GpuDec::new(&cfg, vb.pp("model.decoder"), vb.pp("proj_out"), md, &kernel_dir) {
+                match GpuDec::new(&cfg, vb.pp("model.decoder"), vb.pp("proj_out"), md) {
                     Ok(dec) => {
                         println!("  Triton Metal decoder loaded");
                         Some(dec)

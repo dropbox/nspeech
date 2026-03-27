@@ -10,7 +10,7 @@ use candle_nn::{
     Conv1d, Conv1dConfig, LayerNorm, LayerNormConfig, VarBuilder,
 };
 
-use crate::triton_kernels::{TritonKernels, triton_matmul, triton_rel_pos_fa2, empty_f16};
+use crate::triton_kernels::{TritonKernels, triton_matmul};
 use super::fast_conformer::{ConvSubsampling, FastConformerConfig, relative_positional_encoding};
 
 fn cdiv(a: usize, b: usize) -> usize {
@@ -185,7 +185,6 @@ impl TritonParakeetEncoder {
     pub fn new(
         cfg: FastConformerConfig,
         vb: VarBuilder<'_>,
-        kernel_dir: &std::path::Path,
     ) -> Result<Self> {
         let device = vb.device();
         let metal_device = match device {
@@ -195,7 +194,7 @@ impl TritonParakeetEncoder {
         let model_dtype = vb.dtype();
 
         println!("  Loading Triton kernel pipelines...");
-        let kernels = TritonKernels::load(&metal_device, kernel_dir)?;
+        let kernels = TritonKernels::load(&metal_device)?;
 
         let subsampling = ConvSubsampling::new(&cfg, vb.pp("subsampling"))?;
         let mut blocks = Vec::with_capacity(cfg.num_layers);
@@ -289,60 +288,7 @@ impl TritonParakeetEncoder {
 
         let scale = 1.0 / (hd as f64).sqrt();
 
-        let context = if let Some(fa2_pipe) = &self.kernels.rel_pos_fa2 {
-            // ── Fused FA2 path: precompute rel_bias in F16, then fused kernel ──
-
-            // Reshape Q to per-head [nh, T, hd] in F16 — shared by Q_u and Q_v
-            let q_heads_f16 = q.reshape((padded_t, nh, hd))?
-                .transpose(0, 1)?.to_dtype(DType::F16)?.contiguous()?;
-
-            // Compute relative position bias via 3D batched matmul (all in F16)
-            let bv_f16 = block.attn.bias_v.to_dtype(DType::F16)?.unsqueeze(1)?;
-            let q_v = q_heads_f16.broadcast_add(&bv_f16)?; // [nh, T, hd] F16
-            let k_rel_f16 = k_rel.reshape((pos_len, nh, hd))?
-                .transpose(0, 1)?.to_dtype(DType::F16)?.contiguous()?;
-            let mut attn_scores_r = q_v.matmul(
-                &k_rel_f16.transpose(1, 2)?
-            )?; // [nh, T, 2T-1] F16
-
-            // rel_shift (3D version) — views only except the cat with zeros
-            let (rh, rt, rp) = attn_scores_r.dims3()?;
-            let zeros = Tensor::zeros((rh, rt, 1), DType::F16, attn_scores_r.device())?;
-            attn_scores_r = Tensor::cat(&[zeros, attn_scores_r], 2)?;
-            attn_scores_r = attn_scores_r.reshape((rh, rp + 1, rt))?;
-            attn_scores_r = attn_scores_r.narrow(1, 1, rp)?;
-            attn_scores_r = attn_scores_r.reshape((rh, rt, rp))?;
-            let take = rp.min(padded_t);
-            let rel_bias = attn_scores_r.narrow(2, 0, take)?.contiguous()?;
-            // rel_bias: [nh, T, T] F16 contiguous (unscaled)
-
-            // Kernel applies (QK + bias) * scale internally
-            let scale_f = scale as f32;
-
-            // Q + bias_u for content scores (already F16)
-            let bu_f16 = block.attn.bias_u.to_dtype(DType::F16)?.unsqueeze(1)?;
-            let q_u_f16 = q_heads_f16.broadcast_add(&bu_f16)?.contiguous()?;
-
-            // K, V directly to [nh, T, hd] F16 (one copy each)
-            let k_f16 = k.reshape((padded_t, nh, hd))?
-                .transpose(0, 1)?.to_dtype(DType::F16)?.contiguous()?;
-            let v_f16 = v.reshape((padded_t, nh, hd))?
-                .transpose(0, 1)?.to_dtype(DType::F16)?.contiguous()?;
-
-            // Single multi-head dispatch
-            let out_f16 = empty_f16(&self.metal_device, (nh, padded_t, hd))?;
-            triton_rel_pos_fa2(
-                &self.metal_device, fa2_pipe,
-                &q_u_f16, &k_f16, &v_f16, &rel_bias, &out_f16,
-                nh, padded_t, hd, scale_f,
-            )?;
-
-            // Reshape back: [nh, padded_t, hd] -> [padded_t, d]
-            let out_reshaped = out_f16.transpose(0, 1)?
-                .reshape((padded_t, d))?.contiguous()?;
-            out_reshaped.to_dtype(self.model_dtype)?
-        } else {
-            // ── Candle fallback path ──
+        let context = {
             let q = q.reshape((1, padded_t, nh, hd))?.transpose(1, 2)?.contiguous()?;
             let k = k.reshape((1, padded_t, nh, hd))?.transpose(1, 2)?.contiguous()?;
             let v = v.reshape((1, padded_t, nh, hd))?.transpose(1, 2)?.contiguous()?;

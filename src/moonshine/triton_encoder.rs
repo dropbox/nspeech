@@ -117,7 +117,6 @@ impl TritonEncoder {
     pub fn new(
         cfg: &MoonshineConfig,
         vb: QVarBuilder,
-        kernel_dir: &std::path::Path,
         device: &Device,
     ) -> Result<Self> {
         // Use existing Metal device, or create one if model is on CPU
@@ -132,7 +131,7 @@ impl TritonEncoder {
         };
 
         println!("  Loading Triton kernel pipelines...");
-        let kernels = TritonKernels::load(&metal_device, kernel_dir)?;
+        let kernels = TritonKernels::load(&metal_device)?;
 
         let kv_dim = cfg.encoder_num_kv_heads * cfg.encoder_head_dim;
         let metal = &metal_candle_device;
