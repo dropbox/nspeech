@@ -19,7 +19,8 @@ use crate::triton_kernels::{
     enc_layernorm_std_f32in, enc_attention_decode, enc_attention_splitkv,
     enc_rope_qk_cache_fused, enc_kv_cache_append,
     enc_residual_add_layernorm,
-    enc_gemv_splitk, enc_gemv_qkv_splitk, enc_gemv_splitk_bias,
+    enc_gemv_splitk,
+    enc_gemv_qkv_splitk, enc_gemv_splitk_bias,
     enc_gemv_glu_splitk,
 };
 
@@ -474,7 +475,7 @@ impl TritonMetalDecoder {
     fn forward_one_token(
         &self, token_id: u32, cache: &mut MetalDecoderCache, timing: bool,
     ) -> Result<()> {
-        self.forward_one_token_inner(token_id, cache, timing, false)
+        self.forward_one_token_inner(token_id, cache, timing, std::env::var("PROFILE").is_ok())
     }
 
     /// Profile mode: separate command buffer per phase to get per-phase GPU timing.
@@ -765,25 +766,15 @@ impl TritonMetalDecoder {
         let mut generated = Vec::new();
 
         // First step with BOS
-        self.forward_one_token(self.bos_id, &mut cache, true)?;
-        let ta0 = std::time::Instant::now();
-        let mut next_token = self.argmax_logits(true)?;
-        let ta1 = std::time::Instant::now();
-        eprintln!("  [timing] argmax={:.2}ms", ta1.duration_since(ta0).as_secs_f64() * 1000.0);
+        self.forward_one_token(self.bos_id, &mut cache, false)?;
+        let mut next_token = self.argmax_logits(false)?;
         generated.push(next_token);
         if next_token == self.eos_id { return Ok(generated); }
 
-        eprint!("  [metal-dec] tokens: {}", next_token);
         let decode_start = std::time::Instant::now();
         for step in 0..max_tokens - 1 {
-            self.forward_one_token(next_token, &mut cache, step < 5)?;
-            let ta0 = std::time::Instant::now();
-            next_token = self.argmax_logits(step < 5)?;
-            if step < 5 {
-                eprintln!("  [timing] argmax={:.2}ms",
-                    ta0.elapsed().as_secs_f64() * 1000.0);
-            }
-            eprint!(" {}", next_token);
+            self.forward_one_token(next_token, &mut cache, false)?;
+            next_token = self.argmax_logits(false)?;
             generated.push(next_token);
             if next_token == self.eos_id { break; }
         }

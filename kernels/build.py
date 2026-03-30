@@ -85,6 +85,11 @@ def gen_ninja():
     for d in [apple, intel, hlsl]:
         d.mkdir(parents=True, exist_ok=True)
 
+    # Compiler source files — ninja rebuilds when these change
+    codegen_dir = TRITON_METAL / "backend" / "codegen"
+    compiler_deps = " ".join(str(p) for p in sorted(codegen_dir.glob("*.py")))
+    implicit = f"| {compiler_deps} {COMPILE_STEP}"
+
     w = []
     w.append("# Auto-generated — do not edit")
     w.append(f"python = {PYTHON}")
@@ -94,10 +99,16 @@ def gen_ninja():
     w.append("rule msl_intel\n  command = $python $step msl_intel $in $out\n  description = MSL(intel) $out")
     w.append("rule metallib_apple\n  command = xcrun metal -std=metal3.1 -O3 -ffast-math -w -o $out $in\n  description = METALLIB(apple) $out")
     w.append("rule metallib_intel\n  command = xcrun metal -std=macos-metal2.4 -mmacosx-version-min=14.0 -ffast-math -w -o $out $in\n  description = METALLIB(intel) $out")
+    w.append("rule air_emit\n  command = $python $step air_apple $in $out\n  description = AIR(emit) $out")
+    w.append("rule air_asm\n  command = xcrun metal-as -o $out $in\n  description = AIR(asm) $out")
+    w.append("rule air_link\n  command = xcrun metallib -o $out $in\n  description = AIR(link) $out")
     w.append("rule hlsl\n  command = $python $step hlsl $in $out\n  description = HLSL $out")
     w.append("")
 
-    apple_libs, intel_libs, hlsl_files = [], [], []
+    apple_libs, intel_libs, air_libs, hlsl_files = [], [], [], []
+
+    air_dir = OUT / "air"
+    air_dir.mkdir(parents=True, exist_ok=True)
 
     for cfg in METAL_KERNELS:
         name = cfg[0]
@@ -108,12 +119,20 @@ def gen_ninja():
         al = apple / f"{name}.metallib"
         im = intel / f"{name}.metal"
         il = intel / f"{name}.metallib"
-        w.append(f"build {am}: msl_apple {t}")
+        w.append(f"build {am}: msl_apple {t} {implicit}")
         w.append(f"build {al}: metallib_apple {am}")
-        w.append(f"build {im}: msl_intel {t}")
+        w.append(f"build {im}: msl_intel {t} {implicit}")
         w.append(f"build {il}: metallib_intel {im}")
         apple_libs.append(str(al))
         intel_libs.append(str(il))
+        # AIR path: .ttir -> .ll -> .air -> .metallib
+        a_ll = air_dir / f"{name}.ll"
+        a_air = air_dir / f"{name}.air"
+        a_lib = air_dir / f"{name}.metallib"
+        w.append(f"build {a_ll}: air_emit {t} {implicit}")
+        w.append(f"build {a_air}: air_asm {a_ll}")
+        w.append(f"build {a_lib}: air_link {a_air}")
+        air_libs.append(str(a_lib))
 
     hlsl_seen = set()
     for cfg in get_hlsl_kernels():
@@ -125,18 +144,19 @@ def gen_ninja():
         if not t.exists():
             continue
         h = hlsl / f"{name}.hlsl"
-        w.append(f"build {h}: hlsl {t}")
+        w.append(f"build {h}: hlsl {t} {implicit}")
         hlsl_files.append(str(h))
 
     w.append("")
     w.append(f"build apple: phony {' '.join(apple_libs)}")
     w.append(f"build intel: phony {' '.join(intel_libs)}")
+    w.append(f"build air: phony {' '.join(air_libs)}")
     w.append(f"build hlsl_all: phony {' '.join(hlsl_files)}")
-    w.append("default apple intel hlsl_all")
+    w.append("default apple intel air hlsl_all")
     w.append("")
 
     (OUT / "build.ninja").write_text("\n".join(w))
-    print(f"build.ninja: {len(apple_libs)} apple, {len(intel_libs)} intel, {len(hlsl_files)} hlsl")
+    print(f"build.ninja: {len(apple_libs)} apple, {len(intel_libs)} intel, {len(air_libs)} air, {len(hlsl_files)} hlsl")
 
 
 def run_ninja():

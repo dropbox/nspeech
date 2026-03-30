@@ -54,21 +54,52 @@ macro_rules! kernel_list {
 }
 
 // Embed pre-compiled .metallib binaries for the target architecture.
+// AIR path: TTGIR -> LLVM IR -> metal-as -> metallib (bypasses MSL)
 #[cfg(target_arch = "aarch64")]
 mod kernel_data {
-    macro_rules! embed_metallibs {
-        ($($name:literal),* $(,)?) => {
-            pub fn load_kernel(name: &str) -> Option<&'static [u8]> {
-                match name {
-                    $($name => Some(include_bytes!(concat!(
-                        "../kernels/out/apple/", $name, ".metallib"
-                    ))),)*
-                    _ => None,
-                }
-            }
+    // All MSL baseline — AIR selectively enabled only where proven faster
+    pub fn load_kernel(name: &str) -> Option<&'static [u8]> {
+        match name {
+            "matmul_fp16_64x64x32" => Some(include_bytes!("../kernels/out/apple/matmul_fp16_64x64x32.metallib")),
+            "matmul_fp16_128x128x32" => Some(include_bytes!("../kernels/out/apple/matmul_fp16_128x128x32.metallib")),
+            "matmul_bias_fp16_32x32x32" => Some(include_bytes!("../kernels/out/apple/matmul_bias_fp16_32x32x32.metallib")),
+            "matmul_bias_fp16_64x64x32" => Some(include_bytes!("../kernels/out/apple/matmul_bias_fp16_64x64x32.metallib")),
+            "matmul_bias_fp16_128x128x32" => Some(include_bytes!("../kernels/out/apple/matmul_bias_fp16_128x128x32.metallib")),
+            "matmul_bias_gelu_fp16_32x32x32" => Some(include_bytes!("../kernels/out/apple/matmul_bias_gelu_fp16_32x32x32.metallib")),
+            "matmul_bias_gelu_fp16_64x64x32" => Some(include_bytes!("../kernels/out/apple/matmul_bias_gelu_fp16_64x64x32.metallib")),
+            "matmul_bias_gelu_fp16_128x128x32" => Some(include_bytes!("../kernels/out/apple/matmul_bias_gelu_fp16_128x128x32.metallib")),
+            "layernorm_unit_offset_768" => Some(include_bytes!("../kernels/out/apple/layernorm_unit_offset_768.metallib")),
+            "layernorm_bare_768" => Some(include_bytes!("../kernels/out/apple/layernorm_bare_768.metallib")),
+            "layernorm_standard_f32in_640" => Some(include_bytes!("../kernels/out/apple/layernorm_standard_f32in_640.metallib")),
+            // AIR for flash attention (proven 1.85x faster in encoder)
+            "flash_attention_fwd_32x32x64" => Some(include_bytes!("../kernels/out/air/flash_attention_fwd_32x32x64.metallib")),
+            "attention_decode_splitkv_partial" => Some(include_bytes!("../kernels/out/apple/attention_decode_splitkv_partial.metallib")),
+            "attention_decode_splitkv_reduce" => Some(include_bytes!("../kernels/out/apple/attention_decode_splitkv_reduce.metallib")),
+            "attention_decode_1d_d80" => Some(include_bytes!("../kernels/out/apple/attention_decode_1d_d80.metallib")),
+            "residual_add_layernorm_fused" => Some(include_bytes!("../kernels/out/apple/residual_add_layernorm_fused.metallib")),
+            "residual_add_fp16" => Some(include_bytes!("../kernels/out/apple/residual_add_fp16.metallib")),
+            "residual_add_f32" => Some(include_bytes!("../kernels/out/apple/residual_add_f32.metallib")),
+            "convert_f32_to_f16" => Some(include_bytes!("../kernels/out/apple/convert_f32_to_f16.metallib")),
+            "gelu_fp16" => Some(include_bytes!("../kernels/out/apple/gelu_fp16.metallib")),
+            "bias_add_fp16" => Some(include_bytes!("../kernels/out/apple/bias_add_fp16.metallib")),
+            "gemv_f16w" => Some(include_bytes!("../kernels/out/apple/gemv_f16w.metallib")),
+            "gemv_bias_f16w" => Some(include_bytes!("../kernels/out/apple/gemv_bias_f16w.metallib")),
+            "rope_qk_cache_fused" => Some(include_bytes!("../kernels/out/apple/rope_qk_cache_fused.metallib")),
+            "kv_cache_append" => Some(include_bytes!("../kernels/out/apple/kv_cache_append.metallib")),
+            "glu_silu_fused" => Some(include_bytes!("../kernels/out/apple/glu_silu_fused.metallib")),
+            "gemv_bias_glu_fused" => Some(include_bytes!("../kernels/out/apple/gemv_bias_glu_fused.metallib")),
+            "gemv_resadd_ln_fused" => Some(include_bytes!("../kernels/out/apple/gemv_resadd_ln_fused.metallib")),
+            "gemv_splitk_partial" => Some(include_bytes!("../kernels/out/apple/gemv_splitk_partial.metallib")),
+            "gemv_splitk_bias_reduce" => Some(include_bytes!("../kernels/out/apple/gemv_splitk_bias_reduce.metallib")),
+            "gemv_splitk_reduce" => Some(include_bytes!("../kernels/out/apple/gemv_splitk_reduce.metallib")),
+            "gemv_splitk_reduce_resadd_ln" => Some(include_bytes!("../kernels/out/apple/gemv_splitk_reduce_resadd_ln.metallib")),
+            "gemv_qkv_splitk_partial" => Some(include_bytes!("../kernels/out/apple/gemv_qkv_splitk_partial.metallib")),
+            "gemv_qkv_splitk_reduce" => Some(include_bytes!("../kernels/out/apple/gemv_qkv_splitk_reduce.metallib")),
+            "gemv_glu_splitk_partial" => Some(include_bytes!("../kernels/out/apple/gemv_glu_splitk_partial.metallib")),
+            "gemv_glu_splitk_reduce" => Some(include_bytes!("../kernels/out/apple/gemv_glu_splitk_reduce.metallib")),
+            _ => None,
         }
     }
-    kernel_list!(embed_metallibs);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -92,10 +123,44 @@ fn cdiv(a: usize, b: usize) -> usize {
     (a + b - 1) / b
 }
 
-/// Clamp threadgroup size to pipeline's maximum (critical for Intel GPUs with < 1024 limit).
+/// Set dynamic threadgroup memory for AIR kernels.
+/// AIR kernels declare threadgroup memory as a function parameter (ptr addrspace(3)),
+/// unlike MSL which uses static `threadgroup` declarations. This must be called before
+/// dispatch for any AIR kernel that uses shared memory. Safe to call for MSL too (no-op).
+#[cfg(target_arch = "aarch64")]
+fn set_air_tg_mem(encoder: &candle_metal_kernels::metal::ComputeCommandEncoder, bytes: usize) {
+    if bytes > 0 {
+        encoder.set_threadgroup_memory_length(0, bytes);
+    }
+}
+
+/// Determine threadgroup size for dispatch.
+/// Clamps to the pipeline's max (critical for Intel GPUs with < 1024 limit).
 fn tg_size(pipeline: &ComputePipeline, requested: usize) -> MTLSize {
     let max = pipeline.max_total_threads_per_threadgroup();
     MTLSize { width: requested.min(max), height: 1, depth: 1 }
+}
+
+/// Threadgroup size for matmul kernels.
+/// On aarch64: 32x32 uses AIR (bs=128), larger tiles use MSL (simdgroup_matrix, 1024 threads).
+#[cfg(target_arch = "aarch64")]
+fn matmul_tg_size(pipeline: &ComputePipeline, block_m: usize, _block_n: usize) -> MTLSize {
+    if block_m <= 32 { tg_size(pipeline, 128) } else { tg_size(pipeline, 1024) }
+}
+#[cfg(not(target_arch = "aarch64"))]
+fn matmul_tg_size(pipeline: &ComputePipeline, _block_m: usize, _block_n: usize) -> MTLSize {
+    tg_size(pipeline, 1024)
+}
+
+/// AIR-aware threadgroup size for flash attention.
+#[cfg(target_arch = "aarch64")]
+fn fa_tg_size(pipeline: &ComputePipeline) -> MTLSize {
+    tg_size(pipeline, 128) // AIR FA uses 4 warps × 32 = 128
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn fa_tg_size(pipeline: &ComputePipeline) -> MTLSize {
+    tg_size(pipeline, 832) // MSL FA uses 832 threads
 }
 
 /// All compiled Triton kernel pipelines for the Moonshine encoder.
@@ -276,7 +341,9 @@ pub fn triton_matmul(
             height: cdiv(n, block_n),
             depth: 1,
         };
-        encoder.dispatch_thread_groups(grid, tg_size(pipeline, 1024));
+        #[cfg(target_arch = "aarch64")]
+        if block_m <= 32 { set_air_tg_mem(&encoder, 4096); }
+        encoder.dispatch_thread_groups(grid, matmul_tg_size(pipeline, block_m, block_n));
         Ok::<(), anyhow::Error>(())
     })?;
 
@@ -323,7 +390,9 @@ pub fn triton_matmul_bias(
             height: cdiv(n, block_n),
             depth: 1,
         };
-        encoder.dispatch_thread_groups(grid, tg_size(pipeline, 1024));
+        #[cfg(target_arch = "aarch64")]
+        if block_m <= 32 { set_air_tg_mem(&encoder, 4096); }
+        encoder.dispatch_thread_groups(grid, matmul_tg_size(pipeline, block_m, block_n));
         Ok::<(), anyhow::Error>(())
     })?;
 
@@ -370,7 +439,9 @@ pub fn triton_matmul_bias_gelu(
             height: cdiv(n, block_n),
             depth: 1,
         };
-        encoder.dispatch_thread_groups(grid, tg_size(pipeline, 1024));
+        #[cfg(target_arch = "aarch64")]
+        if block_m <= 32 { set_air_tg_mem(&encoder, 4096); }
+        encoder.dispatch_thread_groups(grid, matmul_tg_size(pipeline, block_m, block_n));
         Ok::<(), anyhow::Error>(())
     })?;
 
@@ -400,6 +471,8 @@ pub fn triton_layernorm_unit_offset(
         encoder.set_bytes(6, &(n_cols as i32));
 
         let grid = MTLSize { width: n_rows as usize, height: 1, depth: 1 };
+        #[cfg(target_arch = "aarch64")]
+        set_air_tg_mem(&encoder, 4096);
         encoder.dispatch_thread_groups(grid, tg_size(pipeline, n_cols));
         Ok::<(), anyhow::Error>(())
     })?;
@@ -435,6 +508,8 @@ pub fn triton_layernorm_bare(
                 encoder.set_bytes(5, &(n_cols as i32));
 
                 let grid = MTLSize { width: n_rows, height: 1, depth: 1 };
+                #[cfg(target_arch = "aarch64")]
+                set_air_tg_mem(&encoder, 4096);
                 encoder.dispatch_thread_groups(grid, tg_size(pipeline, n_cols));
             }
             _ => anyhow::bail!("Tensors must be on Metal device"),
@@ -580,12 +655,16 @@ pub fn triton_flash_attention(
         encoder.set_bytes(9, &window_left);
         encoder.set_bytes(10, &window_right);
 
+        // AIR kernels need dynamic threadgroup memory (MSL declares it statically)
+        #[cfg(target_arch = "aarch64")]
+        encoder.set_threadgroup_memory_length(0, 8192); // FA: 8KB shared memory
+
         let grid = MTLSize {
             width: cdiv(seq_len, 32),
             height: n_heads,
             depth: 1,
         };
-        encoder.dispatch_thread_groups(grid, tg_size(pipeline, 832));
+        encoder.dispatch_thread_groups(grid, fa_tg_size(pipeline));
         Ok::<(), anyhow::Error>(())
     })?;
 
@@ -755,6 +834,8 @@ pub fn triton_layernorm_std_f32in(
         encoder.set_bytes(4, &(n_cols as i32));
         encoder.set_bytes(5, &(n_cols as i32)); // stride_x
         encoder.set_bytes(6, &(n_cols as i32)); // stride_out
+        #[cfg(target_arch = "aarch64")]
+        set_air_tg_mem(&encoder, 4096); // layernorm uses 4KB shared memory
         encoder.dispatch_thread_groups(
             MTLSize { width: n_rows, height: 1, depth: 1 },
             tg_size(pipeline, 1024),
@@ -808,6 +889,8 @@ pub fn triton_attention_decode(
         encoder.set_bytes(8, &(stride_kv_head as i32));
         encoder.set_bytes(9, &(stride_kv_seq as i32));
         encoder.set_bytes(10, &(head_dim as i32));
+        #[cfg(target_arch = "aarch64")]
+        set_air_tg_mem(&encoder, 512); // attention decode uses 512B shared memory
         encoder.dispatch_thread_groups(
             MTLSize { width: n_q_heads, height: 1, depth: 1 },
             tg_size(pipeline, 128),
@@ -938,6 +1021,8 @@ pub fn triton_residual_add_layernorm(
             encoder.set_bytes(6, &(dim as i32));
             encoder.set_bytes(7, &(dim as i32)); // stride_in
             encoder.set_bytes(8, &(dim as i32)); // stride_out
+            #[cfg(target_arch = "aarch64")]
+            set_air_tg_mem(&encoder, 4096);
             encoder.dispatch_thread_groups(
                 MTLSize { width: n_rows, height: 1, depth: 1 },
                 tg_size(pipeline, 1024),
@@ -1010,6 +1095,8 @@ pub fn triton_gemv_resadd_ln(
             encoder.set_bytes(7, &(gemv_k as i32));
             encoder.set_bytes(8, &1i32);          // stride_wn = 1
             encoder.set_bytes(9, &(dim as i32));  // stride_wk = dim
+            #[cfg(target_arch = "aarch64")]
+            set_air_tg_mem(&encoder, 4096); // gemv_resadd_ln has fused layernorm
             encoder.dispatch_thread_groups(
                 MTLSize { width: 1, height: 1, depth: 1 },
                 tg_size(pipeline, 1024),
@@ -1082,6 +1169,8 @@ pub fn enc_layernorm_std_f32in(
         enc.set_bytes(4, &(n_cols as i32));
         enc.set_bytes(5, &(n_cols as i32));
         enc.set_bytes(6, &(n_cols as i32));
+        #[cfg(target_arch = "aarch64")]
+        set_air_tg_mem(enc, 4096);
         enc.dispatch_thread_groups(
             MTLSize { width: n_rows, height: 1, depth: 1 },
             tg_size(pipeline, 1024),
@@ -1109,6 +1198,8 @@ pub fn enc_attention_decode(
         enc.set_bytes(8, &(stride_kv_head as i32));
         enc.set_bytes(9, &(stride_kv_seq as i32));
         enc.set_bytes(10, &(head_dim as i32));
+        #[cfg(target_arch = "aarch64")]
+        set_air_tg_mem(enc, 512);
         enc.dispatch_thread_groups(
             MTLSize { width: n_q_heads, height: 1, depth: 1 },
             tg_size(pipeline, 128),
@@ -1466,6 +1557,8 @@ pub fn enc_gemv_splitk_resadd_ln(
             );
             // Phase 2: fused reduce + resadd + LN (1 threadgroup)
             enc.set_compute_pipeline_state(fused_pipeline);
+            #[cfg(target_arch = "aarch64")]
+            set_air_tg_mem(enc, 4096);
             enc.set_buffer(0, Some(m6.buffer()), off6);
             enc.set_buffer(1, Some(m2.buffer()), off2);
             enc.set_buffer(2, Some(m3.buffer()), off3);
@@ -1632,6 +1725,8 @@ pub fn enc_gemv_resadd_ln(
     match (&*s0, &*s1, &*s2, &*s3, &*s4, &*s5) {
         (Storage::Metal(m0), Storage::Metal(m1), Storage::Metal(m2), Storage::Metal(m3), Storage::Metal(m4), Storage::Metal(m5)) => {
             enc.set_compute_pipeline_state(pipeline);
+            #[cfg(target_arch = "aarch64")]
+            set_air_tg_mem(enc, 4096);
             enc.set_buffer(0, Some(m0.buffer()), off0);
             enc.set_buffer(1, Some(m1.buffer()), off1);
             enc.set_buffer(2, Some(m2.buffer()), off2);
