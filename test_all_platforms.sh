@@ -11,7 +11,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-EXAMPLE=bench_moonshine
+EXAMPLE=transcribe_moonshine
 WAV=dots.wav
 PASS=0
 FAIL=0
@@ -22,6 +22,8 @@ ok()     { PASS=$((PASS+1)); RESULTS+="  PASS  $1\n"; }
 fail()   { FAIL=$((FAIL+1)); RESULTS+="  FAIL  $1\n"; }
 
 # ── 1. Build all 3 targets ─────────────────────────────────────────────────
+
+ninja -C kernels/out
 
 header "Building for M2 Mac (aarch64-apple-darwin)"
 cargo build --release --features triton-metal --example $EXAMPLE 2>&1 \
