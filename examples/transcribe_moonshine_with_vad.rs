@@ -8,7 +8,6 @@
 ///   cargo run --example transcribe_moonshine_with_vad --release -- dots.wav
 ///   cargo run --example transcribe_moonshine_with_vad --release -- dots.wav assets
 ///   cargo run --example transcribe_moonshine_with_vad --release -- MLKDream_16k.wav
-///   PARAKEET_DEVICE=cpu cargo run --example transcribe_moonshine_with_vad --release -- audio.wav
 
 use anyhow::Result;
 use speech::moonshine::MoonshineModel;

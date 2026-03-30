@@ -604,28 +604,11 @@ impl Speech {
 
         let assets = PathBuf::from(assets);
 
-        // Get device
-        #[cfg(not(feature = "use-moonshine"))]
+        // Get device — auto-detects Metal on Apple Silicon, CPU elsewhere
         let device = match parakeet::get_device() {
             Ok(device) => device,
             Err(e) => {
                 warn!("Device could not be initialized: {}", e);
-                candle_core::Device::Cpu
-            }
-        };
-        #[cfg(feature = "use-moonshine")]
-        let device = {
-            // Moonshine uses the same device selection logic
-            if std::env::var("PARAKEET_DEVICE").as_deref() == Ok("cpu") {
-                info!("Using CPU (forced by PARAKEET_DEVICE=cpu)");
-                candle_core::Device::Cpu
-            } else {
-                #[cfg(target_os = "macos")]
-                match candle_core::Device::new_metal(0) {
-                    Ok(d) => { info!("Using Metal GPU acceleration"); d }
-                    Err(_) => { info!("Metal not available, using CPU"); candle_core::Device::Cpu }
-                }
-                #[cfg(not(target_os = "macos"))]
                 candle_core::Device::Cpu
             }
         };

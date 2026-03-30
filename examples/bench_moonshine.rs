@@ -6,11 +6,11 @@
 /// Usage:
 ///   cargo run --example bench_moonshine --release -- dots.wav
 ///   cargo run --example bench_moonshine --release -- dots.wav assets 10
-///   PARAKEET_DEVICE=cpu cargo run --example bench_moonshine --release -- dots.wav
 
 use anyhow::Result;
-use candle_core::{Device, Tensor};
+use candle_core::Tensor;
 use speech::moonshine::MoonshineModel;
+use speech::parakeet::get_device;
 use std::time::Instant;
 
 fn load_wav_samples(path: &str) -> Result<Vec<f32>> {
@@ -39,24 +39,6 @@ fn load_wav_samples(path: &str) -> Result<Vec<f32>> {
     Ok(samples)
 }
 
-fn get_device() -> Device {
-    if std::env::var("PARAKEET_DEVICE").as_deref() == Ok("cpu") {
-        println!("Device: CPU (forced by PARAKEET_DEVICE=cpu)");
-        return Device::Cpu;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        match Device::new_metal(0) {
-            Ok(d) => {
-                println!("Device: Metal GPU");
-                return d;
-            }
-            Err(_) => {}
-        }
-    }
-    println!("Device: CPU");
-    Device::Cpu
-}
 
 fn median(values: &mut Vec<f64>) -> f64 {
     values.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -107,7 +89,7 @@ fn main() -> Result<()> {
     );
 
     // Get device
-    let device = get_device();
+    let device = get_device()?;
 
     // Load model
     let t0 = Instant::now();

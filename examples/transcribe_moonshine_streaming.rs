@@ -11,7 +11,6 @@
 ///   cargo run --example transcribe_moonshine_streaming --release -- dots.wav
 ///   cargo run --example transcribe_moonshine_streaming --release -- dots.wav assets
 ///   cargo run --example transcribe_moonshine_streaming --release -- dots.wav assets --json out.json
-///   PARAKEET_DEVICE=cpu cargo run --example transcribe_moonshine_streaming --release -- audio.wav
 
 use anyhow::Result;
 use speech::moonshine::MoonshineModel;

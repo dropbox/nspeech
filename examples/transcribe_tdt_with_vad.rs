@@ -13,7 +13,6 @@
 /// Usage:
 ///   cargo run --example transcribe_tdt_with_vad --release -- dots.wav
 ///   cargo run --example transcribe_tdt_with_vad --release -- MLKDream_16k.wav
-///   PARAKEET_DEVICE=cpu cargo run --example transcribe_tdt_with_vad --release -- audio.wav
 
 use anyhow::Result;
 use speech::parakeet::{get_device, load_parakeet_tdt_from_gguf_mmap_local, TransducerModel};
@@ -365,8 +364,7 @@ fn main() -> Result<()> {
 
     // Get device
     let device = get_device()?;
-    println!("Device: {:?}", device);
-    println!("  (If you encounter errors, try: PARAKEET_DEVICE=cpu)\n");
+    println!("Device: {:?}\n", device);
 
     let assets = PathBuf::from("assets");
 

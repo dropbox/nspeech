@@ -6,7 +6,6 @@
 /// Usage:
 ///   cargo run --example mic_streaming --release
 ///   cargo run --example mic_streaming --release -- assets
-///   PARAKEET_DEVICE=cpu cargo run --example mic_streaming --release
 
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};

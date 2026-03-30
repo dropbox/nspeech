@@ -6,7 +6,6 @@
 /// Usage:
 ///   cargo run --example transcribe_moonshine --release -- dots.wav
 ///   cargo run --example transcribe_moonshine --release -- dots.wav assets
-///   PARAKEET_DEVICE=cpu cargo run --example transcribe_moonshine --release -- dots.wav
 
 use anyhow::Result;
 use speech::moonshine::MoonshineModel;
@@ -65,7 +64,7 @@ fn main() -> Result<()> {
     let transcribe_ms = t2.elapsed().as_millis();
 
     println!("Transcription: {}", text);
-    println!("\nTiming: {:.0}ms ({:.2}x realtime)",
+    println!("\nTiming: {:.0}ms RTF (real-time factor): {:.3}x)",
         transcribe_ms, (transcribe_ms as f64 / 1000.0) / duration_sec);
 
     Ok(())

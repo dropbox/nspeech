@@ -10,6 +10,7 @@
 
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
+use speech::parakeet::get_device;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -37,15 +38,6 @@ fn load_wav_samples(path: &str) -> Result<Vec<f32>> {
         ),
     };
     Ok(samples)
-}
-
-fn get_device() -> Result<Device> {
-    if let Some(device) = std::env::var_os("PARAKEET_DEVICE") {
-        if device == "cpu" {
-            return Ok(Device::Cpu);
-        }
-    }
-    Ok(Device::new_metal(0)?)
 }
 
 fn main() -> Result<()> {
@@ -145,12 +137,9 @@ fn main() -> Result<()> {
         println!("\n--- Triton Encoder ---");
         use speech::moonshine::triton_encoder::TritonEncoder;
 
-        let kernel_dir = speech::triton_kernels::default_kernel_dir();
-        println!("  Kernel dir: {}", kernel_dir.display());
-
         let t0 = Instant::now();
-        let triton_encoder = TritonEncoder::new(&cfg, vb.pp("model.encoder"), &kernel_dir, &device)?;
-        println!("  Load: {:.0}ms (incl. kernel compilation)", t0.elapsed().as_millis());
+        let triton_encoder = TritonEncoder::new(&cfg, vb.pp("model.encoder"), &device)?;
+        println!("  Load: {:.0}ms", t0.elapsed().as_millis());
 
         // Warmup
         let _ = triton_encoder.forward(&features)?;
