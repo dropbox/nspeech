@@ -358,7 +358,7 @@ impl TritonEncoder {
         let mut hidden = hidden_in.clone();
 
         let mut totals = std::collections::HashMap::<&str, f64>::new();
-        let mut sync = || -> Result<()> {
+        let sync = || -> Result<()> {
             dev.wait_until_completed()?;
             Ok(())
         };

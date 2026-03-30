@@ -9,7 +9,8 @@ use candle_core::{DType, MetalDevice, MetalStorage, Shape, Storage, Tensor};
 use candle_metal_kernels::metal::ComputePipeline;
 use objc2_metal::MTLSize;
 
-// List of all kernel names used by encoder and decoder.
+// List of all kernel names used by encoder and decoder (Intel x86_64 only).
+#[cfg(target_arch = "x86_64")]
 macro_rules! kernel_list {
     ($mac:ident) => {
         $mac!(

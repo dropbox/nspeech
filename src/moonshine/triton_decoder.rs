@@ -479,6 +479,7 @@ impl TritonMetalDecoder {
     }
 
     /// Profile mode: separate command buffer per phase to get per-phase GPU timing.
+    #[allow(dead_code)]
     fn forward_one_token_profile(
         &self, token_id: u32, cache: &mut MetalDecoderCache,
     ) -> Result<()> {
@@ -772,7 +773,7 @@ impl TritonMetalDecoder {
         if next_token == self.eos_id { return Ok(generated); }
 
         let decode_start = std::time::Instant::now();
-        for step in 0..max_tokens - 1 {
+        for _step in 0..max_tokens - 1 {
             self.forward_one_token(next_token, &mut cache, false)?;
             next_token = self.argmax_logits(false)?;
             generated.push(next_token);
