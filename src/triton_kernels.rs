@@ -1460,6 +1460,8 @@ pub fn load_kernel_pipeline(device: &MetalDevice, name: &str, func_name: &str) -
 /// Dispatch f32→f16 element-wise conversion on GPU.
 /// Reads `n_elements` f32 values from `src_buf` at `src_offset` bytes,
 /// writes f16 values to `dst`.
+/// Note: kernel BLOCK_SIZE=1024, each thread handles 1 element, so dispatch
+/// with 1024 threads per group (not num_warps*32=128).
 pub fn enc_convert_f32_to_f16(
     enc: &ComputeCommandEncoder, pipeline: &ComputePipeline,
     src_buf: &Buffer, src_offset: usize,
@@ -1470,6 +1472,6 @@ pub fn enc_convert_f32_to_f16(
     enc.set_buffer(1, Some(dst.buf()), dst.offset);
     enc.set_bytes(2, &(n_elements as i32));
     let grid = MTLSize { width: cdiv(n_elements, 1024), height: 1, depth: 1 };
-    enc.dispatch_thread_groups(grid, tg_size(pipeline, 128));
+    enc.dispatch_thread_groups(grid, tg_size(pipeline, 1024));
 }
 

@@ -2,20 +2,22 @@
 
 use std::cell::RefCell;
 use anyhow::Result;
-use candle_core::MetalDevice;
-use candle_metal_kernels::metal::ComputeCommandEncoder;
+use candle_core::{MetalDevice, Storage, Tensor};
+use candle_metal_kernels::metal::{ComputeCommandEncoder, ComputePipeline};
 
 use crate::triton_kernels::{
     GpuBuffer, TritonKernels,
     enc_matmul, enc_matmul_bias, enc_matmul_bias_gelu,
     enc_layernorm_bare, enc_layernorm_unit_offset,
     enc_gelu, enc_residual_add, enc_bias_add, enc_flash_attention,
+    enc_convert_f32_to_f16, load_kernel_pipeline,
 };
 use super::gpu_encoder::{EncoderBackend, FlashAttentionParams};
 
 pub struct MetalEncoderBackend {
     device: MetalDevice,
     kernels: TritonKernels,
+    convert_f32_to_f16: ComputePipeline,
     /// Active compute command encoder (set during begin_pass..end_pass).
     encoder: RefCell<Option<ComputeCommandEncoder>>,
 }
@@ -23,14 +25,21 @@ pub struct MetalEncoderBackend {
 impl MetalEncoderBackend {
     pub fn new(device: &MetalDevice) -> Result<Self> {
         let kernels = TritonKernels::load(device)?;
+        let convert_f32_to_f16 = load_kernel_pipeline(device, "convert_f32_to_f16", "convert_f32_to_f16")?;
         Ok(Self {
             device: device.clone(),
             kernels,
+            convert_f32_to_f16,
             encoder: RefCell::new(None),
         })
     }
 
     pub fn device(&self) -> &MetalDevice { &self.device }
+
+    /// Flush pending command buffers without waiting (for GPU pipeline overlap).
+    fn flush(&self) -> Result<()> {
+        self.device.flush().map_err(|e| anyhow::anyhow!("{e}"))
+    }
 
     /// Get the active command encoder (must be called between begin_pass..end_pass).
     fn enc(&self) -> std::cell::Ref<'_, ComputeCommandEncoder> {
@@ -193,5 +202,52 @@ impl EncoderBackend for MetalEncoderBackend {
     fn sync(&self) -> Result<()> {
         self.device.wait_until_completed()?;
         Ok(())
+    }
+
+    fn upload_input_gpu(&self, x: &Tensor, dst: &GpuBuffer,
+                         n: usize, padded_n: usize) -> Result<bool> {
+        // Only works for F32 tensors on Metal device
+        if x.dtype() != candle_core::DType::F32 {
+            return Ok(false);
+        }
+        if !matches!(x.device(), candle_core::Device::Metal(_)) {
+            return Ok(false);
+        }
+
+        // Ensure tensor is contiguous (may dispatch a Candle copy kernel)
+        let x = x.contiguous().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let (storage, layout) = x.storage_and_layout();
+        let metal_storage = match &*storage {
+            Storage::Metal(ms) => ms,
+            _ => return Ok(false),
+        };
+        let src_buf = metal_storage.buffer();
+        let src_offset = layout.start_offset() * 4; // f32 = 4 bytes
+
+        // Flush Candle's pending command buffers (frontend + contiguous copy).
+        // Metal's FIFO queue ordering guarantees these ops complete before
+        // our new command encoder starts reading the buffer.
+        self.flush()?;
+
+        // Zero padding region via CPU memset (shared memory buffer).
+        // FA reads all padded_seq rows, so padding must be zero.
+        if padded_n > n {
+            unsafe {
+                let ptr = dst.contents_ptr() as *mut u8;
+                std::ptr::write_bytes(ptr.add(n * 2), 0, (padded_n - n) * 2);
+            }
+        }
+
+        // Open a command pass and dispatch f32→f16 convert as first kernel.
+        // forward() skips begin_pass and dispatches directly into this encoder.
+        // Metal's hazard tracking ensures convert completes before subsequent
+        // reads from dst (same encoder = automatic barrier on buffer dependency).
+        *self.encoder.borrow_mut() = Some(self.device.command_encoder()
+            .map_err(|e| anyhow::anyhow!("{e}"))?);
+        enc_convert_f32_to_f16(&self.enc(), &self.convert_f32_to_f16,
+            src_buf, src_offset, dst, n);
+
+        Ok(true)
     }
 }

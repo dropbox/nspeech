@@ -96,6 +96,15 @@ pub trait EncoderBackend: Sized {
 
     /// Sync GPU for profiling (Metal: wait_until_completed, D3D12: no-op).
     fn sync(&self) -> Result<()> { Ok(()) }
+
+    /// Try to upload input directly from a GPU tensor, avoiding CPU roundtrip.
+    /// The tensor is expected to be contiguous F32 on the GPU device.
+    /// Converts f32→f16 on GPU and writes to `dst` (with zero-padding to `padded_n`).
+    /// Returns `Ok(true)` if handled, `Ok(false)` to fall back to CPU path.
+    fn upload_input_gpu(&self, _x: &Tensor, _dst: &Self::Buf,
+                         _n: usize, _padded_n: usize) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 // ── Parameter structs ──
@@ -314,7 +323,7 @@ impl<B: EncoderBackend> GpuEncoder<B> {
         })
     }
 
-    /// Forward pass. Input: [1, seq_len, dim] F32 on CPU.
+    /// Forward pass. Input: [1, seq_len, dim] F32 (CPU or Metal).
     /// Output: [1, seq_len, dim] F32 on CPU.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (batch, seq_len, dim) = x.dims3()?;
@@ -329,16 +338,27 @@ impl<B: EncoderBackend> GpuEncoder<B> {
         let s = &self.d.scratch;
         let b = &self.backend;
 
-        // Upload input to residual_a
-        self.upload_input(x, seq_len, padded_seq, dim, &s.residual_a)?;
+        // Try GPU-side upload (avoids CPU roundtrip on Metal).
+        // Dispatches f32→f16 convert kernel directly from the tensor's Metal buffer.
+        let n = seq_len * dim;
+        let padded_n = padded_seq * dim;
+        let gpu_uploaded = b.upload_input_gpu(x, &s.residual_a, n, padded_n)?;
+
+        if !gpu_uploaded {
+            // Fallback: CPU-side upload
+            self.upload_input(x, seq_len, padded_seq, dim, &s.residual_a)?;
+        }
 
         // Profiling mode: per-op timing (profile manages its own passes)
         if std::env::var("TRITON_ENCODER_PROFILE").is_ok() {
             return self.forward_profile(x, seq_len, padded_seq);
         }
 
-        // Batch all GPU dispatches into one command pass
-        b.begin_pass()?;
+        // Batch all GPU dispatches into one command pass.
+        // If gpu_uploaded, the pass is already open with the convert kernel dispatched.
+        if !gpu_uploaded {
+            b.begin_pass()?;
+        }
 
         let (mut res_in, mut res_out) = (&s.residual_a, &s.residual_b);
 
