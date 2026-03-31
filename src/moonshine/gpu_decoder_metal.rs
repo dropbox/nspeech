@@ -64,20 +64,20 @@ impl DecoderBackend for MetalBackend {
     type Buf = GpuBuffer;
 
     fn alloc_f16(&self, count: usize) -> Result<GpuBuffer> {
-        GpuBuffer::alloc_f16(&self.device, count)
+        Ok(GpuBuffer::alloc_f16(&self.device, count)?)
     }
 
     fn alloc_f32(&self, count: usize) -> Result<GpuBuffer> {
-        GpuBuffer::alloc_f32(&self.device, count)
+        Ok(GpuBuffer::alloc_f32(&self.device, count)?)
     }
 
     fn upload_f16_weight(&self, data_f32: &[f32]) -> Result<GpuBuffer> {
         let f16_data: Vec<half::f16> = data_f32.iter().map(|&v| half::f16::from_f32(v)).collect();
-        GpuBuffer::from_f16_data(&self.device, &f16_data)
+        Ok(GpuBuffer::from_f16_data(&self.device, &f16_data)?)
     }
 
     fn upload_f32_data(&self, data: &[f32]) -> Result<GpuBuffer> {
-        GpuBuffer::from_f32_data(&self.device, data)
+        Ok(GpuBuffer::from_f32_data(&self.device, data)?)
     }
 
     fn upload_cross_kv_weight(&self, data_f32: &[f32]) -> Result<GpuBuffer> {

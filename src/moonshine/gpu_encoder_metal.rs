@@ -72,21 +72,21 @@ impl EncoderBackend for MetalEncoderBackend {
     type Buf = GpuBuffer;
 
     fn alloc_activation(&self, count: usize) -> Result<GpuBuffer> {
-        GpuBuffer::alloc_f16(&self.device, count)
+        Ok(GpuBuffer::alloc_f16(&self.device, count)?)
     }
 
     fn alloc_residual(&self, count: usize) -> Result<GpuBuffer> {
-        GpuBuffer::alloc_f16(&self.device, count)
+        Ok(GpuBuffer::alloc_f16(&self.device, count)?)
     }
 
     fn upload_matmul_weight(&self, data_f32: &[f32]) -> Result<GpuBuffer> {
         let f16_data: Vec<half::f16> = data_f32.iter().map(|&v| half::f16::from_f32(v)).collect();
-        GpuBuffer::from_f16_data(&self.device, &f16_data)
+        Ok(GpuBuffer::from_f16_data(&self.device, &f16_data)?)
     }
 
     fn upload_f16_1d(&self, data_f32: &[f32]) -> Result<GpuBuffer> {
         let f16_data: Vec<half::f16> = data_f32.iter().map(|&v| half::f16::from_f32(v)).collect();
-        GpuBuffer::from_f16_data(&self.device, &f16_data)
+        Ok(GpuBuffer::from_f16_data(&self.device, &f16_data)?)
     }
 
     fn upload_input_f16(&self, dst: &GpuBuffer, data: &[half::f16]) -> Result<()> {
