@@ -13,6 +13,23 @@ import sys
 import time
 from pathlib import Path
 
+
+def write_if_changed(path: Path, content: str) -> bool:
+    """Write content to path only if it differs from existing content.
+
+    Returns True if the file was written (content changed or new file).
+    Avoids touching mtime when content is unchanged, so ninja/cargo
+    won't trigger unnecessary downstream rebuilds.
+    """
+    if path.exists():
+        try:
+            if path.read_text() == content:
+                return False
+        except Exception:
+            pass
+    path.write_text(content)
+    return True
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 OUT = SCRIPT_DIR / "out"
 TRITON = SCRIPT_DIR.parent.parent / "triton"
@@ -55,8 +72,8 @@ def gen_ttir():
         try:
             r = compile_kernel(fn=fn, signature=sig, num_warps=nw, grid=grid)
             ir = r.ttgir_text or r.ttir_text
-            (ttir_dir / f"{name}.ttir").write_text(ir)
-            (ttir_dir / f"{name}.json").write_text(json.dumps({
+            write_if_changed(ttir_dir / f"{name}.ttir", ir)
+            write_if_changed(ttir_dir / f"{name}.json", json.dumps({
                 "kernel_name": r.kernel_name,
                 "params": r.params,
                 "constants": r.constants,
@@ -94,15 +111,15 @@ def gen_ninja():
     w.append(f"python = {PYTHON}")
     w.append(f"step = {COMPILE_STEP}")
     w.append("")
-    w.append("rule msl_apple\n  command = $python $step msl_apple $in $out\n  description = MSL(apple) $out")
-    w.append("rule msl_intel\n  command = $python $step msl_intel $in $out\n  description = MSL(intel) $out")
+    w.append("rule msl_apple\n  command = $python $step msl_apple $in $out\n  restat = 1\n  description = MSL(apple) $out")
+    w.append("rule msl_intel\n  command = $python $step msl_intel $in $out\n  restat = 1\n  description = MSL(intel) $out")
     w.append("rule metallib_apple\n  command = xcrun metal -std=metal3.1 -O3 -ffast-math -w -o $out $in\n  description = METALLIB(apple) $out")
     w.append("rule metallib_intel\n  command = xcrun metal -std=macos-metal2.4 -mmacosx-version-min=14.0 -O3 -ffast-math -w -o $out $in\n  description = METALLIB(intel) $out")
     # AIR disabled for now — re-enable when emitter covers all ops
-    # w.append("rule air_emit\n  command = $python $step air_apple $in $out\n  description = AIR(emit) $out")
+    # w.append("rule air_emit\n  command = $python $step air_apple $in $out\n  restat = 1\n  description = AIR(emit) $out")
     # w.append("rule air_asm\n  command = xcrun metal-as -o $out $in\n  description = AIR(asm) $out")
     # w.append("rule air_link\n  command = xcrun metallib -o $out $in\n  description = AIR(link) $out")
-    w.append("rule hlsl\n  command = $python $step hlsl $in $out\n  description = HLSL $out")
+    w.append("rule hlsl\n  command = $python $step hlsl $in $out\n  restat = 1\n  description = HLSL $out")
 
     w.append("")
 
@@ -145,7 +162,7 @@ def gen_ninja():
     w.append(f"default apple intel hlsl_all")
     w.append("")
 
-    (OUT / "build.ninja").write_text("\n".join(w))
+    write_if_changed(OUT / "build.ninja", "\n".join(w))
     print(f"build.ninja: {len(apple_libs)} apple, {len(intel_libs)} intel, {len(hlsl_files)} hlsl")
 
 

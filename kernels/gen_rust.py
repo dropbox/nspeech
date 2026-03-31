@@ -16,6 +16,18 @@ OUT = SCRIPT_DIR / "out"
 GEN_DIR = OUT / "generated"
 
 
+def write_if_changed(path: Path, content: str) -> bool:
+    """Write only if content differs, preserving mtime for cargo."""
+    if path.exists():
+        try:
+            if path.read_text() == content:
+                return False
+        except Exception:
+            pass
+    path.write_text(content)
+    return True
+
+
 def load_metadata():
     """Import KERNEL_METADATA and kernel lists from kernel_configs.py."""
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -338,10 +350,10 @@ def main():
     GEN_DIR.mkdir(parents=True, exist_ok=True)
 
     metal_code = gen_metal(metadata, metal_kernels)
-    (GEN_DIR / "triton_metal_gen.rs").write_text(metal_code)
+    write_if_changed(GEN_DIR / "triton_metal_gen.rs", metal_code)
 
     d3d12_code = gen_d3d12(metadata, metal_kernels, hlsl_extra)
-    (GEN_DIR / "triton_d3d12_gen.rs").write_text(d3d12_code)
+    write_if_changed(GEN_DIR / "triton_d3d12_gen.rs", d3d12_code)
 
     # Count
     metal_enc = sum(1 for m in metadata.values() if m.get("group") == "encoder" and not m.get("d3d12_only"))
