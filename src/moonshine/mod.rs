@@ -24,12 +24,14 @@ pub mod frontend;
 pub mod model;
 #[cfg(feature = "triton-metal")]
 pub mod triton_encoder;
-#[cfg(feature = "triton-metal")]
-pub mod triton_decoder;
 #[cfg(feature = "triton-d3d12")]
 pub mod triton_d3d12_encoder;
+#[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
+pub mod gpu_decoder;
+#[cfg(feature = "triton-metal")]
+pub mod gpu_decoder_metal;
 #[cfg(feature = "triton-d3d12")]
-pub mod triton_d3d12_decoder;
+pub mod gpu_decoder_d3d12;
 
 pub use config::MoonshineConfig;
 pub use model::MoonshineModel;

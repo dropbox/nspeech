@@ -38,9 +38,13 @@ use super::encoder::MoonshineEncoder;
 use super::frontend::MoonshineFrontend;
 // GPU backend type aliases — unify Metal and D3D12 behind common names
 #[cfg(feature = "triton-metal")]
-use super::{triton_encoder::TritonEncoder as GpuEnc, triton_decoder::TritonMetalDecoder as GpuDec};
+use super::triton_encoder::TritonEncoder as GpuEnc;
+#[cfg(feature = "triton-metal")]
+type GpuDec = super::gpu_decoder::GpuDecoder<super::gpu_decoder_metal::MetalBackend>;
 #[cfg(feature = "triton-d3d12")]
-use super::{triton_d3d12_encoder::TritonD3D12Encoder as GpuEnc, triton_d3d12_decoder::TritonD3D12Decoder as GpuDec};
+use super::triton_d3d12_encoder::TritonD3D12Encoder as GpuEnc;
+#[cfg(feature = "triton-d3d12")]
+type GpuDec = super::gpu_decoder::GpuDecoder<super::gpu_decoder_d3d12::D3D12Backend>;
 
 /// Dispatch GPU encoder (Metal needs F32 conversion, D3D12 returns directly).
 #[cfg(feature = "triton-metal")]
@@ -193,11 +197,24 @@ impl MoonshineModel {
                 }
             };
             // Get the Metal device from the encoder, or create one
-            let metal_dev = enc.as_ref()
+            let metal_dev: Option<candle_core::MetalDevice> = enc.as_ref()
                 .map(|e| e.metal_device().clone())
-                .or_else(|| Device::new_metal(0).ok());
+                .or_else(|| Device::new_metal(0).ok())
+                .and_then(|dev| match dev {
+                    Device::Metal(md) => Some(md),
+                    _ => None,
+                });
             let dec = metal_dev.as_ref().and_then(|md| {
-                match GpuDec::new(&cfg, vb.pp("model.decoder"), vb.pp("proj_out"), md) {
+                use super::gpu_decoder_metal::MetalBackend;
+                let backend = match MetalBackend::new(md,
+                    cfg.decoder_num_heads, cfg.decoder_intermediate_size) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        println!("  Metal backend unavailable: {e}");
+                        return None;
+                    }
+                };
+                match GpuDec::new(backend, &cfg, vb.pp("model.decoder"), vb.pp("proj_out")) {
                     Ok(dec) => {
                         println!("  Triton Metal decoder loaded");
                         Some(dec)
@@ -227,14 +244,25 @@ impl MoonshineModel {
                             None
                         }
                     };
-                    let dec = match GpuDec::new(&cfg, vb.pp("model.decoder"), vb.pp("proj_out"), &gpu) {
-                        Ok(dec) => {
-                            println!("  Triton D3D12 decoder loaded");
-                            Some(dec)
-                        }
-                        Err(e) => {
-                            println!("  Triton D3D12 decoder unavailable: {e}");
-                            None
+                    let dec = {
+                        use super::gpu_decoder_d3d12::D3D12Backend;
+                        match D3D12Backend::new(&gpu, cfg.vocab_size, cfg.decoder_dim) {
+                            Ok(backend) => {
+                                match GpuDec::new(backend, &cfg, vb.pp("model.decoder"), vb.pp("proj_out")) {
+                                    Ok(dec) => {
+                                        println!("  Triton D3D12 decoder loaded");
+                                        Some(dec)
+                                    }
+                                    Err(e) => {
+                                        println!("  Triton D3D12 decoder unavailable: {e}");
+                                        None
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                println!("  D3D12 backend unavailable: {e}");
+                                None
+                            }
                         }
                     };
                     (enc, dec)
