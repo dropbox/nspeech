@@ -67,6 +67,12 @@ pub trait EncoderBackend: Sized {
     /// Matmul + bias: out_f16 = a_f16 @ b_weight + bias_f16.
     fn matmul_bias(&self, a: &Self::Buf, b: &Self::Buf, bias: &Self::Buf,
                     out: &Self::Buf, m: usize, n: usize, k: usize);
+    /// Matmul + bias + GELU: out = GELU(a @ b + bias). Default: matmul_bias + gelu.
+    fn matmul_bias_gelu(&self, a: &Self::Buf, b: &Self::Buf, bias: &Self::Buf,
+                         out: &Self::Buf, m: usize, n: usize, k: usize) {
+        self.matmul_bias(a, b, bias, out, m, n, k);
+        self.gelu(out, out, m * n);
+    }
     /// In-place GELU: x[i] = gelu(x[i]).
     fn gelu(&self, x: &Self::Buf, out: &Self::Buf, n_elem: usize);
     /// Bias add: out[i] = x[i] + bias[i % n_cols].
@@ -78,6 +84,15 @@ pub trait EncoderBackend: Sized {
     /// Flash Attention 2 with sliding window.
     fn flash_attention(&self, q: &Self::Buf, k: &Self::Buf, v: &Self::Buf,
                         out: &Self::Buf, p: &FlashAttentionParams);
+
+    /// Whether this backend supports fused QKV via buf_slice.
+    fn supports_buf_slice(&self) -> bool { false }
+    /// Create an offset view into a buffer (for fused QKV slicing).
+    /// `byte_offset` is the offset from the start of `buf`.
+    /// Only called if `supports_buf_slice()` returns true.
+    fn buf_slice(&self, _buf: &Self::Buf, _byte_offset: usize) -> Self::Buf {
+        unimplemented!("buf_slice not supported on this backend")
+    }
 
     /// Sync GPU for profiling (Metal: wait_until_completed, D3D12: no-op).
     fn sync(&self) -> Result<()> { Ok(()) }
@@ -109,6 +124,7 @@ pub struct EncoderAttentionW<B> {
     pub q_proj: B,  // baked: (1+gamma) * W
     pub k_proj: B,
     pub v_proj: B,
+    pub qkv_proj: Option<B>,  // fused [dim, 3*kv_dim] weight (if backend supports buf_slice)
     pub o_proj: B,
     pub num_heads: usize,
     pub head_dim: usize,
@@ -133,6 +149,7 @@ struct EncoderScratch<B> {
     q: B,           // [padded_seq, kv_dim] f16
     k: B,           // [padded_seq, kv_dim] f16
     v: B,           // [padded_seq, kv_dim] f16
+    qkv: Option<B>, // [padded_seq, 3*kv_dim] f16 — fused QKV output
     attn_out: B,    // [padded_seq, kv_dim] f16
     attn_proj: B,   // [padded_seq, encoder_dim] f16
     fc1: B,         // [padded_seq, intermediate_size] f16
@@ -203,12 +220,17 @@ impl<B: EncoderBackend> GpuEncoder<B> {
         let block_m = 128; // max tile size for padding
         let padded_seq = cdiv(max_seq_len, block_m) * block_m;
 
+        let fuse_qkv = backend.supports_buf_slice();
+
         // Pre-allocate scratch buffers
         let scratch = EncoderScratch {
             normed: backend.alloc_activation(padded_seq * dim)?,
             q: backend.alloc_activation(padded_seq * kv_dim)?,
             k: backend.alloc_activation(padded_seq * kv_dim)?,
             v: backend.alloc_activation(padded_seq * kv_dim)?,
+            qkv: if fuse_qkv {
+                Some(backend.alloc_activation(padded_seq * 3 * kv_dim)?)
+            } else { None },
             attn_out: backend.alloc_activation(padded_seq * kv_dim)?,
             attn_proj: backend.alloc_activation(padded_seq * dim)?,
             fc1: backend.alloc_activation(padded_seq * intermediate)?,
@@ -235,10 +257,22 @@ impl<B: EncoderBackend> GpuEncoder<B> {
             bake_gamma(&mut w_k, &input_ln_gamma, dim, kv_dim);
             bake_gamma(&mut w_v, &input_ln_gamma, dim, kv_dim);
 
+            // Fused QKV weight: [dim, 3*kv_dim] row-major (q|k|v interleaved per row)
+            let qkv_proj = if fuse_qkv {
+                let mut w_qkv = Vec::with_capacity(dim * 3 * kv_dim);
+                for row in 0..dim {
+                    w_qkv.extend_from_slice(&w_q[row * kv_dim..(row + 1) * kv_dim]);
+                    w_qkv.extend_from_slice(&w_k[row * kv_dim..(row + 1) * kv_dim]);
+                    w_qkv.extend_from_slice(&w_v[row * kv_dim..(row + 1) * kv_dim]);
+                }
+                Some(backend.upload_matmul_weight(&w_qkv)?)
+            } else { None };
+
             let self_attn = EncoderAttentionW {
                 q_proj: backend.upload_matmul_weight(&w_q)?,
                 k_proj: backend.upload_matmul_weight(&w_k)?,
                 v_proj: backend.upload_matmul_weight(&w_v)?,
+                qkv_proj,
                 o_proj: backend.upload_matmul_weight(&dequant_2d((dim, kv_dim), &avb.pp("o_proj"))?)?,
                 num_heads: cfg.encoder_num_heads,
                 head_dim: cfg.encoder_head_dim,
@@ -298,6 +332,11 @@ impl<B: EncoderBackend> GpuEncoder<B> {
         // Upload input to residual_a
         self.upload_input(x, seq_len, padded_seq, dim, &s.residual_a)?;
 
+        // Profiling mode: per-op timing (before begin_pass — profile manages its own passes)
+        if std::env::var("TRITON_ENCODER_PROFILE").is_ok() {
+            return self.forward_profile(x, seq_len, padded_seq);
+        }
+
         // Batch all GPU dispatches into one command pass
         b.begin_pass()?;
 
@@ -310,25 +349,44 @@ impl<B: EncoderBackend> GpuEncoder<B> {
             // Pre-norm (bare LN — gamma baked into QKV weights)
             b.layernorm_bare(res_in, &s.normed, padded_seq, dim);
 
-            // Q/K/V projections (3 separate matmuls with baked weights)
-            b.matmul(&s.normed, &layer.self_attn.q_proj, &s.q, padded_seq, kv_dim, dim);
-            b.matmul(&s.normed, &layer.self_attn.k_proj, &s.k, padded_seq, kv_dim, dim);
-            b.matmul(&s.normed, &layer.self_attn.v_proj, &s.v, padded_seq, kv_dim, dim);
-
-            // Flash Attention 2
+            // Q/K/V projections
             let [win_left, win_right] = self.d.sliding_windows[i];
-            b.flash_attention(&s.q, &s.k, &s.v, &s.attn_out, &FlashAttentionParams {
-                n_heads: layer.self_attn.num_heads,
-                padded_seq,
-                seq_len,
-                head_dim: layer.self_attn.head_dim,
-                stride_h: layer.self_attn.head_dim as i32,
-                stride_m: kv_dim as i32,
-                stride_o: kv_dim as i32,
-                sm_scale: layer.self_attn.scale,
-                window_left: win_left as i32,
-                window_right: win_right as i32,
-            });
+            if let (Some(qkv_w), Some(qkv_buf)) = (&layer.self_attn.qkv_proj, &s.qkv) {
+                // Fused path: single matmul → [T, 3*kv_dim], slice into Q/K/V
+                b.matmul(&s.normed, qkv_w, qkv_buf, padded_seq, 3 * kv_dim, dim);
+                let q = b.buf_slice(qkv_buf, 0);
+                let k = b.buf_slice(qkv_buf, kv_dim * 2); // f16 = 2 bytes
+                let v = b.buf_slice(qkv_buf, 2 * kv_dim * 2);
+                b.flash_attention(&q, &k, &v, &s.attn_out, &FlashAttentionParams {
+                    n_heads: layer.self_attn.num_heads,
+                    padded_seq,
+                    seq_len,
+                    head_dim: layer.self_attn.head_dim,
+                    stride_h: layer.self_attn.head_dim as i32,
+                    stride_m: (3 * kv_dim) as i32,
+                    stride_o: kv_dim as i32,
+                    sm_scale: layer.self_attn.scale,
+                    window_left: win_left as i32,
+                    window_right: win_right as i32,
+                });
+            } else {
+                // Separate path: 3 matmuls
+                b.matmul(&s.normed, &layer.self_attn.q_proj, &s.q, padded_seq, kv_dim, dim);
+                b.matmul(&s.normed, &layer.self_attn.k_proj, &s.k, padded_seq, kv_dim, dim);
+                b.matmul(&s.normed, &layer.self_attn.v_proj, &s.v, padded_seq, kv_dim, dim);
+                b.flash_attention(&s.q, &s.k, &s.v, &s.attn_out, &FlashAttentionParams {
+                    n_heads: layer.self_attn.num_heads,
+                    padded_seq,
+                    seq_len,
+                    head_dim: layer.self_attn.head_dim,
+                    stride_h: layer.self_attn.head_dim as i32,
+                    stride_m: kv_dim as i32,
+                    stride_o: kv_dim as i32,
+                    sm_scale: layer.self_attn.scale,
+                    window_left: win_left as i32,
+                    window_right: win_right as i32,
+                });
+            }
 
             // O projection
             b.matmul(&s.attn_out, &layer.self_attn.o_proj, &s.attn_proj, padded_seq, dim, kv_dim);
@@ -340,22 +398,16 @@ impl<B: EncoderBackend> GpuEncoder<B> {
             // Post-norm (bare LN — gamma baked into fc1 weights)
             b.layernorm_bare(res_in, &s.normed, padded_seq, dim);
 
-            // FFN: matmul_bias + gelu + matmul_bias
+            // FFN: fused matmul_bias_gelu + matmul_bias
             let intermediate = self.d.intermediate_size;
-            b.matmul_bias(&s.normed, &layer.mlp.fc1.weight, &layer.mlp.fc1.bias,
-                           &s.fc1, padded_seq, intermediate, dim);
-            b.gelu(&s.fc1, &s.fc1, padded_seq * intermediate);
+            b.matmul_bias_gelu(&s.normed, &layer.mlp.fc1.weight, &layer.mlp.fc1.bias,
+                                &s.fc1, padded_seq, intermediate, dim);
             b.matmul_bias(&s.fc1, &layer.mlp.fc2.weight, &layer.mlp.fc2.bias,
                            &s.fc2, padded_seq, dim, intermediate);
 
             // Residual add
             b.residual_add(&s.fc2, res_in, res_out, n_elem);
             std::mem::swap(&mut res_in, &mut res_out);
-        }
-
-        // Profiling mode: run separately with per-op timing
-        if std::env::var("TRITON_ENCODER_PROFILE").is_ok() {
-            return self.forward_profile(x, seq_len, padded_seq);
         }
 
         // Final layernorm (with gamma — not baked)
@@ -403,6 +455,7 @@ impl<B: EncoderBackend> GpuEncoder<B> {
     }
 
     /// Profiling forward pass — measures each operation individually.
+    /// Each timed section gets its own begin_pass/end_pass for accurate timing.
     fn forward_profile(&self, x: &Tensor, seq_len: usize, padded_seq: usize) -> Result<Tensor> {
         use std::time::Instant;
 
@@ -410,90 +463,78 @@ impl<B: EncoderBackend> GpuEncoder<B> {
         let s = &self.d.scratch;
         let b = &self.backend;
 
-        // Re-upload input (forward already consumed it)
-        self.upload_input(x, seq_len, padded_seq, dim, &s.residual_a)?;
-
         let (mut res_in, mut res_out) = (&s.residual_a, &s.residual_b);
         let mut totals = std::collections::HashMap::<&str, f64>::new();
+
+        macro_rules! timed {
+            ($name:expr, $body:expr) => {{
+                b.begin_pass()?;
+                let t = Instant::now();
+                $body;
+                b.end_pass()?;
+                *totals.entry($name).or_default() += t.elapsed().as_secs_f64();
+            }};
+        }
 
         for (i, layer) in self.d.layers.iter().enumerate() {
             let kv_dim = layer.self_attn.kv_dim;
             let n_elem = padded_seq * dim;
             let [win_left, win_right] = self.d.sliding_windows[i];
 
-            let t = Instant::now();
-            b.layernorm_bare(res_in, &s.normed, padded_seq, dim);
-            b.sync()?;
-            *totals.entry("layernorm_bare").or_default() += t.elapsed().as_secs_f64();
+            timed!("layernorm_bare", b.layernorm_bare(res_in, &s.normed, padded_seq, dim));
 
-            let t = Instant::now();
-            b.matmul(&s.normed, &layer.self_attn.q_proj, &s.q, padded_seq, kv_dim, dim);
-            b.matmul(&s.normed, &layer.self_attn.k_proj, &s.k, padded_seq, kv_dim, dim);
-            b.matmul(&s.normed, &layer.self_attn.v_proj, &s.v, padded_seq, kv_dim, dim);
-            b.sync()?;
-            *totals.entry("qkv_matmul").or_default() += t.elapsed().as_secs_f64();
+            if let (Some(qkv_w), Some(qkv_buf)) = (&layer.self_attn.qkv_proj, &s.qkv) {
+                timed!("qkv_matmul", b.matmul(&s.normed, qkv_w, qkv_buf, padded_seq, 3 * kv_dim, dim));
+                let q = b.buf_slice(qkv_buf, 0);
+                let k = b.buf_slice(qkv_buf, kv_dim * 2);
+                let v = b.buf_slice(qkv_buf, 2 * kv_dim * 2);
+                timed!("flash_attn", b.flash_attention(&q, &k, &v, &s.attn_out, &FlashAttentionParams {
+                    n_heads: layer.self_attn.num_heads,
+                    padded_seq, seq_len,
+                    head_dim: layer.self_attn.head_dim,
+                    stride_h: layer.self_attn.head_dim as i32,
+                    stride_m: (3 * kv_dim) as i32,
+                    stride_o: kv_dim as i32,
+                    sm_scale: layer.self_attn.scale,
+                    window_left: win_left as i32, window_right: win_right as i32,
+                }));
+            } else {
+                timed!("qkv_matmul", {
+                    b.matmul(&s.normed, &layer.self_attn.q_proj, &s.q, padded_seq, kv_dim, dim);
+                    b.matmul(&s.normed, &layer.self_attn.k_proj, &s.k, padded_seq, kv_dim, dim);
+                    b.matmul(&s.normed, &layer.self_attn.v_proj, &s.v, padded_seq, kv_dim, dim);
+                });
+                timed!("flash_attn", b.flash_attention(&s.q, &s.k, &s.v, &s.attn_out, &FlashAttentionParams {
+                    n_heads: layer.self_attn.num_heads,
+                    padded_seq, seq_len,
+                    head_dim: layer.self_attn.head_dim,
+                    stride_h: layer.self_attn.head_dim as i32,
+                    stride_m: kv_dim as i32,
+                    stride_o: kv_dim as i32,
+                    sm_scale: layer.self_attn.scale,
+                    window_left: win_left as i32, window_right: win_right as i32,
+                }));
+            }
 
-            let t = Instant::now();
-            b.flash_attention(&s.q, &s.k, &s.v, &s.attn_out, &FlashAttentionParams {
-                n_heads: layer.self_attn.num_heads,
-                padded_seq,
-                seq_len,
-                head_dim: layer.self_attn.head_dim,
-                stride_h: layer.self_attn.head_dim as i32,
-                stride_m: kv_dim as i32,
-                stride_o: kv_dim as i32,
-                sm_scale: layer.self_attn.scale,
-                window_left: win_left as i32,
-                window_right: win_right as i32,
-            });
-            b.sync()?;
-            *totals.entry("flash_attn").or_default() += t.elapsed().as_secs_f64();
-
-            let t = Instant::now();
-            b.matmul(&s.attn_out, &layer.self_attn.o_proj, &s.attn_proj, padded_seq, dim, kv_dim);
-            b.sync()?;
-            *totals.entry("o_matmul").or_default() += t.elapsed().as_secs_f64();
-
-            let t = Instant::now();
-            b.residual_add(&s.attn_proj, res_in, res_out, n_elem);
-            b.sync()?;
-            *totals.entry("residual").or_default() += t.elapsed().as_secs_f64();
+            timed!("o_matmul", b.matmul(&s.attn_out, &layer.self_attn.o_proj, &s.attn_proj, padded_seq, dim, kv_dim));
+            timed!("residual", b.residual_add(&s.attn_proj, res_in, res_out, n_elem));
             std::mem::swap(&mut res_in, &mut res_out);
 
-            let t = Instant::now();
-            b.layernorm_bare(res_in, &s.normed, padded_seq, dim);
-            b.sync()?;
-            *totals.entry("layernorm_bare").or_default() += t.elapsed().as_secs_f64();
+            timed!("layernorm_bare", b.layernorm_bare(res_in, &s.normed, padded_seq, dim));
 
             let intermediate = self.d.intermediate_size;
-            let t = Instant::now();
-            b.matmul_bias(&s.normed, &layer.mlp.fc1.weight, &layer.mlp.fc1.bias,
-                           &s.fc1, padded_seq, intermediate, dim);
-            b.sync()?;
-            *totals.entry("fc1_matmul_bias").or_default() += t.elapsed().as_secs_f64();
-
-            let t = Instant::now();
-            b.gelu(&s.fc1, &s.fc1, padded_seq * intermediate);
-            b.sync()?;
-            *totals.entry("gelu").or_default() += t.elapsed().as_secs_f64();
-
-            let t = Instant::now();
-            b.matmul_bias(&s.fc1, &layer.mlp.fc2.weight, &layer.mlp.fc2.bias,
-                           &s.fc2, padded_seq, dim, intermediate);
-            b.sync()?;
-            *totals.entry("fc2_matmul_bias").or_default() += t.elapsed().as_secs_f64();
-
-            let t = Instant::now();
-            b.residual_add(&s.fc2, res_in, res_out, n_elem);
-            b.sync()?;
-            *totals.entry("residual").or_default() += t.elapsed().as_secs_f64();
+            timed!("fc1_matmul_bias_gelu",
+                b.matmul_bias_gelu(&s.normed, &layer.mlp.fc1.weight, &layer.mlp.fc1.bias,
+                                    &s.fc1, padded_seq, intermediate, dim));
+            timed!("fc2_matmul_bias",
+                b.matmul_bias(&s.fc1, &layer.mlp.fc2.weight, &layer.mlp.fc2.bias,
+                               &s.fc2, padded_seq, dim, intermediate));
+            timed!("residual", b.residual_add(&s.fc2, res_in, res_out, n_elem));
             std::mem::swap(&mut res_in, &mut res_out);
         }
 
-        let t = Instant::now();
-        b.layernorm_unit_offset(res_in, &self.d.final_norm_gamma, &s.normed, padded_seq, dim);
-        b.sync()?;
-        *totals.entry("final_ln").or_default() += t.elapsed().as_secs_f64();
+        timed!("final_ln",
+            b.layernorm_unit_offset(res_in, &self.d.final_norm_gamma, &s.normed, padded_seq, dim));
 
         // Print profile
         let total: f64 = totals.values().sum();

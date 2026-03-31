@@ -7,7 +7,8 @@ use candle_metal_kernels::metal::ComputeCommandEncoder;
 
 use crate::triton_kernels::{
     GpuBuffer, TritonKernels,
-    enc_matmul, enc_matmul_bias, enc_layernorm_bare, enc_layernorm_unit_offset,
+    enc_matmul, enc_matmul_bias, enc_matmul_bias_gelu,
+    enc_layernorm_bare, enc_layernorm_unit_offset,
     enc_gelu, enc_residual_add, enc_bias_add, enc_flash_attention,
 };
 use super::gpu_encoder::{EncoderBackend, FlashAttentionParams};
@@ -50,6 +51,13 @@ impl MetalEncoderBackend {
         if let Some(ref p) = self.kernels.matmul_bias_128x128 { (128, p) }
         else if let Some(ref p) = self.kernels.matmul_bias_64x64 { (64, p) }
         else { (32, &self.kernels.matmul_bias_32x32) }
+    }
+
+    /// Select the best matmul_bias_gelu pipeline and tile size.
+    fn matmul_bias_gelu_config(&self) -> (usize, &candle_metal_kernels::metal::ComputePipeline) {
+        if let Some(ref p) = self.kernels.matmul_bias_gelu_128x128 { (128, p) }
+        else if let Some(ref p) = self.kernels.matmul_bias_gelu_64x64 { (64, p) }
+        else { (32, &self.kernels.matmul_bias_gelu_32x32) }
     }
 }
 
@@ -137,6 +145,23 @@ impl EncoderBackend for MetalEncoderBackend {
         enc_matmul_bias(&enc, pipeline, a, b, bias, out, m, n, k, block, block);
     }
 
+    fn matmul_bias_gelu(&self, a: &GpuBuffer, b: &GpuBuffer, bias: &GpuBuffer,
+                         out: &GpuBuffer, m: usize, n: usize, k: usize) {
+        let (block, pipeline) = self.matmul_bias_gelu_config();
+        let enc = self.enc();
+        if block < 64 {
+            // Fallback: fused gelu pipeline tile too small, use larger matmul + separate gelu
+            let (mm_block, mm_pipeline) = self.matmul_config();
+            if mm_block >= 64 {
+                enc_matmul(&enc, mm_pipeline, a, b, out, m, n, k, mm_block, mm_block);
+                enc_bias_add(&enc, &self.kernels.bias_add, out, bias, out, m * n, n);
+                enc_gelu(&enc, &self.kernels.gelu, out, out, m * n);
+                return;
+            }
+        }
+        enc_matmul_bias_gelu(&enc, pipeline, a, b, bias, out, m, n, k, block, block);
+    }
+
     fn gelu(&self, x: &GpuBuffer, out: &GpuBuffer, n_elem: usize) {
         enc_gelu(&self.enc(), &self.kernels.gelu, x, out, n_elem);
     }
@@ -158,6 +183,12 @@ impl EncoderBackend for MetalEncoderBackend {
             p.n_heads, p.padded_seq, p.head_dim,
             p.stride_h, p.stride_m, p.stride_o,
             p.sm_scale, p.window_left, p.window_right);
+    }
+
+    fn supports_buf_slice(&self) -> bool { true }
+
+    fn buf_slice(&self, buf: &GpuBuffer, byte_offset: usize) -> GpuBuffer {
+        buf.with_offset(byte_offset)
     }
 
     fn sync(&self) -> Result<()> {

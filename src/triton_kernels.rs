@@ -57,6 +57,15 @@ impl GpuBuffer {
     pub fn contents_ptr(&self) -> *mut u8 {
         unsafe { self.buffer.contents().add(self.offset) }
     }
+
+    /// Create a view into this buffer at a byte offset.
+    #[inline]
+    pub fn with_offset(&self, byte_offset: usize) -> Self {
+        Self {
+            buffer: self.buffer.clone(),
+            offset: self.offset + byte_offset,
+        }
+    }
 }
 
 fn cdiv(a: usize, b: usize) -> usize {
@@ -1269,6 +1278,35 @@ pub fn enc_matmul(
 }
 
 pub fn enc_matmul_bias(
+    enc: &ComputeCommandEncoder, pipeline: &ComputePipeline,
+    a: &GpuBuffer, b: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
+    m: usize, n: usize, k: usize, block_m: usize, block_n: usize,
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(a.buf()), a.offset);
+    enc.set_buffer(1, Some(b.buf()), b.offset);
+    enc.set_buffer(2, Some(bias.buf()), bias.offset);
+    enc.set_buffer(3, Some(out.buf()), out.offset);
+    enc.set_bytes(4, &(m as i32));
+    enc.set_bytes(5, &(n as i32));
+    enc.set_bytes(6, &(k as i32));
+    enc.set_bytes(7, &(k as i32));      // stride_am = K
+    enc.set_bytes(8, &1i32);            // stride_ak = 1
+    enc.set_bytes(9, &(n as i32));      // stride_bk = N
+    enc.set_bytes(10, &1i32);           // stride_bn = 1
+    enc.set_bytes(11, &(n as i32));     // stride_cm = N
+    enc.set_bytes(12, &1i32);           // stride_cn = 1
+    let grid = MTLSize {
+        width: cdiv(m, block_m),
+        height: cdiv(n, block_n),
+        depth: 1,
+    };
+    #[cfg(target_arch = "aarch64")]
+    if block_m <= 32 { set_air_tg_mem(enc, 4096); }
+    enc.dispatch_thread_groups(grid, matmul_tg_size(pipeline, block_m, block_n));
+}
+
+pub fn enc_matmul_bias_gelu(
     enc: &ComputeCommandEncoder, pipeline: &ComputePipeline,
     a: &GpuBuffer, b: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
     m: usize, n: usize, k: usize, block_m: usize, block_n: usize,
