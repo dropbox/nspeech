@@ -332,7 +332,7 @@ impl<B: EncoderBackend> GpuEncoder<B> {
         // Upload input to residual_a
         self.upload_input(x, seq_len, padded_seq, dim, &s.residual_a)?;
 
-        // Profiling mode: per-op timing (before begin_pass — profile manages its own passes)
+        // Profiling mode: per-op timing (profile manages its own passes)
         if std::env::var("TRITON_ENCODER_PROFILE").is_ok() {
             return self.forward_profile(x, seq_len, padded_seq);
         }
@@ -428,42 +428,41 @@ impl<B: EncoderBackend> GpuEncoder<B> {
     /// Upload input tensor to residual buffer (handles padding).
     fn upload_input(&self, x: &Tensor, seq_len: usize, padded_seq: usize,
                      dim: usize, dst: &B::Buf) -> Result<()> {
-        // Flatten [1, seq_len, dim] → [seq_len * dim]
-        let x_flat = x.reshape((seq_len, dim))?;
-        let x_f32 = x_flat.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
-        let data = x_f32.to_vec2::<f32>()?;
+        let n = seq_len * dim;
+        let padded_n = padded_seq * dim;
 
-        // Convert to f16 for Metal (f16 residual) or f32 for D3D12 (f32 residual)
-        // Try f16 first; if it fails (D3D12), use f32
+        // Copy to CPU, convert f32→f16, upload to GPU buffer
+        let x_flat = x.reshape(n)?;
+        let x_f32 = x_flat.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
+        let data = x_f32.to_vec1::<f32>()?;
+
         let mut f16_data: Vec<half::f16> = data.iter()
-            .flat_map(|row| row.iter().map(|v| half::f16::from_f32(*v)))
+            .map(|v| half::f16::from_f32(*v))
             .collect();
-        // Pad
         if padded_seq > seq_len {
-            f16_data.resize(padded_seq * dim, half::f16::ZERO);
+            f16_data.resize(padded_n, half::f16::ZERO);
         }
         if self.backend.upload_input_f16(dst, &f16_data).is_ok() {
             return Ok(());
         }
 
         // F32 path (D3D12)
-        let mut f32_data: Vec<f32> = data.into_iter().flatten().collect();
+        let mut f32_data = data;
         if padded_seq > seq_len {
-            f32_data.resize(padded_seq * dim, 0.0);
+            f32_data.resize(padded_n, 0.0);
         }
         self.backend.upload_input_f32(dst, &f32_data)
     }
 
     /// Profiling forward pass — measures each operation individually.
     /// Each timed section gets its own begin_pass/end_pass for accurate timing.
-    fn forward_profile(&self, x: &Tensor, seq_len: usize, padded_seq: usize) -> Result<Tensor> {
+    fn forward_profile(&self, _x: &Tensor, seq_len: usize, padded_seq: usize) -> Result<Tensor> {
         use std::time::Instant;
 
         let dim = self.d.encoder_dim;
         let s = &self.d.scratch;
         let b = &self.backend;
 
-        let (mut res_in, mut res_out) = (&s.residual_a, &s.residual_b);
         let mut totals = std::collections::HashMap::<&str, f64>::new();
 
         macro_rules! timed {
@@ -475,6 +474,10 @@ impl<B: EncoderBackend> GpuEncoder<B> {
                 *totals.entry($name).or_default() += t.elapsed().as_secs_f64();
             }};
         }
+
+        // upload_input already called before forward_profile
+
+        let (mut res_in, mut res_out) = (&s.residual_a, &s.residual_b);
 
         for (i, layer) in self.d.layers.iter().enumerate() {
             let kv_dim = layer.self_attn.kv_dim;

@@ -1443,3 +1443,33 @@ pub fn enc_flash_attention(
     enc.dispatch_thread_groups(grid, fa_tg_size(pipeline));
 }
 
+/// Load a kernel pipeline by name from embedded metallibs.
+/// Use this for kernels not part of TritonKernels or DecoderKernels structs.
+pub fn load_kernel_pipeline(device: &MetalDevice, name: &str, func_name: &str) -> Result<ComputePipeline> {
+    let data = kernel_data::load_kernel(name)
+        .ok_or_else(|| anyhow::anyhow!("No embedded kernel for {name}"))?;
+    let lib = device.device().new_library_with_data(data)
+        .map_err(|e| anyhow::anyhow!("Failed to load metallib {name}: {e}"))?;
+    let func = lib.get_function(func_name, None)
+        .map_err(|e| anyhow::anyhow!("Function {func_name} not found in {name}: {e}"))?;
+    let pipeline = device.device().new_compute_pipeline_state_with_function(&func)
+        .map_err(|e| anyhow::anyhow!("Pipeline failed for {name}: {e}"))?;
+    Ok(pipeline)
+}
+
+/// Dispatch f32→f16 element-wise conversion on GPU.
+/// Reads `n_elements` f32 values from `src_buf` at `src_offset` bytes,
+/// writes f16 values to `dst`.
+pub fn enc_convert_f32_to_f16(
+    enc: &ComputeCommandEncoder, pipeline: &ComputePipeline,
+    src_buf: &Buffer, src_offset: usize,
+    dst: &GpuBuffer, n_elements: usize,
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(src_buf), src_offset);
+    enc.set_buffer(1, Some(dst.buf()), dst.offset);
+    enc.set_bytes(2, &(n_elements as i32));
+    let grid = MTLSize { width: cdiv(n_elements, 1024), height: 1, depth: 1 };
+    enc.dispatch_thread_groups(grid, tg_size(pipeline, 128));
+}
+

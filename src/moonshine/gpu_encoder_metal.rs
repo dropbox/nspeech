@@ -32,7 +32,7 @@ impl MetalEncoderBackend {
 
     pub fn device(&self) -> &MetalDevice { &self.device }
 
-    /// Get the active command encoder, or create a new one if not in a pass.
+    /// Get the active command encoder (must be called between begin_pass..end_pass).
     fn enc(&self) -> std::cell::Ref<'_, ComputeCommandEncoder> {
         std::cell::Ref::map(self.encoder.borrow(), |e| e.as_ref().unwrap())
     }
@@ -106,7 +106,7 @@ impl EncoderBackend for MetalEncoderBackend {
     }
 
     fn end_pass(&self) -> Result<()> {
-        let enc = self.encoder.borrow_mut().take().unwrap();
+        let enc = self.encoder.borrow_mut().take();
         drop(enc);
         self.device.wait_until_completed()?;
         Ok(())
@@ -150,7 +150,6 @@ impl EncoderBackend for MetalEncoderBackend {
         let (block, pipeline) = self.matmul_bias_gelu_config();
         let enc = self.enc();
         if block < 64 {
-            // Fallback: fused gelu pipeline tile too small, use larger matmul + separate gelu
             let (mm_block, mm_pipeline) = self.matmul_config();
             if mm_block >= 64 {
                 enc_matmul(&enc, mm_pipeline, a, b, out, m, n, k, mm_block, mm_block);
