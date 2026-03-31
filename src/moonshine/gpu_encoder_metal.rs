@@ -1,6 +1,5 @@
 //! Metal backend for the shared GPU encoder.
 
-use std::cell::RefCell;
 use anyhow::Result;
 use candle_core::{MetalDevice, Storage, Tensor};
 use candle_metal_kernels::metal::{ComputeCommandEncoder, ComputePipeline};
@@ -18,8 +17,6 @@ pub struct MetalEncoderBackend {
     device: MetalDevice,
     kernels: TritonKernels,
     convert_f32_to_f16: ComputePipeline,
-    /// Active compute command encoder (set during begin_pass..end_pass).
-    encoder: RefCell<Option<ComputeCommandEncoder>>,
 }
 
 impl MetalEncoderBackend {
@@ -30,7 +27,6 @@ impl MetalEncoderBackend {
             device: device.clone(),
             kernels,
             convert_f32_to_f16,
-            encoder: RefCell::new(None),
         })
     }
 
@@ -41,9 +37,11 @@ impl MetalEncoderBackend {
         self.device.flush().map_err(|e| anyhow::anyhow!("{e}"))
     }
 
-    /// Get the active command encoder (must be called between begin_pass..end_pass).
-    fn enc(&self) -> std::cell::Ref<'_, ComputeCommandEncoder> {
-        std::cell::Ref::map(self.encoder.borrow(), |e| e.as_ref().unwrap())
+    /// Get a command encoder from Candle's command buffer pool.
+    /// Each call may return an encoder on the same or a different command buffer,
+    /// matching the per-dispatch pattern that gives the GPU scheduler maximum freedom.
+    fn enc(&self) -> ComputeCommandEncoder {
+        self.device.command_encoder().expect("Failed to get command encoder")
     }
 
     /// Select the best matmul pipeline and tile size.
@@ -110,13 +108,13 @@ impl EncoderBackend for MetalEncoderBackend {
     }
 
     fn begin_pass(&self) -> Result<()> {
-        *self.encoder.borrow_mut() = Some(self.device.command_encoder()?);
+        // Metal uses Candle's command buffer pool — no explicit pass needed.
+        // Each enc() call gets an encoder from the pool automatically.
         Ok(())
     }
 
     fn end_pass(&self) -> Result<()> {
-        let enc = self.encoder.borrow_mut().take();
-        drop(enc);
+        // Flush and wait for all pending command buffers.
         self.device.wait_until_completed()?;
         Ok(())
     }
@@ -142,32 +140,30 @@ impl EncoderBackend for MetalEncoderBackend {
     fn matmul_bias(&self, a: &GpuBuffer, b: &GpuBuffer, bias: &GpuBuffer,
                     out: &GpuBuffer, m: usize, n: usize, k: usize) {
         let (block, pipeline) = self.matmul_bias_config();
-        let enc = self.enc();
         if block < 64 {
             let (mm_block, mm_pipeline) = self.matmul_config();
             if mm_block >= 64 {
-                enc_matmul(&enc, mm_pipeline, a, b, out, m, n, k, mm_block, mm_block);
-                enc_bias_add(&enc, &self.kernels.bias_add, out, bias, out, m * n, n);
+                enc_matmul(&self.enc(), mm_pipeline, a, b, out, m, n, k, mm_block, mm_block);
+                enc_bias_add(&self.enc(), &self.kernels.bias_add, out, bias, out, m * n, n);
                 return;
             }
         }
-        enc_matmul_bias(&enc, pipeline, a, b, bias, out, m, n, k, block, block);
+        enc_matmul_bias(&self.enc(), pipeline, a, b, bias, out, m, n, k, block, block);
     }
 
     fn matmul_bias_gelu(&self, a: &GpuBuffer, b: &GpuBuffer, bias: &GpuBuffer,
                          out: &GpuBuffer, m: usize, n: usize, k: usize) {
         let (block, pipeline) = self.matmul_bias_gelu_config();
-        let enc = self.enc();
         if block < 64 {
             let (mm_block, mm_pipeline) = self.matmul_config();
             if mm_block >= 64 {
-                enc_matmul(&enc, mm_pipeline, a, b, out, m, n, k, mm_block, mm_block);
-                enc_bias_add(&enc, &self.kernels.bias_add, out, bias, out, m * n, n);
-                enc_gelu(&enc, &self.kernels.gelu, out, out, m * n);
+                enc_matmul(&self.enc(), mm_pipeline, a, b, out, m, n, k, mm_block, mm_block);
+                enc_bias_add(&self.enc(), &self.kernels.bias_add, out, bias, out, m * n, n);
+                enc_gelu(&self.enc(), &self.kernels.gelu, out, out, m * n);
                 return;
             }
         }
-        enc_matmul_bias_gelu(&enc, pipeline, a, b, bias, out, m, n, k, block, block);
+        enc_matmul_bias_gelu(&self.enc(), pipeline, a, b, bias, out, m, n, k, block, block);
     }
 
     fn gelu(&self, x: &GpuBuffer, out: &GpuBuffer, n_elem: usize) {
@@ -239,13 +235,11 @@ impl EncoderBackend for MetalEncoderBackend {
             }
         }
 
-        // Open a command pass and dispatch f32→f16 convert as first kernel.
-        // forward() skips begin_pass and dispatches directly into this encoder.
-        // Metal's hazard tracking ensures convert completes before subsequent
-        // reads from dst (same encoder = automatic barrier on buffer dependency).
-        *self.encoder.borrow_mut() = Some(self.device.command_encoder()
-            .map_err(|e| anyhow::anyhow!("{e}"))?);
-        enc_convert_f32_to_f16(&self.enc(), &self.convert_f32_to_f16,
+        // Dispatch f32→f16 convert kernel.
+        // Candle's command pool handles encoder management; hazard tracking
+        // ensures the convert completes before subsequent reads from dst.
+        let enc = self.enc();
+        enc_convert_f32_to_f16(&enc, &self.convert_f32_to_f16,
             src_buf, src_offset, dst, n);
 
         Ok(true)

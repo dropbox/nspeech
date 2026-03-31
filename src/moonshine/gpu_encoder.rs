@@ -354,11 +354,7 @@ impl<B: EncoderBackend> GpuEncoder<B> {
             return self.forward_profile(x, seq_len, padded_seq);
         }
 
-        // Batch all GPU dispatches into one command pass.
-        // If gpu_uploaded, the pass is already open with the convert kernel dispatched.
-        if !gpu_uploaded {
-            b.begin_pass()?;
-        }
+        b.begin_pass()?;
 
         let (mut res_in, mut res_out) = (&s.residual_a, &s.residual_b);
 
