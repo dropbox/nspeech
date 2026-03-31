@@ -38,21 +38,16 @@ use super::encoder::MoonshineEncoder;
 use super::frontend::MoonshineFrontend;
 // GPU backend type aliases — unify Metal and D3D12 behind common names
 #[cfg(feature = "triton-metal")]
-use super::triton_encoder::TritonEncoder as GpuEnc;
+type GpuEnc = super::gpu_encoder::GpuEncoder<super::gpu_encoder_metal::MetalEncoderBackend>;
 #[cfg(feature = "triton-metal")]
 type GpuDec = super::gpu_decoder::GpuDecoder<super::gpu_decoder_metal::MetalBackend>;
 #[cfg(feature = "triton-d3d12")]
-use super::triton_d3d12_encoder::TritonD3D12Encoder as GpuEnc;
+type GpuEnc = super::gpu_encoder::GpuEncoder<super::gpu_encoder_d3d12::D3D12EncoderBackend>;
 #[cfg(feature = "triton-d3d12")]
 type GpuDec = super::gpu_decoder::GpuDecoder<super::gpu_decoder_d3d12::D3D12Backend>;
 
-/// Dispatch GPU encoder (Metal needs F32 conversion, D3D12 returns directly).
-#[cfg(feature = "triton-metal")]
-fn gpu_encode(enc: &GpuEnc, features: &Tensor) -> Result<Tensor> {
-    let out = enc.forward(features)?;
-    Ok(out.to_dtype(candle_core::DType::F32)?.to_device(features.device())?)
-}
-#[cfg(feature = "triton-d3d12")]
+/// Dispatch GPU encoder (returns F32 on CPU).
+#[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
 fn gpu_encode(enc: &GpuEnc, features: &Tensor) -> Result<Tensor> {
     enc.forward(features)
 }
@@ -186,24 +181,37 @@ impl MoonshineModel {
 
         #[cfg(feature = "triton-metal")]
         let (gpu_encoder, gpu_decoder): (Option<GpuEnc>, Option<GpuDec>) = {
-            let enc = match GpuEnc::new(&cfg, vb.pp("model.encoder"), device) {
-                Ok(te) => {
-                    println!("  Triton encoder loaded");
-                    Some(te)
-                }
-                Err(e) => {
-                    println!("  Triton encoder unavailable: {e}");
-                    None
-                }
+            // Get the Metal device
+            let metal_candle_dev = match device {
+                Device::Metal(_) => device.clone(),
+                _ => Device::new_metal(0)
+                    .unwrap_or_else(|_| device.clone()),
             };
-            // Get the Metal device from the encoder, or create one
-            let metal_dev: Option<candle_core::MetalDevice> = enc.as_ref()
-                .map(|e| e.metal_device().clone())
-                .or_else(|| Device::new_metal(0).ok())
-                .and_then(|dev| match dev {
-                    Device::Metal(md) => Some(md),
-                    _ => None,
-                });
+            let metal_dev: Option<candle_core::MetalDevice> = match &metal_candle_dev {
+                Device::Metal(md) => Some(md.clone()),
+                _ => None,
+            };
+            let enc = metal_dev.as_ref().and_then(|md| {
+                use super::gpu_encoder_metal::MetalEncoderBackend;
+                let backend = match MetalEncoderBackend::new(md) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        println!("  Metal encoder backend unavailable: {e}");
+                        return None;
+                    }
+                };
+                // Max seq len: 2048 is generous for Moonshine encoder
+                match GpuEnc::new(backend, &cfg, vb.pp("model.encoder"), 2048) {
+                    Ok(enc) => {
+                        println!("  Triton encoder loaded");
+                        Some(enc)
+                    }
+                    Err(e) => {
+                        println!("  Triton encoder unavailable: {e}");
+                        None
+                    }
+                }
+            });
             let dec = metal_dev.as_ref().and_then(|md| {
                 use super::gpu_decoder_metal::MetalBackend;
                 let backend = match MetalBackend::new(md,
@@ -234,14 +242,27 @@ impl MoonshineModel {
             match candle_d3d12_kernels::Gpu::new(0) {
                 Ok(gpu) => {
                     let gpu = Arc::new(gpu);
-                    let enc = match GpuEnc::new(&cfg, vb.pp("model.encoder"), &gpu) {
-                        Ok(enc) => {
-                            println!("  Triton D3D12 encoder loaded");
-                            Some(enc)
-                        }
-                        Err(e) => {
-                            println!("  Triton D3D12 encoder unavailable: {e}");
-                            None
+                    let enc = {
+                        use super::gpu_encoder_d3d12::D3D12EncoderBackend;
+                        let use_fp16_acc = std::env::var("USE_FP16_ACC").map_or(false, |v| v == "1");
+                        println!("  Loading Triton DXIL kernels (fp16_acc={})...", use_fp16_acc);
+                        match D3D12EncoderBackend::new(&gpu, use_fp16_acc, cfg.encoder_dim) {
+                            Ok(backend) => {
+                                match GpuEnc::new(backend, &cfg, vb.pp("model.encoder"), 2048) {
+                                    Ok(enc) => {
+                                        println!("  Triton D3D12 encoder loaded");
+                                        Some(enc)
+                                    }
+                                    Err(e) => {
+                                        println!("  Triton D3D12 encoder unavailable: {e}");
+                                        None
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                println!("  D3D12 encoder backend unavailable: {e}");
+                                None
+                            }
                         }
                     };
                     let dec = {

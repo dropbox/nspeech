@@ -1268,3 +1268,140 @@ pub fn enc_matmul(
     enc.dispatch_thread_groups(grid, matmul_tg_size(pipeline, block_m, block_n));
 }
 
+pub fn enc_matmul_bias(
+    enc: &ComputeCommandEncoder, pipeline: &ComputePipeline,
+    a: &GpuBuffer, b: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
+    m: usize, n: usize, k: usize, block_m: usize, block_n: usize,
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(a.buf()), a.offset);
+    enc.set_buffer(1, Some(b.buf()), b.offset);
+    enc.set_buffer(2, Some(bias.buf()), bias.offset);
+    enc.set_buffer(3, Some(out.buf()), out.offset);
+    enc.set_bytes(4, &(m as i32));
+    enc.set_bytes(5, &(n as i32));
+    enc.set_bytes(6, &(k as i32));
+    enc.set_bytes(7, &(k as i32));      // stride_am = K
+    enc.set_bytes(8, &1i32);            // stride_ak = 1
+    enc.set_bytes(9, &(n as i32));      // stride_bk = N
+    enc.set_bytes(10, &1i32);           // stride_bn = 1
+    enc.set_bytes(11, &(n as i32));     // stride_cm = N
+    enc.set_bytes(12, &1i32);           // stride_cn = 1
+    let grid = MTLSize {
+        width: cdiv(m, block_m),
+        height: cdiv(n, block_n),
+        depth: 1,
+    };
+    #[cfg(target_arch = "aarch64")]
+    if block_m <= 32 { set_air_tg_mem(enc, 4096); }
+    enc.dispatch_thread_groups(grid, matmul_tg_size(pipeline, block_m, block_n));
+}
+
+pub fn enc_layernorm_bare(
+    enc: &ComputeCommandEncoder, pipeline: &ComputePipeline,
+    x: &GpuBuffer, out: &GpuBuffer,
+    n_rows: usize, n_cols: usize,
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(x.buf()), x.offset);
+    enc.set_buffer(1, Some(out.buf()), out.offset);
+    enc.set_bytes(2, &(n_rows as i32));
+    enc.set_bytes(3, &(n_cols as i32));
+    enc.set_bytes(4, &(n_cols as i32));
+    enc.set_bytes(5, &(n_cols as i32));
+    let grid = MTLSize { width: n_rows, height: 1, depth: 1 };
+    #[cfg(target_arch = "aarch64")]
+    set_air_tg_mem(enc, 4096);
+    enc.dispatch_thread_groups(grid, tg_size(pipeline, n_cols));
+}
+
+pub fn enc_layernorm_unit_offset(
+    enc: &ComputeCommandEncoder, pipeline: &ComputePipeline,
+    x: &GpuBuffer, gamma: &GpuBuffer, out: &GpuBuffer,
+    n_rows: usize, n_cols: usize,
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(x.buf()), x.offset);
+    enc.set_buffer(1, Some(gamma.buf()), gamma.offset);
+    enc.set_buffer(2, Some(out.buf()), out.offset);
+    enc.set_bytes(3, &(n_rows as i32));
+    enc.set_bytes(4, &(n_cols as i32));
+    enc.set_bytes(5, &(n_cols as i32));
+    enc.set_bytes(6, &(n_cols as i32));
+    let grid = MTLSize { width: n_rows, height: 1, depth: 1 };
+    #[cfg(target_arch = "aarch64")]
+    set_air_tg_mem(enc, 4096);
+    enc.dispatch_thread_groups(grid, tg_size(pipeline, n_cols));
+}
+
+pub fn enc_gelu(
+    enc: &ComputeCommandEncoder, pipeline: &ComputePipeline,
+    x: &GpuBuffer, out: &GpuBuffer, n_elements: usize,
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(x.buf()), x.offset);
+    enc.set_buffer(1, Some(out.buf()), out.offset);
+    enc.set_bytes(2, &(n_elements as i32));
+    let grid = MTLSize { width: cdiv(n_elements, 1024), height: 1, depth: 1 };
+    enc.dispatch_thread_groups(grid, tg_size(pipeline, 1024));
+}
+
+pub fn enc_residual_add(
+    enc: &ComputeCommandEncoder, pipeline: &ComputePipeline,
+    x: &GpuBuffer, residual: &GpuBuffer, out: &GpuBuffer, n_elements: usize,
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(x.buf()), x.offset);
+    enc.set_buffer(1, Some(residual.buf()), residual.offset);
+    enc.set_buffer(2, Some(out.buf()), out.offset);
+    enc.set_bytes(3, &(n_elements as i32));
+    let tg_w = tg_size(pipeline, 1024).width;
+    let grid = MTLSize { width: cdiv(n_elements, tg_w), height: 1, depth: 1 };
+    enc.dispatch_thread_groups(grid, MTLSize { width: tg_w, height: 1, depth: 1 });
+}
+
+pub fn enc_bias_add(
+    enc: &ComputeCommandEncoder, pipeline: &ComputePipeline,
+    x: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer, n_elements: usize, n_cols: usize,
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(x.buf()), x.offset);
+    enc.set_buffer(1, Some(bias.buf()), bias.offset);
+    enc.set_buffer(2, Some(out.buf()), out.offset);
+    enc.set_bytes(3, &(n_elements as i32));
+    enc.set_bytes(4, &(n_cols as i32));
+    let tg_w = tg_size(pipeline, 1024).width;
+    let grid = MTLSize { width: cdiv(n_elements, tg_w), height: 1, depth: 1 };
+    enc.dispatch_thread_groups(grid, MTLSize { width: tg_w, height: 1, depth: 1 });
+}
+
+pub fn enc_flash_attention(
+    enc: &ComputeCommandEncoder, pipeline: &ComputePipeline,
+    q: &GpuBuffer, k: &GpuBuffer, v: &GpuBuffer, out: &GpuBuffer,
+    n_heads: usize, seq_len: usize, head_dim: usize,
+    stride_h: i32, stride_m: i32, stride_o: i32,
+    sm_scale: f32, window_left: i32, window_right: i32,
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(q.buf()), q.offset);
+    enc.set_buffer(1, Some(k.buf()), k.offset);
+    enc.set_buffer(2, Some(v.buf()), v.offset);
+    enc.set_buffer(3, Some(out.buf()), out.offset);
+    enc.set_bytes(4, &(seq_len as i32));
+    enc.set_bytes(5, &stride_h);
+    enc.set_bytes(6, &stride_m);
+    enc.set_bytes(7, &stride_o);
+    enc.set_bytes(8, &sm_scale);
+    enc.set_bytes(9, &window_left);
+    enc.set_bytes(10, &window_right);
+    #[cfg(target_arch = "aarch64")]
+    enc.set_threadgroup_memory_length(0, 8192);
+    let grid = MTLSize {
+        width: cdiv(seq_len, 32),
+        height: n_heads,
+        depth: 1,
+    };
+    let _ = head_dim; // used implicitly by kernel
+    enc.dispatch_thread_groups(grid, fa_tg_size(pipeline));
+}
+
