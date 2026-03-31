@@ -9,116 +9,9 @@ use candle_core::{DType, MetalDevice, MetalStorage, Shape, Storage, Tensor};
 use candle_metal_kernels::metal::ComputePipeline;
 use objc2_metal::MTLSize;
 
-// List of all kernel names used by encoder and decoder (Intel x86_64 only).
-#[cfg(target_arch = "x86_64")]
-macro_rules! kernel_list {
-    ($mac:ident) => {
-        $mac!(
-            "matmul_fp16_64x64x32",
-            "matmul_fp16_128x128x32",
-            "matmul_bias_fp16_32x32x32",
-            "matmul_bias_fp16_64x64x32",
-            "matmul_bias_fp16_128x128x32",
-            "matmul_bias_gelu_fp16_32x32x32",
-            "matmul_bias_gelu_fp16_64x64x32",
-            "matmul_bias_gelu_fp16_128x128x32",
-            "layernorm_unit_offset_768",
-            "layernorm_bare_768",
-            "residual_add_fp16",
-            "flash_attention_fwd_32x32x64",
-            "gelu_fp16",
-            "bias_add_fp16",
-            "gemv_f16w",
-            "gemv_bias_f16w",
-            "layernorm_standard_f32in_640",
-            "residual_add_f32",
-            "convert_f32_to_f16",
-            "attention_decode_1d_d80",
-            "attention_decode_splitkv_partial",
-            "attention_decode_splitkv_reduce",
-            "rope_qk_cache_fused",
-            "kv_cache_append",
-            "glu_silu_fused",
-            "residual_add_layernorm_fused",
-            "gemv_bias_glu_fused",
-            "gemv_resadd_ln_fused",
-            "gemv_splitk_partial",
-            "gemv_splitk_bias_reduce",
-            "gemv_splitk_reduce",
-            "gemv_splitk_reduce_resadd_ln",
-            "gemv_qkv_splitk_partial",
-            "gemv_qkv_splitk_reduce",
-            "gemv_glu_splitk_partial",
-            "gemv_glu_splitk_reduce",
-        );
-    };
-}
-
-// Embed pre-compiled .metallib binaries for the target architecture.
-// AIR path: TTGIR -> LLVM IR -> metal-as -> metallib (bypasses MSL)
-#[cfg(target_arch = "aarch64")]
-mod kernel_data {
-    // All MSL baseline — AIR selectively enabled only where proven faster
-    pub fn load_kernel(name: &str) -> Option<&'static [u8]> {
-        match name {
-            "matmul_fp16_64x64x32" => Some(include_bytes!("../kernels/out/apple/matmul_fp16_64x64x32.metallib")),
-            "matmul_fp16_128x128x32" => Some(include_bytes!("../kernels/out/apple/matmul_fp16_128x128x32.metallib")),
-            "matmul_bias_fp16_32x32x32" => Some(include_bytes!("../kernels/out/apple/matmul_bias_fp16_32x32x32.metallib")),
-            "matmul_bias_fp16_64x64x32" => Some(include_bytes!("../kernels/out/apple/matmul_bias_fp16_64x64x32.metallib")),
-            "matmul_bias_fp16_128x128x32" => Some(include_bytes!("../kernels/out/apple/matmul_bias_fp16_128x128x32.metallib")),
-            "matmul_bias_gelu_fp16_32x32x32" => Some(include_bytes!("../kernels/out/apple/matmul_bias_gelu_fp16_32x32x32.metallib")),
-            "matmul_bias_gelu_fp16_64x64x32" => Some(include_bytes!("../kernels/out/apple/matmul_bias_gelu_fp16_64x64x32.metallib")),
-            "matmul_bias_gelu_fp16_128x128x32" => Some(include_bytes!("../kernels/out/apple/matmul_bias_gelu_fp16_128x128x32.metallib")),
-            "layernorm_unit_offset_768" => Some(include_bytes!("../kernels/out/apple/layernorm_unit_offset_768.metallib")),
-            "layernorm_bare_768" => Some(include_bytes!("../kernels/out/apple/layernorm_bare_768.metallib")),
-            "layernorm_standard_f32in_640" => Some(include_bytes!("../kernels/out/apple/layernorm_standard_f32in_640.metallib")),
-            // AIR for flash attention (proven 1.85x faster in encoder)
-            "flash_attention_fwd_32x32x64" => Some(include_bytes!("../kernels/out/air/flash_attention_fwd_32x32x64.metallib")),
-            "attention_decode_splitkv_partial" => Some(include_bytes!("../kernels/out/apple/attention_decode_splitkv_partial.metallib")),
-            "attention_decode_splitkv_reduce" => Some(include_bytes!("../kernels/out/apple/attention_decode_splitkv_reduce.metallib")),
-            "attention_decode_1d_d80" => Some(include_bytes!("../kernels/out/apple/attention_decode_1d_d80.metallib")),
-            "residual_add_layernorm_fused" => Some(include_bytes!("../kernels/out/apple/residual_add_layernorm_fused.metallib")),
-            "residual_add_fp16" => Some(include_bytes!("../kernels/out/apple/residual_add_fp16.metallib")),
-            "residual_add_f32" => Some(include_bytes!("../kernels/out/apple/residual_add_f32.metallib")),
-            "convert_f32_to_f16" => Some(include_bytes!("../kernels/out/apple/convert_f32_to_f16.metallib")),
-            "gelu_fp16" => Some(include_bytes!("../kernels/out/apple/gelu_fp16.metallib")),
-            "bias_add_fp16" => Some(include_bytes!("../kernels/out/apple/bias_add_fp16.metallib")),
-            "gemv_f16w" => Some(include_bytes!("../kernels/out/apple/gemv_f16w.metallib")),
-            "gemv_bias_f16w" => Some(include_bytes!("../kernels/out/apple/gemv_bias_f16w.metallib")),
-            "rope_qk_cache_fused" => Some(include_bytes!("../kernels/out/apple/rope_qk_cache_fused.metallib")),
-            "kv_cache_append" => Some(include_bytes!("../kernels/out/apple/kv_cache_append.metallib")),
-            "glu_silu_fused" => Some(include_bytes!("../kernels/out/apple/glu_silu_fused.metallib")),
-            "gemv_bias_glu_fused" => Some(include_bytes!("../kernels/out/apple/gemv_bias_glu_fused.metallib")),
-            "gemv_resadd_ln_fused" => Some(include_bytes!("../kernels/out/apple/gemv_resadd_ln_fused.metallib")),
-            "gemv_splitk_partial" => Some(include_bytes!("../kernels/out/apple/gemv_splitk_partial.metallib")),
-            "gemv_splitk_bias_reduce" => Some(include_bytes!("../kernels/out/apple/gemv_splitk_bias_reduce.metallib")),
-            "gemv_splitk_reduce" => Some(include_bytes!("../kernels/out/apple/gemv_splitk_reduce.metallib")),
-            "gemv_splitk_reduce_resadd_ln" => Some(include_bytes!("../kernels/out/apple/gemv_splitk_reduce_resadd_ln.metallib")),
-            "gemv_qkv_splitk_partial" => Some(include_bytes!("../kernels/out/apple/gemv_qkv_splitk_partial.metallib")),
-            "gemv_qkv_splitk_reduce" => Some(include_bytes!("../kernels/out/apple/gemv_qkv_splitk_reduce.metallib")),
-            "gemv_glu_splitk_partial" => Some(include_bytes!("../kernels/out/apple/gemv_glu_splitk_partial.metallib")),
-            "gemv_glu_splitk_reduce" => Some(include_bytes!("../kernels/out/apple/gemv_glu_splitk_reduce.metallib")),
-            _ => None,
-        }
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-mod kernel_data {
-    macro_rules! embed_metallibs {
-        ($($name:literal),* $(,)?) => {
-            pub fn load_kernel(name: &str) -> Option<&'static [u8]> {
-                match name {
-                    $($name => Some(include_bytes!(concat!(
-                        "../kernels/out/intel/", $name, ".metallib"
-                    ))),)*
-                    _ => None,
-                }
-            }
-        }
-    }
-    kernel_list!(embed_metallibs);
-}
+// Auto-generated: kernel_data module, TritonKernels struct + load(),
+// DecoderKernels struct + load().
+include!("../kernels/out/generated/triton_metal_gen.rs");
 
 fn cdiv(a: usize, b: usize) -> usize {
     (a + b - 1) / b
@@ -153,94 +46,13 @@ fn matmul_tg_size(pipeline: &ComputePipeline, _block_m: usize, _block_n: usize) 
     tg_size(pipeline, 1024)
 }
 
-/// AIR-aware threadgroup size for flash attention.
-#[cfg(target_arch = "aarch64")]
+/// Threadgroup size for flash attention (MSL kernel uses 832 threads).
 fn fa_tg_size(pipeline: &ComputePipeline) -> MTLSize {
-    tg_size(pipeline, 128) // AIR FA uses 4 warps × 32 = 128
+    tg_size(pipeline, 832)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
-fn fa_tg_size(pipeline: &ComputePipeline) -> MTLSize {
-    tg_size(pipeline, 832) // MSL FA uses 832 threads
-}
-
-/// All compiled Triton kernel pipelines for the Moonshine encoder.
-pub struct TritonKernels {
-    pub matmul_64x64: ComputePipeline,
-    pub matmul_128x128: Option<ComputePipeline>,
-    pub matmul_bias_32x32: ComputePipeline,
-    pub matmul_bias_64x64: Option<ComputePipeline>,
-    pub matmul_bias_128x128: Option<ComputePipeline>,
-    pub matmul_bias_gelu_32x32: ComputePipeline,
-    pub matmul_bias_gelu_64x64: Option<ComputePipeline>,
-    pub matmul_bias_gelu_128x128: Option<ComputePipeline>,
-    pub layernorm_unit_offset: ComputePipeline,
-    pub layernorm_bare: Option<ComputePipeline>,
-    pub residual_add: ComputePipeline,
-    pub flash_attention: ComputePipeline,
-    pub gelu: ComputePipeline,
-    pub bias_add: ComputePipeline,
-}
-
-impl TritonKernels {
-    /// Load kernels from embedded data (metallib on Apple Silicon, MSL source on Intel).
-    pub fn load(metal_device: &MetalDevice) -> Result<Self> {
-        let device = metal_device.device();
-
-        let load = |name: &str, func_name: &str| -> Result<ComputePipeline> {
-            eprint!("    {name}...");
-            let data = kernel_data::load_kernel(name)
-                .ok_or_else(|| anyhow::anyhow!("No embedded kernel for {name}"))?;
-            let lib = device.new_library_with_data(data)
-                .map_err(|e| anyhow::anyhow!("Failed to load metallib {name}: {e}"))?;
-            let func = lib
-                .get_function(func_name, None)
-                .map_err(|e| anyhow::anyhow!("Function {func_name} not found in {name}: {e}"))?;
-            let pipeline = device
-                .new_compute_pipeline_state_with_function(&func)
-                .map_err(|e| anyhow::anyhow!("Pipeline failed for {name}: {e}"))?;
-            eprintln!(" ok (max_threads={})", pipeline.max_total_threads_per_threadgroup());
-            Ok(pipeline)
-        };
-
-        Ok(Self {
-            matmul_64x64: load("matmul_fp16_64x64x32", "matmul_fp16")?,
-            matmul_128x128: load("matmul_fp16_128x128x32", "matmul_fp16").ok(),
-            matmul_bias_32x32: load("matmul_bias_fp16_32x32x32", "matmul_bias_fp16")?,
-            matmul_bias_64x64: {
-                match load("matmul_bias_fp16_64x64x32", "matmul_bias_fp16") {
-                    Ok(p) => Some(p),
-                    Err(e) => { eprintln!(" SKIP ({e})"); None }
-                }
-            },
-            matmul_bias_128x128: {
-                match load("matmul_bias_fp16_128x128x32", "matmul_bias_fp16") {
-                    Ok(p) => Some(p),
-                    Err(e) => { eprintln!(" SKIP ({e})"); None }
-                }
-            },
-            matmul_bias_gelu_32x32: load("matmul_bias_gelu_fp16_32x32x32", "matmul_bias_gelu_fp16")?,
-            matmul_bias_gelu_64x64: {
-                match load("matmul_bias_gelu_fp16_64x64x32", "matmul_bias_gelu_fp16") {
-                    Ok(p) => Some(p),
-                    Err(e) => { eprintln!(" SKIP ({e})"); None }
-                }
-            },
-            matmul_bias_gelu_128x128: {
-                match load("matmul_bias_gelu_fp16_128x128x32", "matmul_bias_gelu_fp16") {
-                    Ok(p) => Some(p),
-                    Err(e) => { eprintln!(" SKIP ({e})"); None }
-                }
-            },
-            layernorm_unit_offset: load("layernorm_unit_offset_768", "layernorm")?,
-            layernorm_bare: load("layernorm_bare_768", "layernorm_bare").ok(),
-            residual_add: load("residual_add_fp16", "residual_add")?,
-            flash_attention: load("flash_attention_fwd_32x32x64", "flash_attention_fwd")?,
-            gelu: load("gelu_fp16", "gelu_forward")?,
-            bias_add: load("bias_add_fp16", "bias_add")?,
-        })
-    }
-}
+// TritonKernels struct + load() are auto-generated above via include!.
+// DecoderKernels struct + load() are also auto-generated.
 
 /// Create an empty F16 output tensor on the Metal device.
 pub fn empty_f16(device: &MetalDevice, shape: impl Into<Shape>) -> Result<Tensor> {
@@ -688,80 +500,6 @@ pub fn empty_f32(device: &MetalDevice, shape: impl Into<Shape>) -> Result<Tensor
 
 // ── Decoder kernel pipelines ─────────────────────────────────────────────────
 
-/// All compiled Triton kernel pipelines for the Moonshine decoder.
-pub struct DecoderKernels {
-    pub gemv_f16w: ComputePipeline,
-    pub gemv_bias_f16w: ComputePipeline,
-    pub layernorm_std_f32in: ComputePipeline,
-    pub residual_add_f32: ComputePipeline,
-    pub convert_f32_to_f16: ComputePipeline,
-    pub attention_decode: ComputePipeline,
-    pub attention_splitkv_partial: ComputePipeline,
-    pub attention_splitkv_reduce: ComputePipeline,
-    pub rope_qk_cache_fused: ComputePipeline,
-    pub kv_cache_append: ComputePipeline,
-    pub glu_silu: ComputePipeline,
-    pub residual_add_layernorm: ComputePipeline,
-    pub gemv_bias_glu: ComputePipeline,
-    pub gemv_resadd_ln: ComputePipeline,
-    pub matmul_32x32: ComputePipeline,
-    pub gemv_splitk_partial: ComputePipeline,
-    pub gemv_splitk_bias_reduce: ComputePipeline,
-    pub gemv_splitk_reduce: ComputePipeline,
-    pub gemv_splitk_reduce_resadd_ln: ComputePipeline,
-    pub gemv_qkv_splitk_partial: ComputePipeline,
-    pub gemv_qkv_splitk_reduce: ComputePipeline,
-    pub gemv_glu_splitk_partial: ComputePipeline,
-    pub gemv_glu_splitk_reduce: ComputePipeline,
-}
-
-impl DecoderKernels {
-    pub fn load(metal_device: &MetalDevice) -> Result<Self> {
-        let device = metal_device.device();
-
-        let load = |name: &str, func_name: &str| -> Result<ComputePipeline> {
-            eprint!("    {name}...");
-            let data = kernel_data::load_kernel(name)
-                .ok_or_else(|| anyhow::anyhow!("No embedded kernel for {name}"))?;
-            let lib = device.new_library_with_data(data)
-                .map_err(|e| anyhow::anyhow!("Failed to load metallib {name}: {e}"))?;
-            let func = lib
-                .get_function(func_name, None)
-                .map_err(|e| anyhow::anyhow!("Function {func_name} not found in {name}: {e}"))?;
-            let pipeline = device
-                .new_compute_pipeline_state_with_function(&func)
-                .map_err(|e| anyhow::anyhow!("Pipeline failed for {name}: {e}"))?;
-            eprintln!(" ok (max_threads={})", pipeline.max_total_threads_per_threadgroup());
-            Ok(pipeline)
-        };
-
-        Ok(Self {
-            gemv_f16w: load("gemv_f16w", "gemv_f16w")?,
-            gemv_bias_f16w: load("gemv_bias_f16w", "gemv_bias_f16w")?,
-            layernorm_std_f32in: load("layernorm_standard_f32in_640", "layernorm")?,
-            residual_add_f32: load("residual_add_f32", "residual_add_f32")?,
-            convert_f32_to_f16: load("convert_f32_to_f16", "convert_f32_to_f16")?,
-            attention_decode: load("attention_decode_1d_d80", "attention_decode_1d_masked")?,
-            attention_splitkv_partial: load("attention_decode_splitkv_partial", "attention_decode_splitkv_partial")?,
-            attention_splitkv_reduce: load("attention_decode_splitkv_reduce", "attention_decode_splitkv_reduce")?,
-            rope_qk_cache_fused: load("rope_qk_cache_fused", "rope_qk_cache_fused")?,
-            kv_cache_append: load("kv_cache_append", "kv_cache_append")?,
-            glu_silu: load("glu_silu_fused", "glu_silu_fused")?,
-            residual_add_layernorm: load("residual_add_layernorm_fused", "residual_add_layernorm_fused")?,
-            gemv_bias_glu: load("gemv_bias_glu_fused", "gemv_bias_glu_fused")?,
-            gemv_resadd_ln: load("gemv_resadd_ln_fused", "gemv_resadd_ln_fused")?,
-            matmul_32x32: load("matmul_bias_fp16_32x32x32", "matmul_bias_fp16")?,
-            gemv_splitk_partial: load("gemv_splitk_partial", "gemv_splitk_partial")?,
-            gemv_splitk_bias_reduce: load("gemv_splitk_bias_reduce", "gemv_splitk_bias_reduce")?,
-            gemv_splitk_reduce: load("gemv_splitk_reduce", "gemv_splitk_reduce")?,
-            gemv_splitk_reduce_resadd_ln: load("gemv_splitk_reduce_resadd_ln", "gemv_splitk_reduce_resadd_ln")?,
-            gemv_qkv_splitk_partial: load("gemv_qkv_splitk_partial", "gemv_qkv_splitk_partial")?,
-            gemv_qkv_splitk_reduce: load("gemv_qkv_splitk_reduce", "gemv_qkv_splitk_reduce")?,
-            gemv_glu_splitk_partial: load("gemv_glu_splitk_partial", "gemv_glu_splitk_partial")?,
-            gemv_glu_splitk_reduce: load("gemv_glu_splitk_reduce", "gemv_glu_splitk_reduce")?,
-        })
-    }
-}
 
 // ── Decoder dispatch functions ───────────────────────────────────────────────
 

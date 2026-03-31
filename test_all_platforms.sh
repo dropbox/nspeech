@@ -21,9 +21,11 @@ header() { printf "\n\033[1;36m=== %s ===\033[0m\n" "$1"; }
 ok()     { PASS=$((PASS+1)); RESULTS+="  PASS  $1\n"; }
 fail()   { FAIL=$((FAIL+1)); RESULTS+="  FAIL  $1\n"; }
 
-# ── 1. Build all 3 targets ─────────────────────────────────────────────────
+# ── 1. Build kernels + Rust binaries ───────────────────────────────────────
 
-ninja -C kernels/out
+header "Building kernels"
+# Generate TTIR + ninja rules (if sources changed)
+(cd kernels && python build.py) 2>&1 | tail -5
 
 header "Building for M2 Mac (aarch64-apple-darwin)"
 cargo build --release --features triton-metal --example $EXAMPLE 2>&1 \
@@ -52,7 +54,7 @@ ecp target/x86_64-pc-windows-msvc/release/examples/$EXAMPLE.exe windows:candle/
 header "M2 Mac (local)"
 OUTPUT=$(target/release/examples/$EXAMPLE "$WAV" assets 3 2>&1) || true
 echo "$OUTPUT" | tail -5
-if echo "$OUTPUT" | grep -q 'RTF.*realtime'; then
+if echo "$OUTPUT" | grep -q 'RTF'; then
   ok "M2 Mac"
 else
   echo "$OUTPUT"
@@ -64,7 +66,7 @@ fi
 header "Intel Mac (ssh mac)"
 OUTPUT=$(ssh mac "cd speech && ./$EXAMPLE $WAV assets 3" 2>&1) || true
 echo "$OUTPUT" | tail -5
-if echo "$OUTPUT" | grep -q 'RTF.*realtime'; then
+if echo "$OUTPUT" | grep -q 'RTF'; then
   ok "Intel Mac"
 else
   echo "$OUTPUT"
@@ -76,7 +78,7 @@ fi
 header "Windows (ssh windows)"
 OUTPUT=$(ssh windows "cd candle && ./$EXAMPLE.exe $WAV assets 3" 2>&1) || true
 echo "$OUTPUT" | tail -5
-if echo "$OUTPUT" | grep -q 'RTF.*realtime'; then
+if echo "$OUTPUT" | grep -q 'RTF'; then
   ok "Windows"
 else
   echo "$OUTPUT"

@@ -125,7 +125,7 @@ impl TritonD3D12Encoder {
     pub fn new(cfg: &MoonshineConfig, vb: QVarBuilder, gpu: &Arc<Gpu>) -> Result<Self> {
         // Set USE_FP16_ACC=1 to use fp16 accumulation (2x throughput on Iris Xe)
         let use_fp16_acc = std::env::var("USE_FP16_ACC").map_or(false, |v| v == "1");
-        println!("  Compiling Triton HLSL kernels (fp16_acc={})...", use_fp16_acc);
+        println!("  Loading Triton DXIL kernels (fp16_acc={})...", use_fp16_acc);
         let kernels = TritonD3D12Kernels::load(gpu, use_fp16_acc)?;
 
         let kv_dim = cfg.encoder_num_kv_heads * cfg.encoder_head_dim;

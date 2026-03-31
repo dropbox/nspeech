@@ -218,7 +218,6 @@ impl TritonEncoder {
         let x_metal = x.reshape((seq_len, dim))?
             .to_dtype(DType::F16)?
             .to_device(&self.metal_candle_device)?;
-
         // Pad to multiple of block_m if needed
         let mut hidden = if padded_seq > seq_len {
             let pad = Tensor::zeros(
@@ -260,7 +259,6 @@ impl TritonEncoder {
                 // Fallback: this path should not be reached when bare kernel is compiled
                 unreachable!("layernorm_bare kernel not compiled")
             };
-
             // ── Fused Q/K/V projection: single matmul [T,768] @ [768,1920] → [T,1920] ──
             let qkv = triton_matmul(dev, matmul_pipeline, &normed, &layer.self_attn.qkv_weight, padded_seq, 3 * kv_dim, dim, block_m, block_m)?;
             let q = qkv.narrow(1, 0, kv_dim)?;

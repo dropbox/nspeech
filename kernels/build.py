@@ -76,7 +76,7 @@ def gen_ttir():
 def gen_ninja():
     """Write build.ninja for TTIR → MSL/metallib/HLSL."""
     sys.path.insert(0, str(SCRIPT_DIR))
-    from kernel_configs import METAL_KERNELS, HLSL_EXTRA_KERNELS, get_hlsl_kernels
+    from kernel_configs import METAL_KERNELS, HLSL_EXTRA_KERNELS, get_hlsl_kernels, KERNEL_METADATA
 
     ttir = OUT / "ttir"
     apple = OUT / "apple"
@@ -99,16 +99,28 @@ def gen_ninja():
     w.append("rule msl_intel\n  command = $python $step msl_intel $in $out\n  description = MSL(intel) $out")
     w.append("rule metallib_apple\n  command = xcrun metal -std=metal3.1 -O3 -ffast-math -w -o $out $in\n  description = METALLIB(apple) $out")
     w.append("rule metallib_intel\n  command = xcrun metal -std=macos-metal2.4 -mmacosx-version-min=14.0 -ffast-math -w -o $out $in\n  description = METALLIB(intel) $out")
-    w.append("rule air_emit\n  command = $python $step air_apple $in $out\n  description = AIR(emit) $out")
-    w.append("rule air_asm\n  command = xcrun metal-as -o $out $in\n  description = AIR(asm) $out")
-    w.append("rule air_link\n  command = xcrun metallib -o $out $in\n  description = AIR(link) $out")
+    # AIR disabled for now — re-enable when emitter covers all ops
+    # w.append("rule air_emit\n  command = $python $step air_apple $in $out\n  description = AIR(emit) $out")
+    # w.append("rule air_asm\n  command = xcrun metal-as -o $out $in\n  description = AIR(asm) $out")
+    # w.append("rule air_link\n  command = xcrun metallib -o $out $in\n  description = AIR(link) $out")
     w.append("rule hlsl\n  command = $python $step hlsl $in $out\n  description = HLSL $out")
+
+    # DXC: HLSL → DXIL (only if dxc binary is available)
+    dxc_bin = SCRIPT_DIR / "dxc" / "dxc"
+    dxc_lib = SCRIPT_DIR / "dxc"
+    has_dxc = dxc_bin.exists()
+    if has_dxc:
+        w.append(f"rule dxil\n"
+                 f"  command = DYLD_LIBRARY_PATH={dxc_lib} {dxc_bin} "
+                 f"-T cs_6_2 -E $entry -enable-16bit-types -O3 -Fo $out $in\n"
+                 f"  description = DXIL $out")
+
     w.append("")
 
-    apple_libs, intel_libs, air_libs, hlsl_files = [], [], [], []
+    apple_libs, intel_libs, hlsl_files = [], [], []
 
-    air_dir = OUT / "air"
-    air_dir.mkdir(parents=True, exist_ok=True)
+    dxil_dir = OUT / "dxil"
+    dxil_dir.mkdir(parents=True, exist_ok=True)
 
     for cfg in METAL_KERNELS:
         name = cfg[0]
@@ -125,16 +137,9 @@ def gen_ninja():
         w.append(f"build {il}: metallib_intel {im}")
         apple_libs.append(str(al))
         intel_libs.append(str(il))
-        # AIR path: .ttir -> .ll -> .air -> .metallib
-        a_ll = air_dir / f"{name}.ll"
-        a_air = air_dir / f"{name}.air"
-        a_lib = air_dir / f"{name}.metallib"
-        w.append(f"build {a_ll}: air_emit {t} {implicit}")
-        w.append(f"build {a_air}: air_asm {a_ll}")
-        w.append(f"build {a_lib}: air_link {a_air}")
-        air_libs.append(str(a_lib))
 
     hlsl_seen = set()
+    dxil_files = []
     for cfg in get_hlsl_kernels():
         name = cfg[0]
         if name in hlsl_seen:
@@ -146,25 +151,55 @@ def gen_ninja():
         h = hlsl / f"{name}.hlsl"
         w.append(f"build {h}: hlsl {t} {implicit}")
         hlsl_files.append(str(h))
+        # DXIL: compile HLSL → DXIL via DXC (only for d3d12-capable kernels)
+        if has_dxc and KERNEL_METADATA.get(name, {}).get("d3d12"):
+            meta_path = ttir / f"{name}.json"
+            if meta_path.exists():
+                meta = json.loads(meta_path.read_text())
+                entry_point = meta.get("kernel_name", name)
+            else:
+                entry_point = name
+            d = dxil_dir / f"{name}.dxil"
+            w.append(f"build {d}: dxil {h}")
+            w.append(f"  entry = {entry_point}")
+            dxil_files.append(str(d))
 
     w.append("")
     w.append(f"build apple: phony {' '.join(apple_libs)}")
     w.append(f"build intel: phony {' '.join(intel_libs)}")
-    w.append(f"build air: phony {' '.join(air_libs)}")
     w.append(f"build hlsl_all: phony {' '.join(hlsl_files)}")
-    w.append("default apple intel air hlsl_all")
+    if dxil_files:
+        w.append(f"build dxil_all: phony {' '.join(dxil_files)}")
+    w.append(f"default apple intel hlsl_all{' dxil_all' if dxil_files else ''}")
     w.append("")
 
     (OUT / "build.ninja").write_text("\n".join(w))
-    print(f"build.ninja: {len(apple_libs)} apple, {len(intel_libs)} intel, {len(air_libs)} air, {len(hlsl_files)} hlsl")
+    print(f"build.ninja: {len(apple_libs)} apple, {len(intel_libs)} intel, {len(hlsl_files)} hlsl, {len(dxil_files)} dxil")
 
 
 def run_ninja():
     ninja = NINJA if Path(NINJA).exists() else "ninja"
     t0 = time.time()
     r = subprocess.run([ninja, "-f", str(OUT / "build.ninja")])
-    print(f"ninja: {time.time()-t0:.1f}s (exit={r.returncode})")
-    return r.returncode == 0
+    dt = time.time() - t0
+    # Critical: all apple + intel metallibs must exist
+    from kernel_configs import METAL_KERNELS
+    ttir = OUT / "ttir"
+    missing = [c[0] for c in METAL_KERNELS
+               if (ttir / f"{c[0]}.ttir").exists()
+               and (not (OUT / "apple" / f"{c[0]}.metallib").exists()
+                    or not (OUT / "intel" / f"{c[0]}.metallib").exists())]
+    if missing:
+        print(f"ninja: {dt:.1f}s - FATAL: missing metallibs for {missing}")
+        return False
+    print(f"ninja: {dt:.1f}s (exit={r.returncode})")
+    return True
+
+
+def gen_rust():
+    """Generate Rust kernel embedding code from metadata."""
+    from gen_rust import main as gen_rust_main
+    gen_rust_main()
 
 
 if __name__ == "__main__":
@@ -172,3 +207,4 @@ if __name__ == "__main__":
     gen_ninja()
     if not run_ninja():
         sys.exit(1)
+    gen_rust()

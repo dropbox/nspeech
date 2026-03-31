@@ -5,9 +5,10 @@ fn main() {
     napi_build::setup();
 
     // ── Triton kernel compilation via kernels/build.py ─────────────────────
-    // Compiles @triton.jit → TTIR → MSL/HLSL → metallib via ninja.
-    // Output: kernels/out/{apple,intel}/*.metallib, kernels/out/hlsl/*.hlsl
-    // Embedded in binary via include_bytes!/include_str! — no stale kernels.
+    // Compiles @triton.jit → TTIR → MSL/HLSL → metallib/dxil via ninja.
+    // Output: kernels/out/{apple,intel}/*.metallib, kernels/out/hlsl/*.hlsl,
+    //         kernels/out/dxil/*.dxil
+    // Embedded via include_bytes!.
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let kernels_dir = manifest_dir.join("kernels");
@@ -20,6 +21,7 @@ fn main() {
         "kernels/kernel_configs.py",
         "kernels/build.py",
         "kernels/compile_step.py",
+        "kernels/gen_rust.py",
     ];
     let compiler_sources = &[
         "aot_compile.py",
@@ -40,9 +42,9 @@ fn main() {
         println!("cargo:rerun-if-changed={}", triton_metal_dir.join(src).display());
     }
 
-    // Track output directories so cargo recompiles when metallib/hlsl files change
-    // (include_bytes!/include_str! files need explicit tracking)
-    for subdir in &["kernels/out/apple", "kernels/out/intel", "kernels/out/hlsl"] {
+    // Track output directories so cargo recompiles when metallib/hlsl/dxil files change
+    for subdir in &["kernels/out/apple", "kernels/out/intel", "kernels/out/hlsl",
+                     "kernels/out/dxil", "kernels/out/generated"] {
         println!("cargo:rerun-if-changed={}", manifest_dir.join(subdir).display());
     }
 
@@ -83,7 +85,6 @@ fn main() {
 
     match status {
         Ok(s) if s.success() => {
-            // Write stamp
             let _ = std::fs::write(&stamp, format!("{:?}", std::time::SystemTime::now()));
             println!("cargo:warning=Triton kernels compiled successfully.");
         }
