@@ -12,7 +12,6 @@ Metallib compilation is handled directly by xcrun in build.ninja:
     .ll    -> xcrun metal-as -> .air -> xcrun metallib -> .metallib
 """
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -24,14 +23,12 @@ def main():
     cmd, inp, out = sys.argv[1], sys.argv[2], sys.argv[3]
 
     if cmd == "msl_apple":
-        os.environ["TRITON_METAL_SIMDGROUP"] = "1"
         from backend.codegen import ttir_to_msl_with_metadata
         msl, _, _, _ = ttir_to_msl_with_metadata(
             Path(inp).read_text(), block_size=256, use_simdgroup=True)
         Path(out).write_text(msl)
 
     elif cmd == "msl_intel":
-        os.environ["TRITON_METAL_SIMDGROUP"] = "0"
         from backend.codegen import ttir_to_msl_with_metadata
         msl, _, _, _ = ttir_to_msl_with_metadata(
             Path(inp).read_text(), block_size=256, use_simdgroup=False)
@@ -50,7 +47,6 @@ def main():
         }))
 
     elif cmd == "hlsl":
-        os.environ["TRITON_METAL_SIMDGROUP"] = "0"
         from backend.codegen import ttir_to_hlsl_with_metadata
         meta_path = Path(inp).with_suffix(".json")
         force_fp16 = False

@@ -26,7 +26,6 @@ def gen_ttir():
     """Generate TTIR for every kernel config (one Python process)."""
     sys.path.insert(0, str(TRITON_METAL))
     sys.path.insert(0, str(SCRIPT_DIR))
-    os.environ.setdefault("TRITON_METAL_SIMDGROUP", "0")
 
     from aot_compile import compile_kernel
     import moonshine_kernels as K
@@ -105,22 +104,9 @@ def gen_ninja():
     # w.append("rule air_link\n  command = xcrun metallib -o $out $in\n  description = AIR(link) $out")
     w.append("rule hlsl\n  command = $python $step hlsl $in $out\n  description = HLSL $out")
 
-    # DXC: HLSL → DXIL (only if dxc binary is available)
-    dxc_bin = SCRIPT_DIR / "dxc" / "dxc"
-    dxc_lib = SCRIPT_DIR / "dxc"
-    has_dxc = dxc_bin.exists()
-    if has_dxc:
-        w.append(f"rule dxil\n"
-                 f"  command = DYLD_LIBRARY_PATH={dxc_lib} {dxc_bin} "
-                 f"-T cs_6_2 -E $entry -enable-16bit-types -O3 -Fo $out $in\n"
-                 f"  description = DXIL $out")
-
     w.append("")
 
     apple_libs, intel_libs, hlsl_files = [], [], []
-
-    dxil_dir = OUT / "dxil"
-    dxil_dir.mkdir(parents=True, exist_ok=True)
 
     for cfg in METAL_KERNELS:
         name = cfg[0]
@@ -139,7 +125,6 @@ def gen_ninja():
         intel_libs.append(str(il))
 
     hlsl_seen = set()
-    dxil_files = []
     for cfg in get_hlsl_kernels():
         name = cfg[0]
         if name in hlsl_seen:
@@ -151,30 +136,17 @@ def gen_ninja():
         h = hlsl / f"{name}.hlsl"
         w.append(f"build {h}: hlsl {t} {implicit}")
         hlsl_files.append(str(h))
-        # DXIL: compile HLSL → DXIL via DXC (only for d3d12-capable kernels)
-        if has_dxc and KERNEL_METADATA.get(name, {}).get("d3d12"):
-            meta_path = ttir / f"{name}.json"
-            if meta_path.exists():
-                meta = json.loads(meta_path.read_text())
-                entry_point = meta.get("kernel_name", name)
-            else:
-                entry_point = name
-            d = dxil_dir / f"{name}.dxil"
-            w.append(f"build {d}: dxil {h}")
-            w.append(f"  entry = {entry_point}")
-            dxil_files.append(str(d))
 
     w.append("")
     w.append(f"build apple: phony {' '.join(apple_libs)}")
     w.append(f"build intel: phony {' '.join(intel_libs)}")
     w.append(f"build hlsl_all: phony {' '.join(hlsl_files)}")
-    if dxil_files:
-        w.append(f"build dxil_all: phony {' '.join(dxil_files)}")
-    w.append(f"default apple intel hlsl_all{' dxil_all' if dxil_files else ''}")
+    # DXIL compilation happens after ninja, via compile_dxil()
+    w.append(f"default apple intel hlsl_all")
     w.append("")
 
     (OUT / "build.ninja").write_text("\n".join(w))
-    print(f"build.ninja: {len(apple_libs)} apple, {len(intel_libs)} intel, {len(hlsl_files)} hlsl, {len(dxil_files)} dxil")
+    print(f"build.ninja: {len(apple_libs)} apple, {len(intel_libs)} intel, {len(hlsl_files)} hlsl")
 
 
 def run_ninja():
@@ -196,6 +168,128 @@ def run_ninja():
     return True
 
 
+def compile_dxil():
+    """Compile HLSL → DXIL, preferring Windows DXC via SSH for optimal Intel GPU code.
+
+    Falls back to local Mac DXC if Windows is unreachable.
+    """
+    sys.path.insert(0, str(SCRIPT_DIR))
+    from kernel_configs import KERNEL_METADATA
+
+    hlsl_dir = OUT / "hlsl"
+    ttir_dir = OUT / "ttir"
+    dxil_dir = OUT / "dxil"
+    dxil_dir.mkdir(parents=True, exist_ok=True)
+
+    # Collect HLSL → entry point mapping for d3d12-capable kernels
+    kernels = {}
+    for name, meta in KERNEL_METADATA.items():
+        if not meta.get("d3d12"):
+            continue
+        hlsl_path = hlsl_dir / f"{name}.hlsl"
+        if not hlsl_path.exists():
+            continue
+        json_path = ttir_dir / f"{name}.json"
+        if json_path.exists():
+            entry = json.loads(json_path.read_text()).get("kernel_name", name)
+        else:
+            entry = name
+        kernels[name] = entry
+
+    if not kernels:
+        return
+
+    # Try Windows DXC via SSH (produces optimal code for Intel GPUs)
+    if _compile_dxil_remote(kernels, hlsl_dir, dxil_dir):
+        return
+
+    # Fall back to local Mac DXC
+    dxc_bin = SCRIPT_DIR / "dxc" / "dxc"
+    if dxc_bin.exists():
+        print("DXIL: using local Mac DXC (fallback)")
+        _compile_dxil_local(kernels, hlsl_dir, dxil_dir, dxc_bin)
+    else:
+        print("DXIL: no DXC available, skipping")
+
+
+def _compile_dxil_remote(kernels, hlsl_dir, dxil_dir):
+    """Compile DXIL on Windows via SSH. Returns True on success."""
+    # Check if Windows host is reachable
+    try:
+        r = subprocess.run(["ssh", "-o", "ConnectTimeout=3", "windows", "echo ok"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return False
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+    t0 = time.time()
+    remote_dir = "candle/dxil_build"
+
+    # Copy HLSL files to Windows
+    hlsl_files = [hlsl_dir / f"{name}.hlsl" for name in kernels]
+    subprocess.run(["ssh", "windows", f"mkdir -p {remote_dir}"], check=True)
+    subprocess.run(["scp", "-q"] + [str(f) for f in hlsl_files] +
+                   [f"windows:{remote_dir}/"], check=True)
+
+    # Build PowerShell compile script
+    dxc = r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\dxc.exe"
+    ps_lines = [f'$DXC = "{dxc}"']
+    ps_lines.append(f'cd {remote_dir}')
+    ps_lines.append(f'if (-not (Test-Path dxil)) {{ New-Item -ItemType Directory dxil | Out-Null }}')
+    for name, entry in sorted(kernels.items()):
+        ps_lines.append(
+            f'& $DXC -T cs_6_2 -E {entry} -enable-16bit-types -O3 '
+            f'-Fo "dxil\\{name}.dxil" "{name}.hlsl" 2>&1 | Out-Null'
+        )
+    ps_lines.append('Write-Host "done"')
+    ps_script = "\n".join(ps_lines)
+
+    # Write and run script
+    script_path = Path("/tmp/dxil_build.ps1")
+    script_path.write_text(ps_script)
+    subprocess.run(["scp", "-q", str(script_path), f"windows:{remote_dir}/build.ps1"], check=True)
+
+    r = subprocess.run(
+        ["ssh", "windows", f"powershell -ExecutionPolicy Bypass -File {remote_dir}/build.ps1"],
+        capture_output=True, text=True, timeout=120
+    )
+    if r.returncode != 0:
+        print(f"DXIL: Windows DXC failed: {r.stderr[:200]}")
+        return False
+
+    # Copy DXIL files back
+    subprocess.run(
+        ["scp", "-q", f"windows:{remote_dir}/dxil/*.dxil", str(dxil_dir) + "/"],
+        check=True
+    )
+
+    # Verify
+    compiled = sum(1 for name in kernels if (dxil_dir / f"{name}.dxil").exists()
+                   and (dxil_dir / f"{name}.dxil").stat().st_size > 0)
+    dt = time.time() - t0
+    print(f"DXIL: {compiled}/{len(kernels)} compiled on Windows in {dt:.1f}s")
+    return compiled > 0
+
+
+def _compile_dxil_local(kernels, hlsl_dir, dxil_dir, dxc_bin):
+    """Compile DXIL with local Mac DXC (fallback)."""
+    dxc_lib = SCRIPT_DIR / "dxc"
+    env = {**os.environ, "DYLD_LIBRARY_PATH": str(dxc_lib)}
+    ok = 0
+    for name, entry in sorted(kernels.items()):
+        hlsl_path = hlsl_dir / f"{name}.hlsl"
+        dxil_path = dxil_dir / f"{name}.dxil"
+        r = subprocess.run(
+            [str(dxc_bin), "-T", "cs_6_2", "-E", entry,
+             "-enable-16bit-types", "-O3", "-Fo", str(dxil_path), str(hlsl_path)],
+            env=env, capture_output=True, text=True
+        )
+        if r.returncode == 0 and dxil_path.exists() and dxil_path.stat().st_size > 0:
+            ok += 1
+    print(f"DXIL: {ok}/{len(kernels)} compiled locally (Mac DXC)")
+
+
 def gen_rust():
     """Generate Rust kernel embedding code from metadata."""
     from gen_rust import main as gen_rust_main
@@ -207,4 +301,5 @@ if __name__ == "__main__":
     gen_ninja()
     if not run_ninja():
         sys.exit(1)
+    compile_dxil()
     gen_rust()

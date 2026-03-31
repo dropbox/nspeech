@@ -6,12 +6,58 @@
 
 use anyhow::Result;
 use candle_core::{DType, MetalDevice, MetalStorage, Shape, Storage, Tensor};
-use candle_metal_kernels::metal::ComputePipeline;
+use candle_metal_kernels::metal::{Buffer, ComputePipeline};
 use objc2_metal::MTLSize;
+use std::sync::Arc;
 
 // Auto-generated: kernel_data module, TritonKernels struct + load(),
 // DecoderKernels struct + load().
 include!("../kernels/out/generated/triton_metal_gen.rs");
+
+// ── GpuBuffer: lightweight GPU buffer wrapper (same name on Metal + D3D12) ──
+
+/// A Metal GPU buffer with byte offset. Same name as D3D12's GpuBuffer
+/// to maximize code-sharing potential between platforms.
+pub struct GpuBuffer {
+    buffer: Arc<Buffer>,
+    pub offset: usize, // byte offset into buffer
+}
+
+impl GpuBuffer {
+    /// Allocate an uninitialized F16 buffer.
+    pub fn alloc_f16(device: &MetalDevice, count: usize) -> Result<Self> {
+        let buffer = device.new_buffer(count, DType::F16, "mb_f16")?;
+        Ok(Self { buffer, offset: 0 })
+    }
+
+    /// Allocate an uninitialized F32 buffer.
+    pub fn alloc_f32(device: &MetalDevice, count: usize) -> Result<Self> {
+        let buffer = device.new_buffer(count, DType::F32, "mb_f32")?;
+        Ok(Self { buffer, offset: 0 })
+    }
+
+    /// Create from F16 data (upload to GPU).
+    pub fn from_f16_data(device: &MetalDevice, data: &[half::f16]) -> Result<Self> {
+        let buffer = device.new_buffer_with_data(data)?;
+        Ok(Self { buffer, offset: 0 })
+    }
+
+    /// Create from F32 data (upload to GPU).
+    pub fn from_f32_data(device: &MetalDevice, data: &[f32]) -> Result<Self> {
+        let buffer = device.new_buffer_with_data(data)?;
+        Ok(Self { buffer, offset: 0 })
+    }
+
+    /// Get the underlying Metal buffer for dispatch.
+    #[inline]
+    pub fn buf(&self) -> &Buffer { &self.buffer }
+
+    /// Raw pointer to buffer contents (for CPU read/write on shared buffers).
+    #[inline]
+    pub fn contents_ptr(&self) -> *mut u8 {
+        unsafe { self.buffer.contents().add(self.offset) }
+    }
+}
 
 fn cdiv(a: usize, b: usize) -> usize {
     (a + b - 1) / b
@@ -846,643 +892,379 @@ pub fn triton_gemv_resadd_ln(
     }
 }
 
-// ── Batched dispatch (shared encoder) ────────────────────────────────────────
-// These variants accept a &ComputeCommandEncoder, allowing ~200 dispatches per
-// decoder token to share a single encoder instead of creating one per dispatch.
+// ── Batched dispatch (shared encoder, MetalBuffer) ──────────────────────────
+// These variants accept a &ComputeCommandEncoder + &GpuBuffer, allowing ~200
+// dispatches per decoder token to share a single encoder. No Tensor overhead.
 
 use candle_metal_kernels::metal::ComputeCommandEncoder;
 
 pub fn enc_gemv_f16w(
     enc: &ComputeCommandEncoder, pipeline: &ComputePipeline,
-    x: &Tensor, w: &Tensor, out: &Tensor, n: usize, k: usize,
-) -> Result<()> {
-    with_metal_buffers!(x, w, out, |x_buf, x_off, w_buf, w_off, o_buf, o_off| {
-        enc.set_compute_pipeline_state(pipeline);
-        enc.set_buffer(0, Some(x_buf), x_off);
-        enc.set_buffer(1, Some(w_buf), w_off);
-        enc.set_buffer(2, Some(o_buf), o_off);
-        enc.set_bytes(3, &(n as i32));
-        enc.set_bytes(4, &(k as i32));
-        enc.set_bytes(5, &1i32);
-        enc.set_bytes(6, &(n as i32));
-        enc.dispatch_thread_groups(
-            MTLSize { width: cdiv(n, 128), height: 1, depth: 1 },
-            tg_size(pipeline, 128),
-        );
-        Ok::<(), anyhow::Error>(())
-    })
-}
-
-pub fn enc_gemv_bias_f16w(
-    enc: &ComputeCommandEncoder, pipeline: &ComputePipeline,
-    x: &Tensor, w: &Tensor, bias: &Tensor, out: &Tensor, n: usize, k: usize,
-) -> Result<()> {
-    with_metal_buffers!(x, w, bias, out, |x_buf, x_off, w_buf, w_off, b_buf, b_off, o_buf, o_off| {
-        enc.set_compute_pipeline_state(pipeline);
-        enc.set_buffer(0, Some(x_buf), x_off);
-        enc.set_buffer(1, Some(w_buf), w_off);
-        enc.set_buffer(2, Some(b_buf), b_off);
-        enc.set_buffer(3, Some(o_buf), o_off);
-        enc.set_bytes(4, &(n as i32));
-        enc.set_bytes(5, &(k as i32));
-        enc.set_bytes(6, &1i32);
-        enc.set_bytes(7, &(n as i32));
-        enc.dispatch_thread_groups(
-            MTLSize { width: cdiv(n, 128), height: 1, depth: 1 },
-            tg_size(pipeline, 128),
-        );
-        Ok::<(), anyhow::Error>(())
-    })
+    x: &GpuBuffer, w: &GpuBuffer, out: &GpuBuffer, n: usize, k: usize,
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(x.buf()), x.offset);
+    enc.set_buffer(1, Some(w.buf()), w.offset);
+    enc.set_buffer(2, Some(out.buf()), out.offset);
+    enc.set_bytes(3, &(n as i32));
+    enc.set_bytes(4, &(k as i32));
+    enc.set_bytes(5, &1i32);
+    enc.set_bytes(6, &(n as i32));
+    enc.dispatch_thread_groups(
+        MTLSize { width: cdiv(n, 128), height: 1, depth: 1 },
+        tg_size(pipeline, 128),
+    );
 }
 
 pub fn enc_layernorm_std_f32in(
     enc: &ComputeCommandEncoder, pipeline: &ComputePipeline,
-    x: &Tensor, weight: &Tensor, out: &Tensor, n_rows: usize, n_cols: usize,
-) -> Result<()> {
-    with_metal_buffers!(x, weight, out, |x_buf, x_off, w_buf, w_off, o_buf, o_off| {
-        enc.set_compute_pipeline_state(pipeline);
-        enc.set_buffer(0, Some(x_buf), x_off);
-        enc.set_buffer(1, Some(w_buf), w_off);
-        enc.set_buffer(2, Some(o_buf), o_off);
-        enc.set_bytes(3, &(n_rows as i32));
-        enc.set_bytes(4, &(n_cols as i32));
-        enc.set_bytes(5, &(n_cols as i32));
-        enc.set_bytes(6, &(n_cols as i32));
-        #[cfg(target_arch = "aarch64")]
-        set_air_tg_mem(enc, 4096);
-        enc.dispatch_thread_groups(
-            MTLSize { width: n_rows, height: 1, depth: 1 },
-            tg_size(pipeline, 1024),
-        );
-        Ok::<(), anyhow::Error>(())
-    })
+    x: &GpuBuffer, weight: &GpuBuffer, out: &GpuBuffer, n_rows: usize, n_cols: usize,
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(x.buf()), x.offset);
+    enc.set_buffer(1, Some(weight.buf()), weight.offset);
+    enc.set_buffer(2, Some(out.buf()), out.offset);
+    enc.set_bytes(3, &(n_rows as i32));
+    enc.set_bytes(4, &(n_cols as i32));
+    enc.set_bytes(5, &(n_cols as i32));
+    enc.set_bytes(6, &(n_cols as i32));
+    #[cfg(target_arch = "aarch64")]
+    set_air_tg_mem(enc, 4096);
+    enc.dispatch_thread_groups(
+        MTLSize { width: n_rows, height: 1, depth: 1 },
+        tg_size(pipeline, 1024),
+    );
 }
 
 pub fn enc_attention_decode(
     enc: &ComputeCommandEncoder, pipeline: &ComputePipeline,
-    q: &Tensor, k: &Tensor, v: &Tensor, out: &Tensor,
+    q: &GpuBuffer, k: &GpuBuffer, v: &GpuBuffer, out: &GpuBuffer,
     kv_len: usize, head_dim: usize, n_kv_heads: usize, n_q_heads: usize,
     sm_scale: f32, stride_kv_head: usize, stride_kv_seq: usize,
-) -> Result<()> {
-    with_metal_buffers!(q, k, v, out, |q_buf, q_off, k_buf, k_off, v_buf, v_off, o_buf, o_off| {
-        enc.set_compute_pipeline_state(pipeline);
-        enc.set_buffer(0, Some(q_buf), q_off);
-        enc.set_buffer(1, Some(k_buf), k_off);
-        enc.set_buffer(2, Some(v_buf), v_off);
-        enc.set_buffer(3, Some(o_buf), o_off);
-        enc.set_bytes(4, &(kv_len as i32));
-        enc.set_bytes(5, &(n_q_heads as i32));
-        enc.set_bytes(6, &(n_kv_heads as i32));
-        enc.set_bytes(7, &sm_scale);
-        enc.set_bytes(8, &(stride_kv_head as i32));
-        enc.set_bytes(9, &(stride_kv_seq as i32));
-        enc.set_bytes(10, &(head_dim as i32));
-        #[cfg(target_arch = "aarch64")]
-        set_air_tg_mem(enc, 512);
-        enc.dispatch_thread_groups(
-            MTLSize { width: n_q_heads, height: 1, depth: 1 },
-            tg_size(pipeline, 128),
-        );
-        Ok::<(), anyhow::Error>(())
-    })
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(q.buf()), q.offset);
+    enc.set_buffer(1, Some(k.buf()), k.offset);
+    enc.set_buffer(2, Some(v.buf()), v.offset);
+    enc.set_buffer(3, Some(out.buf()), out.offset);
+    enc.set_bytes(4, &(kv_len as i32));
+    enc.set_bytes(5, &(n_q_heads as i32));
+    enc.set_bytes(6, &(n_kv_heads as i32));
+    enc.set_bytes(7, &sm_scale);
+    enc.set_bytes(8, &(stride_kv_head as i32));
+    enc.set_bytes(9, &(stride_kv_seq as i32));
+    enc.set_bytes(10, &(head_dim as i32));
+    #[cfg(target_arch = "aarch64")]
+    set_air_tg_mem(enc, 512);
+    enc.dispatch_thread_groups(
+        MTLSize { width: n_q_heads, height: 1, depth: 1 },
+        tg_size(pipeline, 128),
+    );
 }
 
 pub fn enc_attention_splitkv(
     enc: &ComputeCommandEncoder,
     partial_pipeline: &ComputePipeline, reduce_pipeline: &ComputePipeline,
-    q: &Tensor, k: &Tensor, v: &Tensor, out: &Tensor, partial_buf: &Tensor,
+    q: &GpuBuffer, k: &GpuBuffer, v: &GpuBuffer, out: &GpuBuffer, partial_buf: &GpuBuffer,
     kv_len: usize, head_dim: usize, n_kv_heads: usize, n_q_heads: usize,
     sm_scale: f32, stride_kv_head: usize, stride_kv_seq: usize,
     n_splits: usize,
-) -> Result<()> {
+) {
     let kv_per_split = (kv_len + n_splits - 1) / n_splits;
     let block_d = 128usize;
     let stride_partial = 3 * block_d;
 
     // Phase 1: partial attention per (head, split)
-    // Need 4 buffers: q, k, v, partial — use nested extraction
-    let (sq, lq) = q.storage_and_layout();
-    let (sk, lk) = k.storage_and_layout();
-    let (sv, lv) = v.storage_and_layout();
-    let (sp, lp) = partial_buf.storage_and_layout();
-    let q_off = lq.start_offset() * q.dtype().size_in_bytes();
-    let k_off = lk.start_offset() * k.dtype().size_in_bytes();
-    let v_off = lv.start_offset() * v.dtype().size_in_bytes();
-    let p_off = lp.start_offset() * partial_buf.dtype().size_in_bytes();
-    match (&*sq, &*sk, &*sv, &*sp) {
-        (Storage::Metal(mq), Storage::Metal(mk), Storage::Metal(mv), Storage::Metal(mp)) => {
-            enc.set_compute_pipeline_state(partial_pipeline);
-            enc.set_buffer(0, Some(mq.buffer()), q_off);
-            enc.set_buffer(1, Some(mk.buffer()), k_off);
-            enc.set_buffer(2, Some(mv.buffer()), v_off);
-            enc.set_buffer(3, Some(mp.buffer()), p_off);
-            enc.set_bytes(4, &(kv_len as i32));
-            enc.set_bytes(5, &(n_q_heads as i32));
-            enc.set_bytes(6, &(n_kv_heads as i32));
-            enc.set_bytes(7, &sm_scale);
-            enc.set_bytes(8, &(stride_kv_head as i32));
-            enc.set_bytes(9, &(stride_kv_seq as i32));
-            enc.set_bytes(10, &(head_dim as i32));
-            enc.set_bytes(11, &(n_splits as i32));
-            enc.set_bytes(12, &(kv_per_split as i32));
-            enc.set_bytes(13, &(stride_partial as i32));
-            enc.dispatch_thread_groups(
-                MTLSize { width: n_q_heads * n_splits, height: 1, depth: 1 },
-                tg_size(partial_pipeline, 128),
-            );
-        }
-        _ => anyhow::bail!("All tensors must be on Metal device"),
-    }
-    drop(sq); drop(sk); drop(sv); drop(sp);
+    enc.set_compute_pipeline_state(partial_pipeline);
+    enc.set_buffer(0, Some(q.buf()), q.offset);
+    enc.set_buffer(1, Some(k.buf()), k.offset);
+    enc.set_buffer(2, Some(v.buf()), v.offset);
+    enc.set_buffer(3, Some(partial_buf.buf()), partial_buf.offset);
+    enc.set_bytes(4, &(kv_len as i32));
+    enc.set_bytes(5, &(n_q_heads as i32));
+    enc.set_bytes(6, &(n_kv_heads as i32));
+    enc.set_bytes(7, &sm_scale);
+    enc.set_bytes(8, &(stride_kv_head as i32));
+    enc.set_bytes(9, &(stride_kv_seq as i32));
+    enc.set_bytes(10, &(head_dim as i32));
+    enc.set_bytes(11, &(n_splits as i32));
+    enc.set_bytes(12, &(kv_per_split as i32));
+    enc.set_bytes(13, &(stride_partial as i32));
+    enc.dispatch_thread_groups(
+        MTLSize { width: n_q_heads * n_splits, height: 1, depth: 1 },
+        tg_size(partial_pipeline, 128),
+    );
 
     // Phase 2: reduce partials to final output
-    let (sp2, lp2) = partial_buf.storage_and_layout();
-    let (so, lo) = out.storage_and_layout();
-    let p_off2 = lp2.start_offset() * partial_buf.dtype().size_in_bytes();
-    let o_off = lo.start_offset() * out.dtype().size_in_bytes();
-    match (&*sp2, &*so) {
-        (Storage::Metal(mp2), Storage::Metal(mo)) => {
-            enc.set_compute_pipeline_state(reduce_pipeline);
-            enc.set_buffer(0, Some(mp2.buffer()), p_off2);
-            enc.set_buffer(1, Some(mo.buffer()), o_off);
-            enc.set_bytes(2, &(n_q_heads as i32));
-            enc.set_bytes(3, &(n_splits as i32));
-            enc.set_bytes(4, &(head_dim as i32));
-            enc.set_bytes(5, &(stride_partial as i32));
-            enc.dispatch_thread_groups(
-                MTLSize { width: n_q_heads, height: 1, depth: 1 },
-                tg_size(reduce_pipeline, 128),
-            );
-            Ok(())
-        }
-        _ => anyhow::bail!("All tensors must be on Metal device"),
-    }
+    enc.set_compute_pipeline_state(reduce_pipeline);
+    enc.set_buffer(0, Some(partial_buf.buf()), partial_buf.offset);
+    enc.set_buffer(1, Some(out.buf()), out.offset);
+    enc.set_bytes(2, &(n_q_heads as i32));
+    enc.set_bytes(3, &(n_splits as i32));
+    enc.set_bytes(4, &(head_dim as i32));
+    enc.set_bytes(5, &(stride_partial as i32));
+    enc.dispatch_thread_groups(
+        MTLSize { width: n_q_heads, height: 1, depth: 1 },
+        tg_size(reduce_pipeline, 128),
+    );
 }
 
 pub fn enc_rope_qk_cache_fused(
     enc: &ComputeCommandEncoder, pipeline: &ComputePipeline,
-    q: &Tensor, k: &Tensor, rope_table: &Tensor, cache_k: &Tensor,
+    q: &GpuBuffer, k: &GpuBuffer, rope_table: &GpuBuffer, cache_k: &GpuBuffer,
     n_q_heads: usize, n_kv_heads: usize, head_dim: usize,
     half_rot: usize, pos: usize, max_kv_len: usize,
-) -> Result<()> {
-    with_metal_buffers!(q, k, rope_table, cache_k, |q_buf, q_off, k_buf, k_off, r_buf, r_off, c_buf, c_off| {
-        enc.set_compute_pipeline_state(pipeline);
-        enc.set_buffer(0, Some(q_buf), q_off);
-        enc.set_buffer(1, Some(k_buf), k_off);
-        enc.set_buffer(2, Some(r_buf), r_off);
-        enc.set_buffer(3, Some(c_buf), c_off);
-        enc.set_bytes(4, &(n_q_heads as i32));
-        enc.set_bytes(5, &(n_kv_heads as i32));
-        enc.set_bytes(6, &(head_dim as i32));
-        enc.set_bytes(7, &(half_rot as i32));
-        enc.set_bytes(8, &(pos as i32));
-        enc.set_bytes(9, &(max_kv_len as i32));
-        enc.dispatch_thread_groups(
-            MTLSize { width: 1, height: 1, depth: 1 },
-            tg_size(pipeline, 512),
-        );
-        Ok::<(), anyhow::Error>(())
-    })
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(q.buf()), q.offset);
+    enc.set_buffer(1, Some(k.buf()), k.offset);
+    enc.set_buffer(2, Some(rope_table.buf()), rope_table.offset);
+    enc.set_buffer(3, Some(cache_k.buf()), cache_k.offset);
+    enc.set_bytes(4, &(n_q_heads as i32));
+    enc.set_bytes(5, &(n_kv_heads as i32));
+    enc.set_bytes(6, &(head_dim as i32));
+    enc.set_bytes(7, &(half_rot as i32));
+    enc.set_bytes(8, &(pos as i32));
+    enc.set_bytes(9, &(max_kv_len as i32));
+    enc.dispatch_thread_groups(
+        MTLSize { width: 1, height: 1, depth: 1 },
+        tg_size(pipeline, 512),
+    );
 }
 
 pub fn enc_kv_cache_append(
     enc: &ComputeCommandEncoder, pipeline: &ComputePipeline,
-    new_kv: &Tensor, cache: &Tensor,
+    new_kv: &GpuBuffer, cache: &GpuBuffer,
     n_kv_heads: usize, head_dim: usize, max_kv_len: usize, pos: usize,
-) -> Result<()> {
+) {
     let total_elems = n_kv_heads * head_dim;
-    let (s0, l0) = new_kv.storage_and_layout();
-    let (s1, l1) = cache.storage_and_layout();
-    let off0 = l0.start_offset() * new_kv.dtype().size_in_bytes();
-    let off1 = l1.start_offset() * cache.dtype().size_in_bytes();
-    match (&*s0, &*s1) {
-        (Storage::Metal(m0), Storage::Metal(m1)) => {
-            enc.set_compute_pipeline_state(pipeline);
-            enc.set_buffer(0, Some(m0.buffer()), off0);
-            enc.set_buffer(1, Some(m1.buffer()), off1);
-            enc.set_bytes(2, &(total_elems as i32));
-            enc.set_bytes(3, &(max_kv_len as i32));
-            enc.set_bytes(4, &(head_dim as i32));
-            enc.set_bytes(5, &(pos as i32));
-            enc.dispatch_thread_groups(
-                MTLSize { width: cdiv(total_elems, 256), height: 1, depth: 1 },
-                tg_size(pipeline, 256),
-            );
-            Ok(())
-        }
-        _ => anyhow::bail!("All tensors must be on Metal device"),
-    }
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(new_kv.buf()), new_kv.offset);
+    enc.set_buffer(1, Some(cache.buf()), cache.offset);
+    enc.set_bytes(2, &(total_elems as i32));
+    enc.set_bytes(3, &(max_kv_len as i32));
+    enc.set_bytes(4, &(head_dim as i32));
+    enc.set_bytes(5, &(pos as i32));
+    enc.dispatch_thread_groups(
+        MTLSize { width: cdiv(total_elems, 256), height: 1, depth: 1 },
+        tg_size(pipeline, 256),
+    );
 }
 
 pub fn enc_residual_add_layernorm(
     enc: &ComputeCommandEncoder, pipeline: &ComputePipeline,
-    f16_proj: &Tensor, f32_residual: &Tensor, f32_out: &Tensor,
-    weight: &Tensor, f16_norm: &Tensor,
+    f16_proj: &GpuBuffer, f32_residual: &GpuBuffer, f32_out: &GpuBuffer,
+    weight: &GpuBuffer, f16_norm: &GpuBuffer,
     n_rows: usize, dim: usize,
-) -> Result<()> {
-    let (s0, l0) = f16_proj.storage_and_layout();
-    let (s1, l1) = f32_residual.storage_and_layout();
-    let (s2, l2) = f32_out.storage_and_layout();
-    let (s3, l3) = weight.storage_and_layout();
-    let (s4, l4) = f16_norm.storage_and_layout();
-    let off0 = l0.start_offset() * f16_proj.dtype().size_in_bytes();
-    let off1 = l1.start_offset() * f32_residual.dtype().size_in_bytes();
-    let off2 = l2.start_offset() * f32_out.dtype().size_in_bytes();
-    let off3 = l3.start_offset() * weight.dtype().size_in_bytes();
-    let off4 = l4.start_offset() * f16_norm.dtype().size_in_bytes();
-    match (&*s0, &*s1, &*s2, &*s3, &*s4) {
-        (Storage::Metal(m0), Storage::Metal(m1), Storage::Metal(m2), Storage::Metal(m3), Storage::Metal(m4)) => {
-            enc.set_compute_pipeline_state(pipeline);
-            enc.set_buffer(0, Some(m0.buffer()), off0);
-            enc.set_buffer(1, Some(m1.buffer()), off1);
-            enc.set_buffer(2, Some(m2.buffer()), off2);
-            enc.set_buffer(3, Some(m3.buffer()), off3);
-            enc.set_buffer(4, Some(m4.buffer()), off4);
-            enc.set_bytes(5, &(n_rows as i32));
-            enc.set_bytes(6, &(dim as i32));
-            enc.set_bytes(7, &(dim as i32));
-            enc.set_bytes(8, &(dim as i32));
-            enc.dispatch_thread_groups(
-                MTLSize { width: n_rows, height: 1, depth: 1 },
-                tg_size(pipeline, 1024),
-            );
-            Ok(())
-        }
-        _ => anyhow::bail!("All tensors must be on Metal device"),
-    }
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(f16_proj.buf()), f16_proj.offset);
+    enc.set_buffer(1, Some(f32_residual.buf()), f32_residual.offset);
+    enc.set_buffer(2, Some(f32_out.buf()), f32_out.offset);
+    enc.set_buffer(3, Some(weight.buf()), weight.offset);
+    enc.set_buffer(4, Some(f16_norm.buf()), f16_norm.offset);
+    enc.set_bytes(5, &(n_rows as i32));
+    enc.set_bytes(6, &(dim as i32));
+    enc.set_bytes(7, &(dim as i32));
+    enc.set_bytes(8, &(dim as i32));
+    #[cfg(target_arch = "aarch64")]
+    set_air_tg_mem(enc, 4096);
+    enc.dispatch_thread_groups(
+        MTLSize { width: n_rows, height: 1, depth: 1 },
+        tg_size(pipeline, 1024),
+    );
 }
 
-pub fn enc_gemv_bias_glu(
-    enc: &ComputeCommandEncoder, pipeline: &ComputePipeline,
-    x: &Tensor, w: &Tensor, bias: &Tensor, out: &Tensor,
-    n_intermediate: usize, k: usize,
-) -> Result<()> {
-    with_metal_buffers!(x, w, bias, out, |x_buf, x_off, w_buf, w_off, b_buf, b_off, o_buf, o_off| {
-        enc.set_compute_pipeline_state(pipeline);
-        enc.set_buffer(0, Some(x_buf), x_off);
-        enc.set_buffer(1, Some(w_buf), w_off);
-        enc.set_buffer(2, Some(b_buf), b_off);
-        enc.set_buffer(3, Some(o_buf), o_off);
-        enc.set_bytes(4, &(n_intermediate as i32));
-        enc.set_bytes(5, &(k as i32));
-        enc.set_bytes(6, &1i32);
-        enc.set_bytes(7, &((n_intermediate * 2) as i32));
-        enc.dispatch_thread_groups(
-            MTLSize { width: cdiv(n_intermediate, 128), height: 1, depth: 1 },
-            tg_size(pipeline, 128),
-        );
-        Ok::<(), anyhow::Error>(())
-    })
-}
-
-/// K-split GEMV + bias for fc2: split K across multiple threadgroups, then reduce.
 pub fn enc_gemv_splitk_bias(
     enc: &ComputeCommandEncoder,
     partial_pipeline: &ComputePipeline, reduce_pipeline: &ComputePipeline,
-    x: &Tensor, w: &Tensor, bias: &Tensor, out: &Tensor, partial_buf: &Tensor,
+    x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer, partial_buf: &GpuBuffer,
     n: usize, k: usize, n_splits: usize,
-) -> Result<()> {
-    let k_per_split = k / n_splits;
-    let n_n_blocks = cdiv(n, 128);
-    let stride_wk = n;        // [K, N] layout
-    let stride_partial = n;   // [n_splits, N]
-
-    let (s0, l0) = x.storage_and_layout();
-    let (s1, l1) = w.storage_and_layout();
-    let (s2, l2) = bias.storage_and_layout();
-    let (s3, l3) = out.storage_and_layout();
-    let (s4, l4) = partial_buf.storage_and_layout();
-    let off0 = l0.start_offset() * x.dtype().size_in_bytes();
-    let off1 = l1.start_offset() * w.dtype().size_in_bytes();
-    let off2 = l2.start_offset() * bias.dtype().size_in_bytes();
-    let off3 = l3.start_offset() * out.dtype().size_in_bytes();
-    let off4 = l4.start_offset() * partial_buf.dtype().size_in_bytes();
-    match (&*s0, &*s1, &*s2, &*s3, &*s4) {
-        (Storage::Metal(m0), Storage::Metal(m1), Storage::Metal(m2), Storage::Metal(m3), Storage::Metal(m4)) => {
-            // Phase 1: partial GEMV
-            enc.set_compute_pipeline_state(partial_pipeline);
-            enc.set_buffer(0, Some(m0.buffer()), off0);
-            enc.set_buffer(1, Some(m1.buffer()), off1);
-            enc.set_buffer(2, Some(m4.buffer()), off4);
-            enc.set_bytes(3, &(n as i32));
-            enc.set_bytes(4, &(k as i32));
-            enc.set_bytes(5, &(stride_wk as i32));
-            enc.set_bytes(6, &(n_n_blocks as i32));
-            enc.set_bytes(7, &(k_per_split as i32));
-            enc.set_bytes(8, &(stride_partial as i32));
-            enc.dispatch_thread_groups(
-                MTLSize { width: n_n_blocks * n_splits, height: 1, depth: 1 },
-                tg_size(partial_pipeline, 128),
-            );
-            // Phase 2: reduce + bias
-            enc.set_compute_pipeline_state(reduce_pipeline);
-            enc.set_buffer(0, Some(m4.buffer()), off4);
-            enc.set_buffer(1, Some(m2.buffer()), off2);
-            enc.set_buffer(2, Some(m3.buffer()), off3);
-            enc.set_bytes(3, &(n as i32));
-            enc.set_bytes(4, &(n_splits as i32));
-            enc.set_bytes(5, &(stride_partial as i32));
-            enc.dispatch_thread_groups(
-                MTLSize { width: n_n_blocks, height: 1, depth: 1 },
-                tg_size(reduce_pipeline, 128),
-            );
-            Ok(())
-        }
-        _ => anyhow::bail!("All tensors must be on Metal device"),
-    }
-}
-
-/// K-split GEMV (no bias) for Q/K/V/O projections: split K across threadgroups, then reduce.
-pub fn enc_gemv_splitk(
-    enc: &ComputeCommandEncoder,
-    partial_pipeline: &ComputePipeline, reduce_pipeline: &ComputePipeline,
-    x: &Tensor, w: &Tensor, out: &Tensor, partial_buf: &Tensor,
-    n: usize, k: usize, n_splits: usize,
-) -> Result<()> {
-    let k_per_split = k / n_splits;
-    let n_n_blocks = cdiv(n, 128);
-    let stride_wk = n;        // [K, N] layout
-    let stride_partial = n;   // [n_splits, N]
-
-    let (s0, l0) = x.storage_and_layout();
-    let (s1, l1) = w.storage_and_layout();
-    let (s2, l2) = out.storage_and_layout();
-    let (s3, l3) = partial_buf.storage_and_layout();
-    let off0 = l0.start_offset() * x.dtype().size_in_bytes();
-    let off1 = l1.start_offset() * w.dtype().size_in_bytes();
-    let off2 = l2.start_offset() * out.dtype().size_in_bytes();
-    let off3 = l3.start_offset() * partial_buf.dtype().size_in_bytes();
-    match (&*s0, &*s1, &*s2, &*s3) {
-        (Storage::Metal(m0), Storage::Metal(m1), Storage::Metal(m2), Storage::Metal(m3)) => {
-            // Phase 1: partial GEMV
-            enc.set_compute_pipeline_state(partial_pipeline);
-            enc.set_buffer(0, Some(m0.buffer()), off0);
-            enc.set_buffer(1, Some(m1.buffer()), off1);
-            enc.set_buffer(2, Some(m3.buffer()), off3);
-            enc.set_bytes(3, &(n as i32));
-            enc.set_bytes(4, &(k as i32));
-            enc.set_bytes(5, &(stride_wk as i32));
-            enc.set_bytes(6, &(n_n_blocks as i32));
-            enc.set_bytes(7, &(k_per_split as i32));
-            enc.set_bytes(8, &(stride_partial as i32));
-            enc.dispatch_thread_groups(
-                MTLSize { width: n_n_blocks * n_splits, height: 1, depth: 1 },
-                tg_size(partial_pipeline, 128),
-            );
-            // Phase 2: reduce (no bias)
-            enc.set_compute_pipeline_state(reduce_pipeline);
-            enc.set_buffer(0, Some(m3.buffer()), off3);
-            enc.set_buffer(1, Some(m2.buffer()), off2);
-            enc.set_bytes(2, &(n as i32));
-            enc.set_bytes(3, &(n_splits as i32));
-            enc.set_bytes(4, &(stride_partial as i32));
-            enc.dispatch_thread_groups(
-                MTLSize { width: n_n_blocks, height: 1, depth: 1 },
-                tg_size(reduce_pipeline, 128),
-            );
-            Ok(())
-        }
-        _ => anyhow::bail!("All tensors must be on Metal device"),
-    }
-}
-
-/// Split-K GEMV + fused reduce + residual-add + layernorm.
-/// Phase 1: partial GEMV (many TGs), Phase 2: reduce + resadd + LN (1 TG).
-pub fn enc_gemv_splitk_resadd_ln(
-    enc: &ComputeCommandEncoder,
-    partial_pipeline: &ComputePipeline, fused_pipeline: &ComputePipeline,
-    x: &Tensor, w: &Tensor,
-    residual: &Tensor, out_f32: &Tensor,
-    ln_weight: &Tensor, norm_out: &Tensor,
-    partial_buf: &Tensor,
-    dim: usize, k: usize, n_splits: usize,
-) -> Result<()> {
-    let k_per_split = k / n_splits;
-    let n_n_blocks = cdiv(dim, 128);
-    let stride_wk = dim;
-    let stride_partial = dim;
-
-    let (s0, l0) = x.storage_and_layout();
-    let (s1, l1) = w.storage_and_layout();
-    let (s2, l2) = residual.storage_and_layout();
-    let (s3, l3) = out_f32.storage_and_layout();
-    let (s4, l4) = ln_weight.storage_and_layout();
-    let (s5, l5) = norm_out.storage_and_layout();
-    let (s6, l6) = partial_buf.storage_and_layout();
-    let off0 = l0.start_offset() * x.dtype().size_in_bytes();
-    let off1 = l1.start_offset() * w.dtype().size_in_bytes();
-    let off2 = l2.start_offset() * residual.dtype().size_in_bytes();
-    let off3 = l3.start_offset() * out_f32.dtype().size_in_bytes();
-    let off4 = l4.start_offset() * ln_weight.dtype().size_in_bytes();
-    let off5 = l5.start_offset() * norm_out.dtype().size_in_bytes();
-    let off6 = l6.start_offset() * partial_buf.dtype().size_in_bytes();
-    match (&*s0, &*s1, &*s2, &*s3, &*s4, &*s5, &*s6) {
-        (Storage::Metal(m0), Storage::Metal(m1), Storage::Metal(m2), Storage::Metal(m3),
-         Storage::Metal(m4), Storage::Metal(m5), Storage::Metal(m6)) => {
-            // Phase 1: partial GEMV
-            enc.set_compute_pipeline_state(partial_pipeline);
-            enc.set_buffer(0, Some(m0.buffer()), off0);
-            enc.set_buffer(1, Some(m1.buffer()), off1);
-            enc.set_buffer(2, Some(m6.buffer()), off6);
-            enc.set_bytes(3, &(dim as i32));
-            enc.set_bytes(4, &(k as i32));
-            enc.set_bytes(5, &(stride_wk as i32));
-            enc.set_bytes(6, &(n_n_blocks as i32));
-            enc.set_bytes(7, &(k_per_split as i32));
-            enc.set_bytes(8, &(stride_partial as i32));
-            enc.dispatch_thread_groups(
-                MTLSize { width: n_n_blocks * n_splits, height: 1, depth: 1 },
-                tg_size(partial_pipeline, 128),
-            );
-            // Phase 2: fused reduce + resadd + LN (1 threadgroup)
-            enc.set_compute_pipeline_state(fused_pipeline);
-            #[cfg(target_arch = "aarch64")]
-            set_air_tg_mem(enc, 4096);
-            enc.set_buffer(0, Some(m6.buffer()), off6);
-            enc.set_buffer(1, Some(m2.buffer()), off2);
-            enc.set_buffer(2, Some(m3.buffer()), off3);
-            enc.set_buffer(3, Some(m4.buffer()), off4);
-            enc.set_buffer(4, Some(m5.buffer()), off5);
-            enc.set_bytes(5, &(dim as i32));
-            enc.set_bytes(6, &(n_splits as i32));
-            enc.set_bytes(7, &(stride_partial as i32));
-            enc.dispatch_thread_groups(
-                MTLSize { width: 1, height: 1, depth: 1 },
-                tg_size(fused_pipeline, 1024),
-            );
-            Ok(())
-        }
-        _ => anyhow::bail!("All tensors must be on Metal device"),
-    }
-}
-
-/// Fused Q/K/V split-K GEMV: single dispatch for all 3 projections.
-pub fn enc_gemv_qkv_splitk(
-    enc: &ComputeCommandEncoder,
-    partial_pipeline: &ComputePipeline, reduce_pipeline: &ComputePipeline,
-    x: &Tensor, wq: &Tensor, wk: &Tensor, wv: &Tensor,
-    oq: &Tensor, ok: &Tensor, ov: &Tensor,
-    partial_buf: &Tensor,
-    n: usize, k: usize, n_splits: usize,
-) -> Result<()> {
+) {
     let k_per_split = k / n_splits;
     let n_n_blocks = cdiv(n, 128);
     let stride_wk = n;
     let stride_partial = n;
 
-    let (sx, lx) = x.storage_and_layout();
-    let (sq, lq) = wq.storage_and_layout();
-    let (sk, lk) = wk.storage_and_layout();
-    let (sv, lv) = wv.storage_and_layout();
-    let (soq, loq) = oq.storage_and_layout();
-    let (sok, lok) = ok.storage_and_layout();
-    let (sov, lov) = ov.storage_and_layout();
-    let (sp, lp) = partial_buf.storage_and_layout();
-    let ox = lx.start_offset() * x.dtype().size_in_bytes();
-    let oq_off = lq.start_offset() * wq.dtype().size_in_bytes();
-    let ok_off = lk.start_offset() * wk.dtype().size_in_bytes();
-    let ov_off = lv.start_offset() * wv.dtype().size_in_bytes();
-    let ooq = loq.start_offset() * oq.dtype().size_in_bytes();
-    let ook = lok.start_offset() * ok.dtype().size_in_bytes();
-    let oov = lov.start_offset() * ov.dtype().size_in_bytes();
-    let op = lp.start_offset() * partial_buf.dtype().size_in_bytes();
-    match (&*sx, &*sq, &*sk, &*sv, &*soq, &*sok, &*sov, &*sp) {
-        (Storage::Metal(mx), Storage::Metal(mq), Storage::Metal(mk), Storage::Metal(mv),
-         Storage::Metal(moq), Storage::Metal(mok), Storage::Metal(mov), Storage::Metal(mp)) => {
-            // Phase 1: fused QKV partial (grid: n_n_blocks*n_splits × 3)
-            enc.set_compute_pipeline_state(partial_pipeline);
-            enc.set_buffer(0, Some(mx.buffer()), ox);
-            enc.set_buffer(1, Some(mq.buffer()), oq_off);
-            enc.set_buffer(2, Some(mk.buffer()), ok_off);
-            enc.set_buffer(3, Some(mv.buffer()), ov_off);
-            enc.set_buffer(4, Some(mp.buffer()), op);
-            enc.set_bytes(5, &(n as i32));
-            enc.set_bytes(6, &(k as i32));
-            enc.set_bytes(7, &(stride_wk as i32));
-            enc.set_bytes(8, &(n_n_blocks as i32));
-            enc.set_bytes(9, &(k_per_split as i32));
-            enc.set_bytes(10, &(stride_partial as i32));
-            enc.dispatch_thread_groups(
-                MTLSize { width: n_n_blocks * n_splits, height: 3, depth: 1 },
-                tg_size(partial_pipeline, 128),
-            );
-            // Phase 2: fused QKV reduce (grid: cdiv(N,128) × 3)
-            enc.set_compute_pipeline_state(reduce_pipeline);
-            enc.set_buffer(0, Some(mp.buffer()), op);
-            enc.set_buffer(1, Some(moq.buffer()), ooq);
-            enc.set_buffer(2, Some(mok.buffer()), ook);
-            enc.set_buffer(3, Some(mov.buffer()), oov);
-            enc.set_bytes(4, &(n as i32));
-            enc.set_bytes(5, &(n_splits as i32));
-            enc.set_bytes(6, &(stride_partial as i32));
-            enc.dispatch_thread_groups(
-                MTLSize { width: n_n_blocks, height: 3, depth: 1 },
-                tg_size(reduce_pipeline, 128),
-            );
-            Ok(())
-        }
-        _ => anyhow::bail!("All tensors must be on Metal device"),
-    }
+    // Phase 1: partial GEMV
+    enc.set_compute_pipeline_state(partial_pipeline);
+    enc.set_buffer(0, Some(x.buf()), x.offset);
+    enc.set_buffer(1, Some(w.buf()), w.offset);
+    enc.set_buffer(2, Some(partial_buf.buf()), partial_buf.offset);
+    enc.set_bytes(3, &(n as i32));
+    enc.set_bytes(4, &(k as i32));
+    enc.set_bytes(5, &(stride_wk as i32));
+    enc.set_bytes(6, &(n_n_blocks as i32));
+    enc.set_bytes(7, &(k_per_split as i32));
+    enc.set_bytes(8, &(stride_partial as i32));
+    enc.dispatch_thread_groups(
+        MTLSize { width: n_n_blocks * n_splits, height: 1, depth: 1 },
+        tg_size(partial_pipeline, 128),
+    );
+    // Phase 2: reduce + bias
+    enc.set_compute_pipeline_state(reduce_pipeline);
+    enc.set_buffer(0, Some(partial_buf.buf()), partial_buf.offset);
+    enc.set_buffer(1, Some(bias.buf()), bias.offset);
+    enc.set_buffer(2, Some(out.buf()), out.offset);
+    enc.set_bytes(3, &(n as i32));
+    enc.set_bytes(4, &(n_splits as i32));
+    enc.set_bytes(5, &(stride_partial as i32));
+    enc.dispatch_thread_groups(
+        MTLSize { width: n_n_blocks, height: 1, depth: 1 },
+        tg_size(reduce_pipeline, 128),
+    );
 }
 
-/// K-split GEMV + GLU-SiLU + bias for fc1: split K across threadgroups, then reduce with GLU.
+pub fn enc_gemv_splitk(
+    enc: &ComputeCommandEncoder,
+    partial_pipeline: &ComputePipeline, reduce_pipeline: &ComputePipeline,
+    x: &GpuBuffer, w: &GpuBuffer, out: &GpuBuffer, partial_buf: &GpuBuffer,
+    n: usize, k: usize, n_splits: usize,
+) {
+    let k_per_split = k / n_splits;
+    let n_n_blocks = cdiv(n, 128);
+    let stride_wk = n;
+    let stride_partial = n;
+
+    // Phase 1: partial GEMV
+    enc.set_compute_pipeline_state(partial_pipeline);
+    enc.set_buffer(0, Some(x.buf()), x.offset);
+    enc.set_buffer(1, Some(w.buf()), w.offset);
+    enc.set_buffer(2, Some(partial_buf.buf()), partial_buf.offset);
+    enc.set_bytes(3, &(n as i32));
+    enc.set_bytes(4, &(k as i32));
+    enc.set_bytes(5, &(stride_wk as i32));
+    enc.set_bytes(6, &(n_n_blocks as i32));
+    enc.set_bytes(7, &(k_per_split as i32));
+    enc.set_bytes(8, &(stride_partial as i32));
+    enc.dispatch_thread_groups(
+        MTLSize { width: n_n_blocks * n_splits, height: 1, depth: 1 },
+        tg_size(partial_pipeline, 128),
+    );
+    // Phase 2: reduce
+    enc.set_compute_pipeline_state(reduce_pipeline);
+    enc.set_buffer(0, Some(partial_buf.buf()), partial_buf.offset);
+    enc.set_buffer(1, Some(out.buf()), out.offset);
+    enc.set_bytes(2, &(n as i32));
+    enc.set_bytes(3, &(n_splits as i32));
+    enc.set_bytes(4, &(stride_partial as i32));
+    enc.dispatch_thread_groups(
+        MTLSize { width: n_n_blocks, height: 1, depth: 1 },
+        tg_size(reduce_pipeline, 128),
+    );
+}
+
+pub fn enc_gemv_qkv_splitk(
+    enc: &ComputeCommandEncoder,
+    partial_pipeline: &ComputePipeline, reduce_pipeline: &ComputePipeline,
+    x: &GpuBuffer, wq: &GpuBuffer, wk: &GpuBuffer, wv: &GpuBuffer,
+    oq: &GpuBuffer, ok: &GpuBuffer, ov: &GpuBuffer,
+    partial_buf: &GpuBuffer,
+    n: usize, k: usize, n_splits: usize,
+) {
+    let k_per_split = k / n_splits;
+    let n_n_blocks = cdiv(n, 128);
+    let stride_wk = n;
+    let stride_partial = n;
+
+    // Phase 1: fused QKV partial (grid: n_n_blocks*n_splits × 3)
+    enc.set_compute_pipeline_state(partial_pipeline);
+    enc.set_buffer(0, Some(x.buf()), x.offset);
+    enc.set_buffer(1, Some(wq.buf()), wq.offset);
+    enc.set_buffer(2, Some(wk.buf()), wk.offset);
+    enc.set_buffer(3, Some(wv.buf()), wv.offset);
+    enc.set_buffer(4, Some(partial_buf.buf()), partial_buf.offset);
+    enc.set_bytes(5, &(n as i32));
+    enc.set_bytes(6, &(k as i32));
+    enc.set_bytes(7, &(stride_wk as i32));
+    enc.set_bytes(8, &(n_n_blocks as i32));
+    enc.set_bytes(9, &(k_per_split as i32));
+    enc.set_bytes(10, &(stride_partial as i32));
+    enc.dispatch_thread_groups(
+        MTLSize { width: n_n_blocks * n_splits, height: 3, depth: 1 },
+        tg_size(partial_pipeline, 128),
+    );
+    // Phase 2: fused QKV reduce (grid: cdiv(N,128) × 3)
+    enc.set_compute_pipeline_state(reduce_pipeline);
+    enc.set_buffer(0, Some(partial_buf.buf()), partial_buf.offset);
+    enc.set_buffer(1, Some(oq.buf()), oq.offset);
+    enc.set_buffer(2, Some(ok.buf()), ok.offset);
+    enc.set_buffer(3, Some(ov.buf()), ov.offset);
+    enc.set_bytes(4, &(n as i32));
+    enc.set_bytes(5, &(n_splits as i32));
+    enc.set_bytes(6, &(stride_partial as i32));
+    enc.dispatch_thread_groups(
+        MTLSize { width: n_n_blocks, height: 3, depth: 1 },
+        tg_size(reduce_pipeline, 128),
+    );
+}
+
 pub fn enc_gemv_glu_splitk(
     enc: &ComputeCommandEncoder,
     partial_pipeline: &ComputePipeline, reduce_pipeline: &ComputePipeline,
-    x: &Tensor, w: &Tensor, bias: &Tensor, out: &Tensor, partial_buf: &Tensor,
+    x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer, partial_buf: &GpuBuffer,
     n_intermediate: usize, k: usize, n_splits: usize,
-) -> Result<()> {
+) {
     let k_per_split = k / n_splits;
     let n_n_blocks = cdiv(n_intermediate, 128);
-    let stride_wk = n_intermediate * 2;    // [2*N, K] layout
-    let stride_partial = n_intermediate * 2; // [n_splits, 2*N]
+    let stride_wk = n_intermediate * 2;
+    let stride_partial = n_intermediate * 2;
 
-    let (s0, l0) = x.storage_and_layout();
-    let (s1, l1) = w.storage_and_layout();
-    let (s2, l2) = bias.storage_and_layout();
-    let (s3, l3) = out.storage_and_layout();
-    let (s4, l4) = partial_buf.storage_and_layout();
-    let off0 = l0.start_offset() * x.dtype().size_in_bytes();
-    let off1 = l1.start_offset() * w.dtype().size_in_bytes();
-    let off2 = l2.start_offset() * bias.dtype().size_in_bytes();
-    let off3 = l3.start_offset() * out.dtype().size_in_bytes();
-    let off4 = l4.start_offset() * partial_buf.dtype().size_in_bytes();
-    match (&*s0, &*s1, &*s2, &*s3, &*s4) {
-        (Storage::Metal(m0), Storage::Metal(m1), Storage::Metal(m2), Storage::Metal(m3), Storage::Metal(m4)) => {
-            // Phase 1: partial GEMV (x-half + gate-half)
-            enc.set_compute_pipeline_state(partial_pipeline);
-            enc.set_buffer(0, Some(m0.buffer()), off0);
-            enc.set_buffer(1, Some(m1.buffer()), off1);
-            enc.set_buffer(2, Some(m4.buffer()), off4);
-            enc.set_bytes(3, &(n_intermediate as i32));
-            enc.set_bytes(4, &(k as i32));
-            enc.set_bytes(5, &(stride_wk as i32));
-            enc.set_bytes(6, &(n_n_blocks as i32));
-            enc.set_bytes(7, &(k_per_split as i32));
-            enc.set_bytes(8, &(stride_partial as i32));
-            enc.dispatch_thread_groups(
-                MTLSize { width: n_n_blocks * n_splits, height: 1, depth: 1 },
-                tg_size(partial_pipeline, 128),
-            );
-            // Phase 2: reduce + bias + GLU-SiLU
-            enc.set_compute_pipeline_state(reduce_pipeline);
-            enc.set_buffer(0, Some(m4.buffer()), off4);
-            enc.set_buffer(1, Some(m2.buffer()), off2);
-            enc.set_buffer(2, Some(m3.buffer()), off3);
-            enc.set_bytes(3, &(n_intermediate as i32));
-            enc.set_bytes(4, &(n_splits as i32));
-            enc.set_bytes(5, &(stride_partial as i32));
-            enc.dispatch_thread_groups(
-                MTLSize { width: n_n_blocks, height: 1, depth: 1 },
-                tg_size(reduce_pipeline, 128),
-            );
-            Ok(())
-        }
-        _ => anyhow::bail!("All tensors must be on Metal device"),
-    }
+    // Phase 1: partial GEMV (x-half + gate-half)
+    enc.set_compute_pipeline_state(partial_pipeline);
+    enc.set_buffer(0, Some(x.buf()), x.offset);
+    enc.set_buffer(1, Some(w.buf()), w.offset);
+    enc.set_buffer(2, Some(partial_buf.buf()), partial_buf.offset);
+    enc.set_bytes(3, &(n_intermediate as i32));
+    enc.set_bytes(4, &(k as i32));
+    enc.set_bytes(5, &(stride_wk as i32));
+    enc.set_bytes(6, &(n_n_blocks as i32));
+    enc.set_bytes(7, &(k_per_split as i32));
+    enc.set_bytes(8, &(stride_partial as i32));
+    enc.dispatch_thread_groups(
+        MTLSize { width: n_n_blocks * n_splits, height: 1, depth: 1 },
+        tg_size(partial_pipeline, 128),
+    );
+    // Phase 2: reduce + bias + GLU-SiLU
+    enc.set_compute_pipeline_state(reduce_pipeline);
+    enc.set_buffer(0, Some(partial_buf.buf()), partial_buf.offset);
+    enc.set_buffer(1, Some(bias.buf()), bias.offset);
+    enc.set_buffer(2, Some(out.buf()), out.offset);
+    enc.set_bytes(3, &(n_intermediate as i32));
+    enc.set_bytes(4, &(n_splits as i32));
+    enc.set_bytes(5, &(stride_partial as i32));
+    enc.dispatch_thread_groups(
+        MTLSize { width: n_n_blocks, height: 1, depth: 1 },
+        tg_size(reduce_pipeline, 128),
+    );
 }
 
-pub fn enc_gemv_resadd_ln(
+/// Tiled matmul on MetalBuffer: C[M,N] = A[M,K] @ B[K,N]
+pub fn enc_matmul(
     enc: &ComputeCommandEncoder, pipeline: &ComputePipeline,
-    x: &Tensor, w: &Tensor,
-    f32_res: &Tensor, f32_out: &Tensor,
-    ln_weight: &Tensor, f16_norm: &Tensor,
-    dim: usize, gemv_k: usize,
-) -> Result<()> {
-    let (s0, l0) = x.storage_and_layout();
-    let (s1, l1) = w.storage_and_layout();
-    let (s2, l2) = f32_res.storage_and_layout();
-    let (s3, l3) = f32_out.storage_and_layout();
-    let (s4, l4) = ln_weight.storage_and_layout();
-    let (s5, l5) = f16_norm.storage_and_layout();
-    let off0 = l0.start_offset() * x.dtype().size_in_bytes();
-    let off1 = l1.start_offset() * w.dtype().size_in_bytes();
-    let off2 = l2.start_offset() * f32_res.dtype().size_in_bytes();
-    let off3 = l3.start_offset() * f32_out.dtype().size_in_bytes();
-    let off4 = l4.start_offset() * ln_weight.dtype().size_in_bytes();
-    let off5 = l5.start_offset() * f16_norm.dtype().size_in_bytes();
-    match (&*s0, &*s1, &*s2, &*s3, &*s4, &*s5) {
-        (Storage::Metal(m0), Storage::Metal(m1), Storage::Metal(m2), Storage::Metal(m3), Storage::Metal(m4), Storage::Metal(m5)) => {
-            enc.set_compute_pipeline_state(pipeline);
-            #[cfg(target_arch = "aarch64")]
-            set_air_tg_mem(enc, 4096);
-            enc.set_buffer(0, Some(m0.buffer()), off0);
-            enc.set_buffer(1, Some(m1.buffer()), off1);
-            enc.set_buffer(2, Some(m2.buffer()), off2);
-            enc.set_buffer(3, Some(m3.buffer()), off3);
-            enc.set_buffer(4, Some(m4.buffer()), off4);
-            enc.set_buffer(5, Some(m5.buffer()), off5);
-            enc.set_bytes(6, &(dim as i32));
-            enc.set_bytes(7, &(gemv_k as i32));
-            enc.set_bytes(8, &1i32);
-            enc.set_bytes(9, &(dim as i32));
-            enc.dispatch_thread_groups(
-                MTLSize { width: 1, height: 1, depth: 1 },
-                tg_size(pipeline, 1024),
-            );
-            Ok(())
-        }
-        _ => anyhow::bail!("All tensors must be on Metal device"),
-    }
+    a: &GpuBuffer, b: &GpuBuffer, out: &GpuBuffer,
+    m: usize, n: usize, k: usize, block_m: usize, block_n: usize,
+) {
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(a.buf()), a.offset);
+    enc.set_buffer(1, Some(b.buf()), b.offset);
+    enc.set_buffer(2, Some(out.buf()), out.offset);
+    enc.set_bytes(3, &(m as i32));
+    enc.set_bytes(4, &(n as i32));
+    enc.set_bytes(5, &(k as i32));
+    enc.set_bytes(6, &(k as i32));      // stride_am = K
+    enc.set_bytes(7, &1i32);            // stride_ak = 1
+    enc.set_bytes(8, &(n as i32));      // stride_bk = N
+    enc.set_bytes(9, &1i32);            // stride_bn = 1
+    enc.set_bytes(10, &(n as i32));     // stride_cm = N
+    enc.set_bytes(11, &1i32);           // stride_cn = 1
+    let grid = MTLSize {
+        width: cdiv(m, block_m),
+        height: cdiv(n, block_n),
+        depth: 1,
+    };
+    #[cfg(target_arch = "aarch64")]
+    if block_m <= 32 { set_air_tg_mem(enc, 4096); }
+    enc.dispatch_thread_groups(grid, matmul_tg_size(pipeline, block_m, block_n));
 }
 

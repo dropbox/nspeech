@@ -1,8 +1,9 @@
 //! Moonshine V2 Decoder using Triton-compiled Metal kernels.
 //!
-//! All decoder operations run on the Metal GPU. Weights stored as F16 on GPU.
-//! Mixed precision: F32 residual stream, F16 within-layer computation.
-//! Only GPU→CPU transfers: final logits download for argmax (once per token).
+//! All decoder operations run on the Metal GPU via GpuBuffer (no Candle Tensor overhead).
+//! Weights stored as F16 on GPU. Mixed precision: F32 residual stream, F16 within-layer.
+//! Zero per-token allocations: all buffers pre-allocated at init.
+//! Only GPU→CPU transfer: final logits readback for argmax (once per token).
 //!
 //! Architecture per layer:
 //!  - Pre-norm (standard LayerNorm) → self-attention with RoPE → residual
@@ -14,8 +15,8 @@ use candle_core::{DType, Device, Tensor};
 
 use super::config::MoonshineConfig;
 use crate::triton_kernels::{
-    DecoderKernels, empty_f16, empty_f32, triton_matmul,
-    enc_gemv_f16w,
+    DecoderKernels, GpuBuffer, TritonKernels,
+    enc_gemv_f16w, enc_matmul,
     enc_layernorm_std_f32in, enc_attention_decode, enc_attention_splitkv,
     enc_rope_qk_cache_fused, enc_kv_cache_append,
     enc_residual_add_layernorm,
@@ -26,36 +27,41 @@ use crate::triton_kernels::{
 
 type QVarBuilder = candle_transformers::quantized_var_builder::VarBuilder;
 
-/// Load 2D weight from GGUF → dequantize → F16 → Metal tensor [K, N] (transposed).
-fn load_f16_weight(shape: (usize, usize), vb: &QVarBuilder, metal: &Device) -> Result<Tensor> {
+/// Load 2D weight from GGUF → dequantize → F16 → GpuBuffer [K, N] (transposed).
+fn load_f16_weight(shape: (usize, usize), vb: &QVarBuilder, dev: &candle_core::MetalDevice) -> Result<GpuBuffer> {
     let qt = vb.get(shape, "weight")?;
     let t = qt.dequantize(&Device::Cpu)?;
-    Ok(t.to_dtype(DType::F16)?.to_device(metal)?.t()?.contiguous()?)
+    let t = t.to_dtype(DType::F16)?.t()?.contiguous()?.flatten_all()?;
+    let data: Vec<half::f16> = t.to_vec1::<half::f16>()?;
+    GpuBuffer::from_f16_data(dev, &data)
 }
 
-/// Load 1D from GGUF → dequantize → F16 → Metal tensor.
-fn load_f16_1d(dim: usize, name: &str, vb: &QVarBuilder, metal: &Device) -> Result<Tensor> {
+/// Load 1D from GGUF → dequantize → F16 → GpuBuffer.
+fn load_f16_1d(dim: usize, name: &str, vb: &QVarBuilder, dev: &candle_core::MetalDevice) -> Result<GpuBuffer> {
     let qt = vb.get(dim, name)?;
     let t = qt.dequantize(&Device::Cpu)?;
-    Ok(t.to_dtype(DType::F16)?.to_device(metal)?)
+    let t = t.to_dtype(DType::F16)?;
+    let data: Vec<half::f16> = t.to_vec1::<half::f16>()?;
+    GpuBuffer::from_f16_data(dev, &data)
 }
 
-/// Load 1D from GGUF → dequantize → F32 → Metal tensor.
-fn load_f32_1d(dim: usize, name: &str, vb: &QVarBuilder, metal: &Device) -> Result<Tensor> {
+/// Load 1D from GGUF → dequantize → F32 → GpuBuffer.
+fn load_f32_1d(dim: usize, name: &str, vb: &QVarBuilder, dev: &candle_core::MetalDevice) -> Result<GpuBuffer> {
     let qt = vb.get(dim, name)?;
     let t = qt.dequantize(&Device::Cpu)?;
-    Ok(t.to_device(metal)?)
+    let data: Vec<f32> = t.to_vec1::<f32>()?;
+    GpuBuffer::from_f32_data(dev, &data)
 }
 
 // ── Weight structures ──
 
 struct LinearWeights {
-    weight: Tensor, // f16 [K, N] transposed (for GEMV)
+    weight: GpuBuffer, // f16 [K, N] transposed (for GEMV)
 }
 
 struct LinearBiasWeights {
-    weight: Tensor, // f16 [K, N] transposed
-    bias: Tensor,   // f32 [out_dim]
+    weight: GpuBuffer, // f16 [K, N] transposed
+    bias: GpuBuffer,   // f32 [out_dim]
 }
 
 struct AttentionWeights {
@@ -74,52 +80,53 @@ struct DecoderLayerWeights {
     self_attn: AttentionWeights,
     cross_attn: AttentionWeights,
     mlp: MLPWeights,
-    input_layernorm: Tensor,          // f16 [decoder_dim]
-    post_attention_layernorm: Tensor,  // f16 [decoder_dim]
-    final_layernorm: Tensor,          // f16 [decoder_dim]
+    input_layernorm: GpuBuffer,          // f16 [decoder_dim]
+    post_attention_layernorm: GpuBuffer,  // f16 [decoder_dim]
+    final_layernorm: GpuBuffer,          // f16 [decoder_dim]
 }
 
 // ── KV Cache ──
 
 struct MetalDecoderCache {
     // Self-attention KV: [n_kv_heads * max_kv_len * head_dim] per layer
-    self_k: Vec<Tensor>,
-    self_v: Vec<Tensor>,
+    self_k: Vec<GpuBuffer>,
+    self_v: Vec<GpuBuffer>,
     self_len: usize,
 
-    // Cross-attention KV: [enc_seq, kv_dim] per layer
-    cross_k: Vec<Tensor>,
-    cross_v: Vec<Tensor>,
+    // Cross-attention KV: [enc_seq, kv_dim] per layer (pre-allocated)
+    cross_k: Vec<GpuBuffer>,
+    cross_v: Vec<GpuBuffer>,
     cross_len: usize,
     cross_initialized: bool,
 
     // Encoder projection (computed once per decode run)
-    encoder_proj_f16: Option<Tensor>,
+    encoder_proj_f16: Option<GpuBuffer>,
 }
 
 // ── Scratch buffers ──
 
+/// Pre-allocated scratch buffers reused across tokens (zero per-token allocation).
 struct DecoderScratch {
-    f16_norm: Tensor,       // [dim] F16 — layernorm output → GEMV input
-    f16_q: Tensor,          // [q_dim]
-    f16_k: Tensor,          // [kv_dim]
-    f16_v: Tensor,          // [kv_dim]
-    f16_attn: Tensor,       // [q_dim] F16 — attention output
-    f16_act: Tensor,        // [intermediate_size]
-    f32_a: Tensor,          // [dim] F32 — residual stream ping
-    f32_b: Tensor,          // [dim] F32 — residual stream pong
-    f16_logits: Tensor,     // [vocab_size]
-    f32_splitkv_partial: Tensor, // [n_q_heads * n_splits * 3 * BLOCK_D] F32 — split-KV partials
-    f16_partial: Tensor,        // F16 scratch for K-split GEMV partials (QKV, O, fc1, fc2)
+    f16_norm: GpuBuffer,       // [dim] F16 — layernorm output → GEMV input
+    f16_q: GpuBuffer,          // [q_dim]
+    f16_k: GpuBuffer,          // [kv_dim]
+    f16_v: GpuBuffer,          // [kv_dim]
+    f16_attn: GpuBuffer,       // [q_dim] F16 — attention output
+    f16_act: GpuBuffer,        // [intermediate_size]
+    f32_a: GpuBuffer,          // [dim] F32 — residual stream ping
+    f32_b: GpuBuffer,          // [dim] F32 — residual stream pong
+    f16_logits: GpuBuffer,     // [vocab_size]
+    f32_splitkv_partial: GpuBuffer, // [n_q_heads * n_splits * 3 * BLOCK_D] F32
+    f16_partial: GpuBuffer,        // F16 scratch for K-split GEMV partials
+    embed_upload: GpuBuffer,       // [dim] F32 — pre-allocated embed staging
 }
 
 // ── Main decoder struct ──
 
 pub struct TritonMetalDecoder {
     device: candle_core::MetalDevice,
-    metal_device: Device,
     kernels: DecoderKernels,
-    encoder_kernels: crate::triton_kernels::TritonKernels,
+    encoder_kernels: TritonKernels,
     scratch: DecoderScratch,
 
     // Token embedding (CPU side for lookup)
@@ -132,16 +139,19 @@ pub struct TritonMetalDecoder {
     proj_weight: Option<Vec<f32>>,
 
     // LM head
-    proj_out_weight: Tensor, // f16 [decoder_dim, vocab_size]
+    proj_out_weight: GpuBuffer, // f16 [decoder_dim, vocab_size]
 
     // Decoder layers
     layers: Vec<DecoderLayerWeights>,
 
     // Final norm
-    final_norm_weight: Tensor, // f16 [decoder_dim]
+    final_norm_weight: GpuBuffer, // f16 [decoder_dim]
 
     // RoPE table
-    rope_table: Tensor, // f32 [max_pos, half_rot * 2]
+    rope_table: GpuBuffer, // f32 [max_pos, half_rot * 2]
+
+    // Cached env var (avoid syscall per token)
+    profile: bool,
 
     // Config
     decoder_dim: usize,
@@ -173,7 +183,7 @@ impl TritonMetalDecoder {
 
         println!("  Loading decoder Metal kernels...");
         let kernels = DecoderKernels::load(&md)?;
-        let encoder_kernels = crate::triton_kernels::TritonKernels::load(&md)?;
+        let encoder_kernels = TritonKernels::load(&md)?;
 
         let decoder_dim = cfg.decoder_dim;
         let encoder_dim = cfg.encoder_dim;
@@ -185,7 +195,6 @@ impl TritonMetalDecoder {
         let intermediate_size = cfg.decoder_intermediate_size;
         let q_dim = n_q_heads * head_dim;
         let kv_dim = n_kv_heads * head_dim;
-        let metal = metal_device;
 
         // Token embedding (CPU for index_select)
         let embed_qt = dec_vb.pp("embed_tokens").get((cfg.vocab_size, decoder_dim), "weight")?;
@@ -209,7 +218,7 @@ impl TritonMetalDecoder {
         };
 
         // LM head
-        let proj_out_weight = load_f16_weight((cfg.vocab_size, decoder_dim), &proj_out_vb, metal)?;
+        let proj_out_weight = load_f16_weight((cfg.vocab_size, decoder_dim), &proj_out_vb, &md)?;
 
         // Decoder layers
         let mut layers = Vec::with_capacity(cfg.decoder_num_layers);
@@ -217,29 +226,29 @@ impl TritonMetalDecoder {
             let lvb = dec_vb.pp(&format!("layers.{i}"));
             let avb = lvb.pp("self_attn");
             let self_attn = AttentionWeights {
-                q_proj: LinearWeights { weight: load_f16_weight((q_dim, decoder_dim), &avb.pp("q_proj"), metal)? },
-                k_proj: LinearWeights { weight: load_f16_weight((kv_dim, decoder_dim), &avb.pp("k_proj"), metal)? },
-                v_proj: LinearWeights { weight: load_f16_weight((kv_dim, decoder_dim), &avb.pp("v_proj"), metal)? },
-                o_proj: LinearWeights { weight: load_f16_weight((decoder_dim, q_dim), &avb.pp("o_proj"), metal)? },
+                q_proj: LinearWeights { weight: load_f16_weight((q_dim, decoder_dim), &avb.pp("q_proj"), &md)? },
+                k_proj: LinearWeights { weight: load_f16_weight((kv_dim, decoder_dim), &avb.pp("k_proj"), &md)? },
+                v_proj: LinearWeights { weight: load_f16_weight((kv_dim, decoder_dim), &avb.pp("v_proj"), &md)? },
+                o_proj: LinearWeights { weight: load_f16_weight((decoder_dim, q_dim), &avb.pp("o_proj"), &md)? },
             };
 
             let cavb = lvb.pp("encoder_attn");
             let cross_attn = AttentionWeights {
-                q_proj: LinearWeights { weight: load_f16_weight((q_dim, decoder_dim), &cavb.pp("q_proj"), metal)? },
-                k_proj: LinearWeights { weight: load_f16_weight((kv_dim, decoder_dim), &cavb.pp("k_proj"), metal)? },
-                v_proj: LinearWeights { weight: load_f16_weight((kv_dim, decoder_dim), &cavb.pp("v_proj"), metal)? },
-                o_proj: LinearWeights { weight: load_f16_weight((decoder_dim, q_dim), &cavb.pp("o_proj"), metal)? },
+                q_proj: LinearWeights { weight: load_f16_weight((q_dim, decoder_dim), &cavb.pp("q_proj"), &md)? },
+                k_proj: LinearWeights { weight: load_f16_weight((kv_dim, decoder_dim), &cavb.pp("k_proj"), &md)? },
+                v_proj: LinearWeights { weight: load_f16_weight((kv_dim, decoder_dim), &cavb.pp("v_proj"), &md)? },
+                o_proj: LinearWeights { weight: load_f16_weight((decoder_dim, q_dim), &cavb.pp("o_proj"), &md)? },
             };
 
             let mvb = lvb.pp("mlp");
             let mlp = MLPWeights {
                 fc1: LinearBiasWeights {
-                    weight: load_f16_weight((intermediate_size * 2, decoder_dim), &mvb.pp("fc1"), metal)?,
-                    bias: load_f32_1d(intermediate_size * 2, "bias", &mvb.pp("fc1"), metal)?,
+                    weight: load_f16_weight((intermediate_size * 2, decoder_dim), &mvb.pp("fc1"), &md)?,
+                    bias: load_f32_1d(intermediate_size * 2, "bias", &mvb.pp("fc1"), &md)?,
                 },
                 fc2: LinearBiasWeights {
-                    weight: load_f16_weight((decoder_dim, intermediate_size), &mvb.pp("fc2"), metal)?,
-                    bias: load_f32_1d(decoder_dim, "bias", &mvb.pp("fc2"), metal)?,
+                    weight: load_f16_weight((decoder_dim, intermediate_size), &mvb.pp("fc2"), &md)?,
+                    bias: load_f32_1d(decoder_dim, "bias", &mvb.pp("fc2"), &md)?,
                 },
             };
 
@@ -247,29 +256,31 @@ impl TritonMetalDecoder {
                 self_attn,
                 cross_attn,
                 mlp,
-                input_layernorm: load_f16_1d(decoder_dim, "weight", &lvb.pp("input_layernorm"), metal)?,
-                post_attention_layernorm: load_f16_1d(decoder_dim, "weight", &lvb.pp("post_attention_layernorm"), metal)?,
-                final_layernorm: load_f16_1d(decoder_dim, "weight", &lvb.pp("final_layernorm"), metal)?,
+                input_layernorm: load_f16_1d(decoder_dim, "weight", &lvb.pp("input_layernorm"), &md)?,
+                post_attention_layernorm: load_f16_1d(decoder_dim, "weight", &lvb.pp("post_attention_layernorm"), &md)?,
+                final_layernorm: load_f16_1d(decoder_dim, "weight", &lvb.pp("final_layernorm"), &md)?,
             });
         }
 
-        let final_norm_weight = load_f16_1d(decoder_dim, "weight", &dec_vb.pp("norm"), metal)?;
+        let final_norm_weight = load_f16_1d(decoder_dim, "weight", &dec_vb.pp("norm"), &md)?;
 
         // Pre-allocate scratch buffers
         let scratch = DecoderScratch {
-            f16_norm: empty_f16(&md, (decoder_dim.max(q_dim),))?,
-            f16_q: empty_f16(&md, (q_dim,))?,
-            f16_k: empty_f16(&md, (kv_dim,))?,
-            f16_v: empty_f16(&md, (kv_dim,))?,
-            f16_attn: empty_f16(&md, (q_dim,))?,
-            f16_act: empty_f16(&md, (intermediate_size,))?,
-            f32_a: empty_f32(&md, (decoder_dim,))?,
-            f32_b: empty_f32(&md, (decoder_dim,))?,
-            f16_logits: empty_f16(&md, (cfg.vocab_size,))?,
+            f16_norm: GpuBuffer::alloc_f16(&md, decoder_dim.max(q_dim))?,
+            f16_q: GpuBuffer::alloc_f16(&md, q_dim)?,
+            f16_k: GpuBuffer::alloc_f16(&md, kv_dim)?,
+            f16_v: GpuBuffer::alloc_f16(&md, kv_dim)?,
+            f16_attn: GpuBuffer::alloc_f16(&md, q_dim)?,
+            f16_act: GpuBuffer::alloc_f16(&md, intermediate_size)?,
+            f32_a: GpuBuffer::alloc_f32(&md, decoder_dim)?,
+            f32_b: GpuBuffer::alloc_f32(&md, decoder_dim)?,
+            f16_logits: GpuBuffer::alloc_f16(&md, cfg.vocab_size)?,
             // n_splits=32, BLOCK_D=128, 3 arrays (m, l, acc) per partial
-            f32_splitkv_partial: empty_f32(&md, (n_q_heads * 32 * 3 * 128,))?,
+            f32_splitkv_partial: GpuBuffer::alloc_f32(&md, n_q_heads * 32 * 3 * 128)?,
             // F16 partial buffer for split-K GEMV: QKV (3×8×N), O (8×N), fc1 (8×2×N_int), fc2 (16×N)
-            f16_partial: empty_f16(&md, (3 * 16 * 2 * intermediate_size,))?,
+            f16_partial: GpuBuffer::alloc_f16(&md, 3 * 16 * 2 * intermediate_size)?,
+            // Pre-allocated embed upload buffer (avoid per-token allocation)
+            embed_upload: GpuBuffer::alloc_f32(&md, decoder_dim)?,
         };
 
         // Precompute RoPE table
@@ -286,12 +297,10 @@ impl TritonMetalDecoder {
                 rope_data[pos * half_rot * 2 + half_rot + i] = angle.sin();
             }
         }
-        let rope_table = Tensor::from_vec(rope_data, (max_pos, half_rot * 2), &Device::Cpu)?
-            .to_device(metal)?;
+        let rope_table = GpuBuffer::from_f32_data(&md, &rope_data)?;
 
         Ok(Self {
             device: md,
-            metal_device: metal_device.clone(),
             kernels,
             encoder_kernels,
             scratch,
@@ -302,6 +311,7 @@ impl TritonMetalDecoder {
             layers,
             final_norm_weight,
             rope_table,
+            profile: std::env::var("PROFILE").is_ok(),
             decoder_dim,
             encoder_dim,
             num_layers: cfg.decoder_num_layers,
@@ -319,11 +329,12 @@ impl TritonMetalDecoder {
     }
 
     fn new_cache(&self) -> Result<MetalDecoderCache> {
+        let kv_cache_size = self.n_kv_heads * self.max_kv_len * self.head_dim;
         let mut self_k = Vec::with_capacity(self.num_layers);
         let mut self_v = Vec::with_capacity(self.num_layers);
         for _ in 0..self.num_layers {
-            self_k.push(empty_f16(&self.device, (self.n_kv_heads * self.max_kv_len * self.head_dim,))?);
-            self_v.push(empty_f16(&self.device, (self.n_kv_heads * self.max_kv_len * self.head_dim,))?);
+            self_k.push(GpuBuffer::alloc_f16(&self.device, kv_cache_size)?);
+            self_v.push(GpuBuffer::alloc_f16(&self.device, kv_cache_size)?);
         }
         Ok(MetalDecoderCache {
             self_k,
@@ -337,7 +348,7 @@ impl TritonMetalDecoder {
         })
     }
 
-    /// Compute encoder projection on CPU, upload as F16 to GPU.
+    /// Compute encoder projection on CPU, upload as F16 GpuBuffer to GPU.
     fn prepare_encoder_proj(
         &self, encoder_hidden: &Tensor, cache: &mut MetalDecoderCache,
     ) -> Result<()> {
@@ -347,13 +358,7 @@ impl TritonMetalDecoder {
         let enc_hidden = encoder_hidden.squeeze(0)?.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
         let enc_data = enc_hidden.to_vec2::<f32>()?;
 
-        // Debug: check encoder output
-        let enc_nan = enc_data.iter().flatten().filter(|v| v.is_nan()).count();
-        eprintln!("  [enc_proj] encoder_hidden: seq={} dim={} nan={} first5={:?}",
-            enc_seq, self.encoder_dim, enc_nan, &enc_data[0][..5]);
-
         let max_pos_emb = self.pos_emb_data.len() / self.encoder_dim;
-        eprintln!("  [enc_proj] max_pos_emb={} pos_emb first5={:?}", max_pos_emb, &self.pos_emb_data[..5]);
 
         let mut proj_data = vec![0.0f32; enc_seq * self.encoder_dim];
         for s in 0..enc_seq {
@@ -363,13 +368,7 @@ impl TritonMetalDecoder {
             }
         }
 
-        let proj_nan = proj_data.iter().filter(|v| v.is_nan()).count();
-        eprintln!("  [enc_proj] after pos_emb: nan={} first5={:?}", proj_nan, &proj_data[..5]);
-
         let final_data = if let Some(proj_w) = &self.proj_weight {
-            let pw_nan = proj_w.iter().filter(|v| v.is_nan()).count();
-            eprintln!("  [enc_proj] proj_weight: len={} nan={} first5={:?}", proj_w.len(), pw_nan, &proj_w[..5]);
-
             let mut out = vec![0.0f32; enc_seq * self.decoder_dim];
             for s in 0..enc_seq {
                 for d in 0..self.decoder_dim {
@@ -380,26 +379,14 @@ impl TritonMetalDecoder {
                     out[s * self.decoder_dim + d] = sum;
                 }
             }
-
-            let out_nan = out.iter().filter(|v| v.is_nan()).count();
-            let out_max = out.iter().copied().fold(0.0f32, |a, b| a.max(b.abs()));
-            eprintln!("  [enc_proj] after proj: nan={} max_abs={:.1} first5={:?}", out_nan, out_max, &out[..5]);
             out
         } else {
             proj_data
         };
 
-        let dim = if self.proj_weight.is_some() { self.decoder_dim } else { self.encoder_dim };
-        let t = Tensor::from_vec(final_data, (enc_seq, dim), &Device::Cpu)?
-            .to_dtype(DType::F16)?.to_device(&self.metal_device)?;
-
-        // Debug: verify after F16 conversion
-        let t_check = t.flatten_all()?.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
-        let t_data = t_check.to_vec1::<f32>()?;
-        let t_nan = t_data.iter().filter(|v| v.is_nan()).count();
-        eprintln!("  [enc_proj] after f16 upload: nan={}/{} first5={:?}", t_nan, t_data.len(), &t_data[..5]);
-
-        cache.encoder_proj_f16 = Some(t);
+        // Convert f32 → f16 and upload directly
+        let f16_data: Vec<half::f16> = final_data.iter().map(|&v| half::f16::from_f32(v)).collect();
+        cache.encoder_proj_f16 = Some(GpuBuffer::from_f16_data(&self.device, &f16_data)?);
         cache.cross_len = enc_seq;
         Ok(())
     }
@@ -413,60 +400,34 @@ impl TritonMetalDecoder {
         let enc_seq = cache.cross_len;
         let kv_dim = self.n_kv_heads * self.head_dim;
 
-        let enc_f16 = enc_proj;
-
-        // Debug: check enc_proj
-        {
-            let ep = enc_f16.flatten_all()?.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
-            let ep_data = ep.to_vec1::<f32>()?;
-            let nan_count = ep_data.iter().filter(|v| v.is_nan()).count();
-            eprintln!("  [dbg] enc_proj shape={:?} dtype={:?} nan={}/{} first5={:?}",
-                enc_f16.shape(), enc_f16.dtype(), nan_count, ep_data.len(), &ep_data[..5]);
-        }
-
+        // Pre-allocate cross-attention K/V buffers
         cache.cross_k.clear();
         cache.cross_v.clear();
+        for _ in 0..self.num_layers {
+            cache.cross_k.push(GpuBuffer::alloc_f16(&self.device, enc_seq * kv_dim)?);
+            cache.cross_v.push(GpuBuffer::alloc_f16(&self.device, enc_seq * kv_dim)?);
+        }
 
-        // Use 64x64 matmul for cross-attention K/V projections
+        // Select matmul kernel tile size
         let (block_m, pipeline) = if let Some(ref p128) = self.encoder_kernels.matmul_128x128 {
             (128, p128)
         } else {
             (64, &self.encoder_kernels.matmul_64x64)
         };
 
+        // Batch all cross-attention K/V matmuls on one encoder
+        let enc = self.device.command_encoder()?;
         for (i, layer) in self.layers.iter().enumerate() {
-            // Cross-attention K/V weights are f32 → convert to f16 for matmul
-            let kw_f16 = layer.cross_attn.k_proj.weight.to_dtype(DType::F16)?;
-            let vw_f16 = layer.cross_attn.v_proj.weight.to_dtype(DType::F16)?;
-
-            if i == 0 {
-                let kw = kw_f16.flatten_all()?.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
-                let kw_data = kw.to_vec1::<f32>()?;
-                let nan_count = kw_data.iter().filter(|v| v.is_nan()).count();
-                eprintln!("  [dbg] cross_k_weight shape={:?} dtype={:?} nan={}/{} first5={:?}",
-                    layer.cross_attn.k_proj.weight.shape(), layer.cross_attn.k_proj.weight.dtype(),
-                    nan_count, kw_data.len(), &kw_data[..5]);
-            }
-
-            let cross_k = triton_matmul(&self.device, pipeline,
-                enc_f16, &kw_f16, enc_seq, kv_dim, self.decoder_dim, block_m, block_m)?;
-            let cross_v = triton_matmul(&self.device, pipeline,
-                enc_f16, &vw_f16, enc_seq, kv_dim, self.decoder_dim, block_m, block_m)?;
-
-            if i == 0 {
-                self.device.wait_until_completed()?;
-                let ck = cross_k.flatten_all()?.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
-                let ck_data = ck.to_vec1::<f32>()?;
-                let nan_count = ck_data.iter().filter(|v| v.is_nan()).count();
-                eprintln!("  [dbg] cross_k result shape={:?} nan={}/{} first5={:?}",
-                    cross_k.shape(), nan_count, ck_data.len(), &ck_data[..5]);
-            }
-
-            cache.cross_k.push(cross_k);
-            cache.cross_v.push(cross_v);
+            enc_matmul(&enc, pipeline,
+                enc_proj, &layer.cross_attn.k_proj.weight, &cache.cross_k[i],
+                enc_seq, kv_dim, self.decoder_dim, block_m, block_m);
+            enc_matmul(&enc, pipeline,
+                enc_proj, &layer.cross_attn.v_proj.weight, &cache.cross_v[i],
+                enc_seq, kv_dim, self.decoder_dim, block_m, block_m);
         }
-
+        drop(enc);
         self.device.wait_until_completed()?;
+
         cache.cross_initialized = true;
         Ok(())
     }
@@ -475,7 +436,7 @@ impl TritonMetalDecoder {
     fn forward_one_token(
         &self, token_id: u32, cache: &mut MetalDecoderCache, timing: bool,
     ) -> Result<()> {
-        self.forward_one_token_inner(token_id, cache, timing, std::env::var("PROFILE").is_ok())
+        self.forward_one_token_inner(token_id, cache, timing, self.profile)
     }
 
     /// Profile mode: separate command buffer per phase to get per-phase GPU timing.
@@ -492,17 +453,19 @@ impl TritonMetalDecoder {
         let k = &self.kernels;
         let s = &self.scratch;
         let dim = self.decoder_dim;
-        let q_dim = self.n_q_heads * self.head_dim;  // == kv_dim in Moonshine v2
+        let q_dim = self.n_q_heads * self.head_dim;
         let pos = cache.self_len;
         let dev = &self.device;
 
         let t0 = std::time::Instant::now();
 
-        // 1. Token embedding: CPU lookup → F32 tensor → upload to Metal
+        // 1. Token embedding: CPU lookup → write directly into pre-allocated buffer
         let token_offset = (token_id as usize) * dim;
         let embed_slice = &self.embed_tokens_data[token_offset..token_offset + dim];
-        let embed_f32 = Tensor::from_slice(embed_slice, (dim,), &Device::Cpu)?
-            .to_device(&self.metal_device)?;
+        unsafe {
+            let dst = s.embed_upload.contents_ptr() as *mut f32;
+            std::ptr::copy_nonoverlapping(embed_slice.as_ptr(), dst, dim);
+        }
 
         let t1 = std::time::Instant::now();
 
@@ -517,7 +480,7 @@ impl TritonMetalDecoder {
 
         let mut enc = dev.command_encoder()?;
 
-        let buffers: [&Tensor; 2] = [&s.f32_a, &s.f32_b];
+        let buffers: [&GpuBuffer; 2] = [&s.f32_a, &s.f32_b];
         let mut write_idx: usize = 1;
 
         // Profiling accumulators (per-phase, summed across layers)
@@ -528,7 +491,7 @@ impl TritonMetalDecoder {
         let mut t_misc = 0.0f64;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let read_f32 = if layer_idx == 0 { &embed_f32 } else { buffers[1 - write_idx] };
+            let read_f32 = if layer_idx == 0 { &s.embed_upload } else { buffers[1 - write_idx] };
             let write_f32 = buffers[write_idx];
 
             // ── Self-attention QKV GEMVs (split-K for parallelism) ──
@@ -536,28 +499,28 @@ impl TritonMetalDecoder {
             let tp = std::time::Instant::now();
             if layer_idx == 0 {
                 enc_layernorm_std_f32in(&enc, &k.layernorm_std_f32in,
-                    read_f32, &layer.input_layernorm, &s.f16_norm, 1, dim)?;
+                    read_f32, &layer.input_layernorm, &s.f16_norm, 1, dim);
             }
 
-            // Fused Q/K/V split-K: single dispatch for all 3 projections (saves 4 dispatches)
+            // Fused Q/K/V split-K: single dispatch for all 3 projections
             enc_gemv_qkv_splitk(&enc,
                 &k.gemv_qkv_splitk_partial, &k.gemv_qkv_splitk_reduce,
                 &s.f16_norm,
                 &layer.self_attn.q_proj.weight, &layer.self_attn.k_proj.weight, &layer.self_attn.v_proj.weight,
                 &s.f16_q, &s.f16_k, &s.f16_v,
                 &s.f16_partial,
-                q_dim, dim, qkv_splits)?;
+                q_dim, dim, qkv_splits);
             if profile { enc = gpu_sync!(enc, dev); t_gemv += tp.elapsed().as_secs_f64() * 1000.0; }
 
             let tp = std::time::Instant::now();
             enc_rope_qk_cache_fused(&enc, &k.rope_qk_cache_fused,
                 &s.f16_q, &s.f16_k, &self.rope_table, &cache.self_k[layer_idx],
                 self.n_q_heads, self.n_kv_heads, self.head_dim, self.half_rot,
-                pos, self.max_kv_len)?;
+                pos, self.max_kv_len);
 
             enc_kv_cache_append(&enc, &k.kv_cache_append,
                 &s.f16_v, &cache.self_v[layer_idx],
-                self.n_kv_heads, self.head_dim, self.max_kv_len, pos)?;
+                self.n_kv_heads, self.head_dim, self.max_kv_len, pos);
             if profile { enc = gpu_sync!(enc, dev); t_misc += tp.elapsed().as_secs_f64() * 1000.0; }
 
             // ── Self-attention decode ──
@@ -568,18 +531,18 @@ impl TritonMetalDecoder {
                 self_kv_len, self.head_dim, self.n_kv_heads, self.n_q_heads,
                 self.sm_scale,
                 self.max_kv_len * self.head_dim,
-                self.head_dim)?;
+                self.head_dim);
             if profile { enc = gpu_sync!(enc, dev); t_self_attn += tp.elapsed().as_secs_f64() * 1000.0; }
 
             let tp = std::time::Instant::now();
             enc_gemv_splitk(&enc,
                 &k.gemv_splitk_partial, &k.gemv_splitk_reduce,
                 &s.f16_attn, &layer.self_attn.o_proj.weight, &s.f16_act, &s.f16_partial,
-                dim, q_dim, qkv_splits)?;
+                dim, q_dim, qkv_splits);
             enc_residual_add_layernorm(&enc, &k.residual_add_layernorm,
                 &s.f16_act, read_f32, write_f32,
                 &layer.post_attention_layernorm, &s.f16_norm,
-                1, dim)?;
+                1, dim);
             if profile { enc = gpu_sync!(enc, dev); t_gemv += tp.elapsed().as_secs_f64() * 1000.0; }
             write_idx = 1 - write_idx;
 
@@ -591,10 +554,8 @@ impl TritonMetalDecoder {
             enc_gemv_splitk(&enc,
                 &k.gemv_splitk_partial, &k.gemv_splitk_reduce,
                 &s.f16_norm, &layer.cross_attn.q_proj.weight, &s.f16_q, &s.f16_partial,
-                q_dim, dim, qkv_splits)?;
-            if profile { enc = gpu_sync!(enc, dev); t_gemv += tp.elapsed().as_secs_f64() * 1000.0;
-                if layer_idx == 0 { eprintln!("  [layer0] cross_Q={:.3}ms", tp.elapsed().as_secs_f64() * 1000.0); }
-            }
+                q_dim, dim, qkv_splits);
+            if profile { enc = gpu_sync!(enc, dev); t_gemv += tp.elapsed().as_secs_f64() * 1000.0; }
 
             let tp = std::time::Instant::now();
             let cross_n_splits = 32usize.min(cache.cross_len);
@@ -606,23 +567,19 @@ impl TritonMetalDecoder {
                 self.sm_scale,
                 self.head_dim,
                 self.n_kv_heads * self.head_dim,
-                cross_n_splits)?;
-            if profile { enc = gpu_sync!(enc, dev); t_cross_attn += tp.elapsed().as_secs_f64() * 1000.0;
-                if layer_idx == 0 { eprintln!("  [layer0] cross_attn={:.3}ms (kv_len={}, splits={})", tp.elapsed().as_secs_f64() * 1000.0, cache.cross_len, cross_n_splits); }
-            }
+                cross_n_splits);
+            if profile { enc = gpu_sync!(enc, dev); t_cross_attn += tp.elapsed().as_secs_f64() * 1000.0; }
 
             let tp = std::time::Instant::now();
             enc_gemv_splitk(&enc,
                 &k.gemv_splitk_partial, &k.gemv_splitk_reduce,
                 &s.f16_attn, &layer.cross_attn.o_proj.weight, &s.f16_act, &s.f16_partial,
-                dim, q_dim, qkv_splits)?;
+                dim, q_dim, qkv_splits);
             enc_residual_add_layernorm(&enc, &k.residual_add_layernorm,
                 &s.f16_act, read_f32, write_f32,
                 &layer.final_layernorm, &s.f16_norm,
-                1, dim)?;
-            if profile { enc = gpu_sync!(enc, dev); t_gemv += tp.elapsed().as_secs_f64() * 1000.0;
-                if layer_idx == 0 { eprintln!("  [layer0] cross_O_resadd_ln={:.3}ms", tp.elapsed().as_secs_f64() * 1000.0); }
-            }
+                1, dim);
+            if profile { enc = gpu_sync!(enc, dev); t_gemv += tp.elapsed().as_secs_f64() * 1000.0; }
             write_idx = 1 - write_idx;
 
             // ── MLP ──
@@ -638,7 +595,7 @@ impl TritonMetalDecoder {
                     &k.gemv_glu_splitk_partial, &k.gemv_glu_splitk_reduce,
                     &s.f16_norm, &layer.mlp.fc1.weight, &layer.mlp.fc1.bias, &s.f16_act,
                     &s.f16_partial,
-                    self.intermediate_size, dim, fc1_splits)?;
+                    self.intermediate_size, dim, fc1_splits);
                 enc = gpu_sync!(enc, dev);
                 let t_fc1 = tp2.elapsed().as_secs_f64() * 1000.0;
                 let tp2 = std::time::Instant::now();
@@ -646,7 +603,7 @@ impl TritonMetalDecoder {
                     &k.gemv_splitk_partial, &k.gemv_splitk_bias_reduce,
                     &s.f16_act, &layer.mlp.fc2.weight, &layer.mlp.fc2.bias, &s.f16_norm,
                     &s.f16_partial,
-                    dim, self.intermediate_size, fc2_splits)?;
+                    dim, self.intermediate_size, fc2_splits);
                 enc = gpu_sync!(enc, dev);
                 let t_fc2 = tp2.elapsed().as_secs_f64() * 1000.0;
                 let tp2 = std::time::Instant::now();
@@ -658,7 +615,7 @@ impl TritonMetalDecoder {
                 enc_residual_add_layernorm(&enc, &k.residual_add_layernorm,
                     &s.f16_norm, read_f32, write_f32,
                     next_ln_weight, &s.f16_norm,
-                    1, dim)?;
+                    1, dim);
                 enc = gpu_sync!(enc, dev);
                 let t_res = tp2.elapsed().as_secs_f64() * 1000.0;
                 eprintln!("  [layer0] fc1_glu={:.3}ms fc2={:.3}ms resadd_ln={:.3}ms", t_fc1, t_fc2, t_res);
@@ -669,13 +626,13 @@ impl TritonMetalDecoder {
                     &k.gemv_glu_splitk_partial, &k.gemv_glu_splitk_reduce,
                     &s.f16_norm, &layer.mlp.fc1.weight, &layer.mlp.fc1.bias, &s.f16_act,
                     &s.f16_partial,
-                    self.intermediate_size, dim, fc1_splits)?;
+                    self.intermediate_size, dim, fc1_splits);
 
                 enc_gemv_splitk_bias(&enc,
                     &k.gemv_splitk_partial, &k.gemv_splitk_bias_reduce,
                     &s.f16_act, &layer.mlp.fc2.weight, &layer.mlp.fc2.bias, &s.f16_norm,
                     &s.f16_partial,
-                    dim, self.intermediate_size, fc2_splits)?;
+                    dim, self.intermediate_size, fc2_splits);
 
                 let next_ln_weight = if layer_idx + 1 < self.num_layers {
                     &self.layers[layer_idx + 1].input_layernorm
@@ -685,7 +642,7 @@ impl TritonMetalDecoder {
                 enc_residual_add_layernorm(&enc, &k.residual_add_layernorm,
                     &s.f16_norm, read_f32, write_f32,
                     next_ln_weight, &s.f16_norm,
-                    1, dim)?;
+                    1, dim);
                 if profile { enc = gpu_sync!(enc, dev); t_mlp += tp.elapsed().as_secs_f64() * 1000.0; }
             }
             write_idx = 1 - write_idx;
@@ -695,7 +652,7 @@ impl TritonMetalDecoder {
         let tp = std::time::Instant::now();
         enc_gemv_f16w(&enc, &k.gemv_f16w,
             &s.f16_norm, &self.proj_out_weight, &s.f16_logits,
-            self.vocab_size, dim)?;
+            self.vocab_size, dim);
 
         let t2 = std::time::Instant::now();
 
@@ -732,27 +689,20 @@ impl TritonMetalDecoder {
         Ok(())
     }
 
-    /// Read f16 logits from GPU and return argmax token ID.
-    fn argmax_logits(&self, debug: bool) -> Result<u32> {
-        let logits = self.scratch.f16_logits.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
-        let data = logits.to_vec1::<f32>()?;
-        if debug {
-            let nan_count = data.iter().filter(|v| v.is_nan()).count();
-            let zero_count = data.iter().filter(|&&v| v == 0.0).count();
-            let nonzero: Vec<(usize, f32)> = data.iter().enumerate()
-                .filter(|&(_, &v)| v != 0.0 && !v.is_nan())
-                .take(10)
-                .map(|(i, &v)| (i, v))
-                .collect();
-            eprintln!("  [logits] len={} nan={} zero={} nonzero_sample={:?} first5={:?}",
-                data.len(), nan_count, zero_count, nonzero, &data[..5.min(data.len())]);
+    /// Read f16 logits from GPU buffer and return argmax token ID.
+    fn argmax_logits(&self) -> u32 {
+        let ptr = self.scratch.f16_logits.contents_ptr() as *const half::f16;
+        let data = unsafe { std::slice::from_raw_parts(ptr, self.vocab_size) };
+        let mut best_idx = 0usize;
+        let mut best_val = f32::NEG_INFINITY;
+        for (i, v) in data.iter().enumerate() {
+            let f = v.to_f32();
+            if f > best_val {
+                best_val = f;
+                best_idx = i;
+            }
         }
-        let mut indexed: Vec<(usize, f32)> = data.iter().copied().enumerate().collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        if debug {
-            eprintln!("  [metal-logits] top5={:?}", &indexed[..5]);
-        }
-        Ok(indexed[0].0 as u32)
+        best_idx as u32
     }
 
     /// Full greedy decode.
@@ -768,14 +718,14 @@ impl TritonMetalDecoder {
 
         // First step with BOS
         self.forward_one_token(self.bos_id, &mut cache, false)?;
-        let mut next_token = self.argmax_logits(false)?;
+        let mut next_token = self.argmax_logits();
         generated.push(next_token);
         if next_token == self.eos_id { return Ok(generated); }
 
         let decode_start = std::time::Instant::now();
         for _step in 0..max_tokens - 1 {
             self.forward_one_token(next_token, &mut cache, false)?;
-            next_token = self.argmax_logits(false)?;
+            next_token = self.argmax_logits();
             generated.push(next_token);
             if next_token == self.eos_id { break; }
         }
