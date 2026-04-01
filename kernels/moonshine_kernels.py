@@ -132,7 +132,7 @@ def matmul_bias_fp16(
 
     bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
     c = acc + bias[None, :].to(tl.float32)
-    if ACTIVATION is not None:
+    if ACTIVATION:
         c = ACTIVATION(c)
 
     c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
@@ -171,7 +171,7 @@ def matmul_bias_f16a_f32w(
 
     bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
     c = acc + bias[None, :]
-    if ACTIVATION is not None:
+    if ACTIVATION:
         c = ACTIVATION(c)
 
     c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
