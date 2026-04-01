@@ -4,12 +4,10 @@
 Usage:
     python compile_step.py msl_metal         INPUT.ttir  OUTPUT.metal
     python compile_step.py msl_metal_nosimd  INPUT.ttir  OUTPUT.metal
-    python compile_step.py air_metal         INPUT.ttir  OUTPUT.ll
-    python compile_step.py hlsl       INPUT.ttir  OUTPUT.hlsl
+    python compile_step.py hlsl              INPUT.ttir  OUTPUT.hlsl
 
 Metallib compilation is handled directly by xcrun in build.ninja:
     .metal -> xcrun metal -> .metallib
-    .ll    -> xcrun metal-as -> .air -> xcrun metallib -> .metallib
 """
 import json
 import sys
@@ -45,18 +43,6 @@ def main():
         msl, _, _, _ = ttir_to_msl_with_metadata(
             Path(inp).read_text(), block_size=256, use_simdgroup=False)
         write_if_changed(Path(out), msl)
-
-    elif cmd == "air_metal":
-        from backend.codegen.air_emitter import ttgir_to_air
-        ir_text, kname, tg_mem, bs = ttgir_to_air(Path(inp).read_text(), block_size=256)
-        write_if_changed(Path(out), ir_text)
-        # Write sidecar with AIR-specific metadata
-        meta_out = Path(out).with_suffix(".json")
-        write_if_changed(meta_out, json.dumps({
-            "kernel_name": kname,
-            "block_size": bs,
-            "tg_mem_bytes": tg_mem,
-        }))
 
     elif cmd == "hlsl":
         from backend.codegen import ttir_to_hlsl_with_metadata

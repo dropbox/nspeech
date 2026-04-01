@@ -259,7 +259,6 @@ HLSL_EXTRA_KERNELS = [
 #   group:    "encoder" or "decoder" (which struct it belongs to)
 #   optional: True → Option<Pipeline>, loads with .ok() instead of ?
 #   tg_mem:   AIR threadgroup memory in bytes (aarch64 only, 0 = none)
-#   air:      True → use out/air/ metallib on aarch64 instead of out/metal/
 #   d3d12:    True → include in D3D12 kernel set (generates DXIL const + PSO field)
 #   d3d12_alias: D3D12 field name override (if different from alias)
 

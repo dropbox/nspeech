@@ -75,11 +75,7 @@ def gen_metal(metadata, metal_kernels):
     lines.append("    pub fn load_kernel(name: &str) -> Option<&'static [u8]> {")
     lines.append("        match name {")
     for name in metal_names:
-        meta = metadata.get(name, {})
-        if meta.get("air"):
-            path = f"../air/{name}.metallib"
-        else:
-            path = f"../metal/{name}.metallib"
+        path = f"../metal/{name}.metallib"
         lines.append(f'            "{name}" => Some(include_bytes!("{path}")),')
     lines.append("            _ => None,")
     lines.append("        }")
