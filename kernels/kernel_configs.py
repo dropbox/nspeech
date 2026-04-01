@@ -38,19 +38,11 @@ METAL_KERNELS = [
     ("matmul_bias_gelu_fp16_128x128x32", "matmul_bias_fp16",
      "*fp16:16, *fp16:16, *fp16, *fp16:16, i32, i32, i32, i32, i32, i32, i32, i32, i32, 128, 128, 32, gelu",
      8, ["cdiv(M, 128)", "cdiv(N, 128)", "1"]),
-    ("matmul_bias_silu_fp16_32x32x32", "matmul_bias_fp16",
-     "*fp16:16, *fp16:16, *fp16, *fp16:16, i32, i32, i32, i32, i32, i32, i32, i32, i32, 32, 32, 32, silu",
-     4, ["cdiv(M, 32)", "cdiv(N, 32)", "1"]),
     # ── Mixed precision (f16 activations, f32 weights) ──
     ("matmul_bias_gelu_f16a_f32w_32x32x32", "matmul_bias_f16a_f32w",
      "*fp16:16, *fp32:16, *fp32, *fp16:16, i32, i32, i32, i32, i32, i32, i32, i32, i32, 32, 32, 32, gelu",
      4, ["cdiv(M, 32)", "cdiv(N, 32)", "1"],
      {"targets": ["hlsl"]}),
-    ("matmul_bias_silu_f16a_f32w_32x32x32", "matmul_bias_f16a_f32w",
-     "*fp16:16, *fp32:16, *fp32, *fp16:16, i32, i32, i32, i32, i32, i32, i32, i32, i32, 32, 32, 32, silu",
-     4, ["cdiv(M, 32)", "cdiv(N, 32)", "1"],
-     {"targets": ["hlsl"]}),
-
     # ── Flash Attention 2 ──
     ("flash_attention_fwd_32x32x64", "flash_attention_fwd",
      "*fp16:16, *fp16:16, *fp16:16, *fp16:16, i32, i32, i32, i32, fp32, i32, i32, 32, 32, 64",
@@ -62,12 +54,6 @@ METAL_KERNELS = [
      4, ["n_rows", "1", "1"]),
     ("layernorm_bare_768", "layernorm_bare",
      "*fp16, *fp16, i32, i32, i32, i32, 1e-5, 1024",
-     4, ["n_rows", "1", "1"]),
-    ("layernorm_standard_768", "layernorm",
-     "*fp16, *fp16, *fp16, i32, i32, i32, i32, 1e-5, 1024, 0",
-     4, ["n_rows", "1", "1"]),
-    ("layernorm_standard_640", "layernorm",
-     "*fp16, *fp16, *fp16, i32, i32, i32, i32, 1e-5, 1024, 0",
      4, ["n_rows", "1", "1"]),
     ("layernorm_standard_f32in_640", "layernorm",
      "*fp32, *fp16, *fp16, i32, i32, i32, i32, 1e-5, 1024, 0",
@@ -82,9 +68,6 @@ METAL_KERNELS = [
      4, ["cdiv(n_elements, 1024)", "1", "1"]),
     ("softmax_fp16", "softmax_rows",
      "*fp16, *fp16, i32, i32, i32, 1024",
-     4, ["n_rows", "1", "1"]),
-    ("masked_softmax_fp16", "masked_softmax_rows",
-     "*fp16, *fp16, *fp16, i32, i32, i32, i32, 1024",
      4, ["n_rows", "1", "1"]),
     ("bias_add_fp16", "bias_add",
      "*fp16, *fp16, *fp16, i32, i32, 1024",
@@ -147,9 +130,6 @@ METAL_KERNELS = [
     ("gemv_splitk_reduce", "gemv_splitk_reduce",
      "*fp16, *fp16, i32, i32, i32, 128",
      4, ["cdiv(N, 128)", "1", "1"]),
-    ("gemv_splitk_reduce_resadd_ln", "gemv_splitk_reduce_resadd_ln",
-     "*fp16, *fp32, *fp32, *fp16, *fp16, i32, i32, i32, 1e-5, 1024",
-     4, ["1", "1", "1"]),
     ("gemv_qkv_splitk_partial", "gemv_qkv_splitk_partial",
      "*fp16, *fp16, *fp16, *fp16, *fp16, i32, i32, i32, i32, i32, i32, 128",
      4, ["n_n_blocks * n_splits", "3", "1"]),
@@ -185,10 +165,6 @@ HLSL_EXTRA_KERNELS = [
     ("matmul_bias_f16a_f32w_32x32x32", "matmul_bias_f16a_f32w",
      "*fp16:16, *fp32:16, *fp32, *fp16:16, i32, i32, i32, i32, i32, i32, i32, i32, i32, 32, 32, 32, None",
      4, ["cdiv(M, 32)", "cdiv(N, 32)", "1"]),
-    ("matmul_f16a_f32w_32x32x32", "matmul_f16a_f32w",
-     "*fp16:16, *fp32:16, *fp16:16, i32, i32, i32, i32, i32, i32, i32, i32, i32, 32, 32, 32",
-     4, ["cdiv(M, 32)", "cdiv(N, 32)", "1"]),
-
     # Extra layernorm variants for HLSL
     ("layernorm_unit_offset_f32in_768", "layernorm",
      "*fp32, *fp16, *fp16, i32, i32, i32, i32, 1e-5, 1024, 1",
@@ -199,67 +175,14 @@ HLSL_EXTRA_KERNELS = [
      "*fp16, *fp32, i32, 1024",
      4, ["cdiv(n_elements, 1024)", "1", "1"]),
 
-    # Additional decoder HLSL kernels
-    ("silu_fp16", "silu_forward",
-     "*fp16, *fp16, i32, 1024",
-     4, ["cdiv(n_elements, 1024)", "1", "1"]),
-    ("silu_mul_fp16", "silu_mul_forward",
-     "*fp16, *fp16, *fp16, i32, 1024",
-     4, ["cdiv(n_elements, 1024)", "1", "1"]),
-    ("scale_inplace_fp16", "scale_inplace",
-     "*fp16, i32, fp32, 1024",
-     4, ["cdiv(n_elements, 1024)", "1", "1"]),
-    ("add_bias_f32_fp16", "add_bias_f32",
-     "*fp16, *fp32, *fp16, i32, i32, i32, 1024",
-     4, ["n_rows", "1", "1"]),
-
-    # HLSL GEMV variants
-    ("gemv_qkv_fused", "gemv_qkv_fused",
-     "*fp16, *fp16, *fp16, *fp16, *fp16, *fp16, *fp16, i32, i32, i32, i32, 128",
-     4, ["cdiv(N * 3, 128)", "1", "1"]),
-    ("rope_interleaved", "rope_interleaved",
-     "*fp16, *fp32, i32, i32, i32, i32, 256",
-     4, ["cdiv(total_pairs, 256)", "1", "1"]),
-    ("rope_cache_fused", "rope_cache_fused",
-     "*fp16, *fp16, *fp32, i32, i32, i32, i32, i32, 256",
-     4, ["cdiv(total_pairs, 256)", "1", "1"]),
-    ("rope_qk_cache_fused_hlsl", "rope_qk_cache_fused",
-     "*fp16, *fp16, *fp32, *fp16, i32, i32, i32, i32, i32, i32, 512",
-     4, ["1", "1", "1"]),
-
     # HLSL attention decode variants
     ("flash_attention_d64", "flash_attention_fwd",
      "*fp16:16, *fp16:16, *fp16:16, *fp16:16, i32, i32, i32, i32, fp32, i32, i32, 32, 32, 64",
      4, ["cdiv(seq_len, 32)", "n_heads", "1"]),
-    ("attention_decode_fwd", "attention_decode_fwd",
-     "*fp16, *fp16, *fp16, *fp16, i32, i32, i32, fp32, i32, i32, i32, i32, 8, 64",
-     4, ["n_q_heads", "1", "1"]),
-    ("attention_decode_1d", "attention_decode_1d",
-     "*fp16, *fp16, *fp16, *fp16, i32, i32, i32, fp32, i32, i32, 64",
-     4, ["n_q_heads", "1", "1"]),
     ("attention_decode_1d_d80", "attention_decode_1d_masked",
      "*fp16, *fp16, *fp16, *fp16, i32, i32, i32, fp32, i32, i32, i32, 128",
      4, ["n_q_heads", "1", "1"]),
 
-    # Q8 GEMV variants (HLSL only)
-    ("gemv_q8", "gemv_q8",
-     "*fp16, *i32, *fp16, *fp16, i32, i32, i32, 64, 32",
-     4, ["cdiv(N, 64)", "1", "1"]),
-    ("gemv_q8_bias", "gemv_q8_bias",
-     "*fp16, *i32, *fp16, *fp32, *fp16, i32, i32, i32, 64, 32",
-     4, ["cdiv(N, 64)", "1", "1"]),
-    ("gemv_q8_v2", "gemv_q8",
-     "*fp16, *i32, *fp16, *fp16, i32, i32, i32, 128, 32",
-     4, ["cdiv(N, 128)", "1", "1"]),
-    ("gemv_q8_bias_v2", "gemv_q8_bias",
-     "*fp16, *i32, *fp16, *fp32, *fp16, i32, i32, i32, 128, 32",
-     4, ["cdiv(N, 128)", "1", "1"]),
-    ("gemv_q8_bias_glu_v2", "gemv_q8_bias_glu",
-     "*fp16, *i32, *fp16, *fp32, *fp16, i32, i32, i32, 128, 32",
-     4, ["cdiv(N, 128)", "1", "1"]),
-    ("gemv_q8_resadd_ln_v2", "gemv_q8_resadd_ln",
-     "*fp16, *i32, *fp16, *fp32, *fp32, *fp16, *fp16, i32, i32, i32, 1e-5, 1024, 32",
-     4, ["1", "1", "1"]),
 ]
 
 
@@ -301,12 +224,6 @@ KERNEL_METADATA = {
     "matmul_bias_gelu_f16a_f32w_32x32x32": {
         "alias": "matmul_bias_gelu_f32w_32x32", "group": "encoder", "d3d12": True,
     },
-    "matmul_bias_silu_fp16_32x32x32": {
-        "alias": "matmul_bias_silu_32x32", "group": "decoder",
-    },
-    "matmul_bias_silu_f16a_f32w_32x32x32": {
-        "alias": "matmul_bias_silu_f32w_32x32", "group": "decoder", "d3d12": True,
-    },
     "flash_attention_fwd_32x32x64": {
         "alias": "flash_attention", "group": "encoder", "tg_mem": 8192,
     },
@@ -316,12 +233,6 @@ KERNEL_METADATA = {
     },
     "layernorm_bare_768": {
         "alias": "layernorm_bare", "group": "encoder", "optional": True, "tg_mem": 4096,
-    },
-    "layernorm_standard_768": {
-        "alias": "layernorm_standard_768", "group": "encoder", "tg_mem": 4096,
-    },
-    "layernorm_standard_640": {
-        "alias": "layernorm_standard_640", "group": "encoder", "tg_mem": 4096,
     },
     "layernorm_standard_f32in_640": {
         "alias": "layernorm_std_f32in", "group": "decoder", "tg_mem": 4096,
@@ -334,9 +245,6 @@ KERNEL_METADATA = {
     },
     "softmax_fp16": {
         "alias": "softmax", "group": "encoder", "d3d12": True,
-    },
-    "masked_softmax_fp16": {
-        "alias": "masked_softmax", "group": "encoder",
     },
     "bias_add_fp16": {
         "alias": "bias_add", "group": "encoder",
@@ -393,9 +301,6 @@ KERNEL_METADATA = {
     "gemv_splitk_reduce": {
         "alias": "gemv_splitk_reduce", "group": "decoder",
     },
-    "gemv_splitk_reduce_resadd_ln": {
-        "alias": "gemv_splitk_reduce_resadd_ln", "group": "decoder", "tg_mem": 4096,
-    },
     "gemv_qkv_splitk_partial": {
         "alias": "gemv_qkv_splitk_partial", "group": "decoder",
     },
@@ -426,10 +331,6 @@ KERNEL_METADATA = {
         "alias": "matmul_bias_f32w_32x32", "group": "encoder",
         "d3d12": True, "d3d12_only": True,
     },
-    "matmul_f16a_f32w_32x32x32": {
-        "alias": "matmul_f32w_32x32", "group": "encoder",
-        "d3d12": True, "d3d12_only": True,
-    },
     "layernorm_unit_offset_f32in_768": {
         "alias": "layernorm_f32in", "group": "encoder",
         "d3d12": True, "d3d12_only": True,
@@ -439,62 +340,8 @@ KERNEL_METADATA = {
         "d3d12": True, "d3d12_only": True,
     },
 
-    # ── HLSL-only decoder kernels ──
-    "silu_fp16": {
-        "alias": "silu", "group": "encoder", "d3d12": True, "d3d12_only": True,
-    },
-    "silu_mul_fp16": {
-        "alias": "silu_mul", "group": "decoder", "d3d12": True, "d3d12_only": True,
-    },
-    "scale_inplace_fp16": {
-        "alias": "scale_inplace", "group": "decoder", "d3d12": True, "d3d12_only": True,
-    },
-    "add_bias_f32_fp16": {
-        "alias": "add_bias_f32", "group": "decoder", "d3d12": True, "d3d12_only": True,
-    },
-    "gemv_qkv_fused": {
-        "alias": "gemv_qkv_fused", "group": "decoder", "d3d12": True, "d3d12_only": True,
-    },
-    "rope_interleaved": {
-        "alias": "rope_interleaved", "group": "decoder", "d3d12": True, "d3d12_only": True,
-    },
-    "rope_cache_fused": {
-        "alias": "rope_cache_fused", "group": "decoder", "d3d12": True, "d3d12_only": True,
-    },
-    "rope_qk_cache_fused_hlsl": {
-        "alias": "rope_qk_cache_fused_hlsl", "group": "decoder",
-        "d3d12": True, "d3d12_only": True,
-    },
     "flash_attention_d64": {
         "alias": "flash_attn_d64", "group": "encoder",
-        "d3d12": True, "d3d12_only": True,
-    },
-    "attention_decode_fwd": {
-        "alias": "attention_decode_fwd", "group": "decoder",
-        "d3d12": True, "d3d12_only": True,
-    },
-    "attention_decode_1d": {
-        "alias": "attention_decode_1d", "group": "decoder",
-        "d3d12": True, "d3d12_only": True,
-    },
-    "gemv_q8": {
-        "alias": "gemv_q8", "group": "decoder", "d3d12": True, "d3d12_only": True,
-    },
-    "gemv_q8_bias": {
-        "alias": "gemv_q8_bias", "group": "decoder", "d3d12": True, "d3d12_only": True,
-    },
-    "gemv_q8_v2": {
-        "alias": "gemv_q8_v2", "group": "decoder", "d3d12": True, "d3d12_only": True,
-    },
-    "gemv_q8_bias_v2": {
-        "alias": "gemv_q8_bias_v2", "group": "decoder", "d3d12": True, "d3d12_only": True,
-    },
-    "gemv_q8_bias_glu_v2": {
-        "alias": "gemv_q8_bias_glu_v2", "group": "decoder",
-        "d3d12": True, "d3d12_only": True,
-    },
-    "gemv_q8_resadd_ln_v2": {
-        "alias": "gemv_q8_resadd_ln_v2", "group": "decoder",
         "d3d12": True, "d3d12_only": True,
     },
 }

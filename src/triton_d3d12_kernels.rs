@@ -261,29 +261,6 @@ pub fn triton_d3d12_gelu(
         .map_err(|e| anyhow::anyhow!("gelu dispatch: {e}"))
 }
 
-/// Dispatch SiLU: out = x * sigmoid(x) (F16)
-pub fn triton_d3d12_silu(
-    kernels: &TritonD3D12Kernels,
-    x: &GpuBuffer,
-    out: &GpuBuffer,
-    n_elements: usize,
-) -> Result<()> {
-    let grid_x = cdiv(n_elements, 1024) as u32;
-
-    let root_constants: Vec<u32> = vec![
-        i32_as_u32(n_elements as i32),
-        grid_x, 1, 1,
-    ];
-
-    let uavs = [
-        uav_f16(x, n_elements as u32),
-        uav_f16(out, n_elements as u32),
-    ];
-
-    kernels.gpu.dispatch_uav_only(&kernels.silu, &root_constants, &uavs, [grid_x, 1, 1])
-        .map_err(|e| anyhow::anyhow!("silu dispatch: {e}"))
-}
-
 /// Dispatch residual add: out = x + residual (F16)
 ///
 /// Pointer args: 0=x, 1=residual, 2=out
