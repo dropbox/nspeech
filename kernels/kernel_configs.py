@@ -86,16 +86,6 @@ METAL_KERNELS = [
      "*fp32, *fp16, i32, 1024",
      4, ["cdiv(n_elements, 1024)", "1", "1"]),
 
-    # ── Frontend: Causal Conv1d ──
-    # Conv1: [768, T] → [1536, T/2] + SiLU
-    ("causal_conv1d_silu", "causal_conv1d",
-     "*fp32, *fp32, *fp32, *fp16, i32, i32, i32, i32, 5, 2, 4, 128, 1",
-     4, ["C_out", "cdiv(T_out, 128)", "1"]),
-    # Conv2: [1536, T/2] → [768, T/4], no activation
-    ("causal_conv1d_linear", "causal_conv1d",
-     "*fp32, *fp32, *fp32, *fp16, i32, i32, i32, i32, 5, 2, 4, 128, 0",
-     4, ["C_out", "cdiv(T_out, 128)", "1"]),
-
     # ── Decoder: GEMV ──
     ("gemv_f16w", "gemv_f16w",
      "*fp16, *fp16, *fp16, i32, i32, i32, i32, 128",
@@ -339,13 +329,6 @@ KERNEL_METADATA = {
         "alias": "convert_f32_to_f16", "group": "decoder", "d3d12": True,
     },
 
-    # ── Frontend kernels ──
-    "causal_conv1d_silu": {
-        "alias": "conv1d_silu", "group": "encoder", "d3d12": True,
-    },
-    "causal_conv1d_linear": {
-        "alias": "conv1d_linear", "group": "encoder", "d3d12": True,
-    },
 
     # ── Decoder kernels ──
     "gemv_f16w": {
@@ -439,7 +422,7 @@ KERNEL_METADATA = {
 
     # ── HLSL-only decoder kernels ──
     "silu_fp16": {
-        "alias": "silu", "group": "decoder", "d3d12": True, "d3d12_only": True,
+        "alias": "silu", "group": "encoder", "d3d12": True, "d3d12_only": True,
     },
     "silu_mul_fp16": {
         "alias": "silu_mul", "group": "decoder", "d3d12": True, "d3d12_only": True,
