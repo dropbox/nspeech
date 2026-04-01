@@ -375,6 +375,58 @@ def convert_f16_to_f32(
     tl.store(out_ptr + offsets, x, mask=mask)
 
 
+# ─── Causal Conv1d (frontend) ────────────────────────────────────────────────
+
+@triton.jit
+def causal_conv1d(
+    x_ptr, w_ptr, bias_ptr, out_ptr,
+    C_in, C_out, T_in, T_out,
+    K: tl.constexpr,
+    STRIDE: tl.constexpr,
+    LEFT_PAD: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    FUSE_SILU: tl.constexpr,
+):
+    """Causal 1D convolution + bias + optional SiLU.
+
+    Input:  x[C_in, T_in] fp32, channel-first.
+    Weight: w[C_in, K, C_out] fp32, transposed for coalesced output-channel access.
+    Bias:   bias[C_out] fp32.
+    Output: out[C_out, T_out] fp16, channel-first.
+
+    out[co, t] = bias[co] + sum_{ci,k} x[ci, t*S+k-pad] * w[ci, k, co]
+
+    Causal padding: x[ci, t] = 0 for t < 0 (left_pad = K-1).
+    Grid: (C_out, cdiv(T_out, BLOCK_T), 1).
+    Each threadgroup handles one output channel across BLOCK_T time steps.
+    """
+    pid_co = tl.program_id(0)
+    pid_tb = tl.program_id(1)
+    t = pid_tb * BLOCK_T + tl.arange(0, BLOCK_T)
+    t_mask = t < T_out
+
+    K_C_out = K * C_out
+
+    acc = tl.zeros((BLOCK_T,), dtype=tl.float32)
+
+    for k in range(K):          # constexpr → unrolled
+        in_t = t * STRIDE + k - LEFT_PAD
+        valid = (in_t >= 0) & t_mask
+        w_k_base = k * C_out + pid_co
+        for ci in range(C_in):
+            x_val = tl.load(x_ptr + ci * T_in + in_t, mask=valid, other=0.0)
+            w_val = tl.load(w_ptr + ci * K_C_out + w_k_base)
+            acc += x_val * w_val
+
+    bias = tl.load(bias_ptr + pid_co)
+    acc += bias
+
+    if FUSE_SILU:
+        acc = acc * tl.sigmoid(acc)
+
+    tl.store(out_ptr + pid_co * T_out + t, acc.to(tl.float16), mask=t_mask)
+
+
 # ─── Decoder-specific kernels ────────────────────────────────────────────────
 
 @triton.jit
