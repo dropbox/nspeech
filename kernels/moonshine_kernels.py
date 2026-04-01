@@ -206,6 +206,127 @@ def matmul_bias_gelu_fp16(
     tl.store(c_ptrs, c.to(tl.float16), mask=mask)
 
 
+@triton.jit
+def matmul_bias_silu_fp16(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """C[M,N] = SiLU(A[M,K] @ B[K,N] + bias[N]), all fp16.
+    Fuses matmul + bias + SiLU to avoid writing intermediate to memory.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] + k < K, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] + k < K, other=0.0)
+        acc += tl.dot(a, b)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Add bias + SiLU in fp32
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    x = acc + bias[None, :].to(tl.float32)
+    # SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
+    c = x / (1.0 + tl.exp(-x))
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, c.to(tl.float16), mask=mask)
+
+
+@triton.jit
+def matmul_bias_gelu_f16a_f32w(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """C_f16[M,N] = GELU(A_f16[M,K] @ B_f32[K,N] + bias_f32[N]).
+    Fuses matmul + bias + GELU, mixed precision (f16 activations, f32 weights).
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] + k < K, other=0.0).to(tl.float32)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] + k < K, other=0.0)
+        acc += tl.dot(a, b)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Add bias + GELU in fp32
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    x = acc + bias[None, :]
+    c = x * (0.5 * (1.0 + tl.math.erf(x * 0.7071067811865476)))
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, c.to(tl.float16), mask=mask)
+
+
+@triton.jit
+def matmul_bias_silu_f16a_f32w(
+    a_ptr, b_ptr, bias_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """C_f16[M,N] = SiLU(A_f16[M,K] @ B_f32[K,N] + bias_f32[N]).
+    Fuses matmul + bias + SiLU, mixed precision (f16 activations, f32 weights).
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] + k < K, other=0.0).to(tl.float32)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] + k < K, other=0.0)
+        acc += tl.dot(a, b)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Add bias + SiLU in fp32
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    x = acc + bias[None, :]
+    c = x / (1.0 + tl.exp(-x))
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, c.to(tl.float16), mask=mask)
+
+
 # ─── LayerNorm ────────────────────────────────────────────────────────────────
 
 @triton.jit

@@ -40,6 +40,19 @@ METAL_KERNELS = [
     ("matmul_bias_gelu_fp16_128x128x32", "matmul_bias_gelu_fp16",
      "*fp16:16, *fp16:16, *fp16, *fp16:16, i32, i32, i32, i32, i32, i32, i32, i32, i32, 128, 128, 32",
      8, ["cdiv(M, 128)", "cdiv(N, 128)", "1"]),
+    ("matmul_bias_gelu_f16a_f32w_32x32x32", "matmul_bias_gelu_f16a_f32w",
+     "*fp16:16, *fp32:16, *fp32, *fp16:16, i32, i32, i32, i32, i32, i32, i32, i32, i32, 32, 32, 32",
+     4, ["cdiv(M, 32)", "cdiv(N, 32)", "1"],
+     {"targets": ["hlsl"]}),
+
+    # ── Fused matmul + bias + SiLU ──
+    ("matmul_bias_silu_fp16_32x32x32", "matmul_bias_silu_fp16",
+     "*fp16:16, *fp16:16, *fp16, *fp16:16, i32, i32, i32, i32, i32, i32, i32, i32, i32, 32, 32, 32",
+     4, ["cdiv(M, 32)", "cdiv(N, 32)", "1"]),
+    ("matmul_bias_silu_f16a_f32w_32x32x32", "matmul_bias_silu_f16a_f32w",
+     "*fp16:16, *fp32:16, *fp32, *fp16:16, i32, i32, i32, i32, i32, i32, i32, i32, i32, 32, 32, 32",
+     4, ["cdiv(M, 32)", "cdiv(N, 32)", "1"],
+     {"targets": ["hlsl"]}),
 
     # ── Flash Attention 2 ──
     ("flash_attention_fwd_32x32x64", "flash_attention_fwd",
@@ -287,6 +300,15 @@ KERNEL_METADATA = {
     },
     "matmul_bias_gelu_fp16_128x128x32": {
         "alias": "matmul_bias_gelu_128x128", "group": "encoder", "optional": True,
+    },
+    "matmul_bias_gelu_f16a_f32w_32x32x32": {
+        "alias": "matmul_bias_gelu_f32w_32x32", "group": "encoder", "d3d12": True,
+    },
+    "matmul_bias_silu_fp16_32x32x32": {
+        "alias": "matmul_bias_silu_32x32", "group": "decoder",
+    },
+    "matmul_bias_silu_f16a_f32w_32x32x32": {
+        "alias": "matmul_bias_silu_f32w_32x32", "group": "decoder", "d3d12": True,
     },
     "flash_attention_fwd_32x32x64": {
         "alias": "flash_attention", "group": "encoder", "tg_mem": 8192,

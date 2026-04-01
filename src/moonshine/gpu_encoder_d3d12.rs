@@ -9,6 +9,7 @@ use crate::triton_d3d12_kernels::{
     create_f16_buffer, create_f32_buffer,
     upload_f16, upload_f32, download_f16,
     triton_d3d12_matmul_f32w, triton_d3d12_matmul_bias_f32w,
+    triton_d3d12_matmul_bias_gelu_f32w,
     triton_d3d12_layernorm_f32in,
     triton_d3d12_gelu, triton_d3d12_residual_add_f32,
     triton_d3d12_flash_attention,
@@ -110,6 +111,11 @@ impl EncoderBackend for D3D12EncoderBackend {
     fn matmul_bias(&self, a: &GpuBuffer, b: &GpuBuffer, bias: &GpuBuffer,
                     out: &GpuBuffer, m: usize, n: usize, k: usize) {
         triton_d3d12_matmul_bias_f32w(&self.kernels, a, b, bias, out, m, n, k).unwrap();
+    }
+
+    fn matmul_bias_gelu(&self, a: &GpuBuffer, b: &GpuBuffer, bias: &GpuBuffer,
+                         out: &GpuBuffer, m: usize, n: usize, k: usize) {
+        triton_d3d12_matmul_bias_gelu_f32w(&self.kernels, a, b, bias, out, m, n, k).unwrap();
     }
 
     fn gelu(&self, x: &GpuBuffer, out: &GpuBuffer, n_elem: usize) {

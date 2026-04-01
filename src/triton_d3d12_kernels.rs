@@ -388,6 +388,45 @@ pub fn triton_d3d12_matmul_bias_f32w(
         .map_err(|e| anyhow::anyhow!("matmul_bias_f32w dispatch: {e}"))
 }
 
+/// Dispatch fused matmul+bias+GELU: C_f16[M,N] = GELU(A_f16[M,K] @ B_f32[K,N] + bias_f32[N])
+pub fn triton_d3d12_matmul_bias_gelu_f32w(
+    kernels: &TritonD3D12Kernels,
+    a: &GpuBuffer,     // f16 activation
+    b: &GpuBuffer,     // f32 weight
+    bias: &GpuBuffer,  // f32 bias
+    out: &GpuBuffer,   // f16 output
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    let (bm, bn) = (32, 32);
+    let grid_x = cdiv(m, bm) as u32;
+    let grid_y = cdiv(n, bn) as u32;
+
+    let root_constants: Vec<u32> = vec![
+        i32_as_u32(m as i32),
+        i32_as_u32(n as i32),
+        i32_as_u32(k as i32),
+        i32_as_u32(k as i32),
+        i32_as_u32(1),
+        i32_as_u32(n as i32),
+        i32_as_u32(1),
+        i32_as_u32(n as i32),
+        i32_as_u32(1),
+        grid_x, grid_y, 1,
+    ];
+
+    let uavs = [
+        uav_f16(a, (m * k) as u32),
+        uav_f32(b, (k * n) as u32),
+        uav_f32(bias, n as u32),
+        uav_f16(out, (m * n) as u32),
+    ];
+
+    kernels.gpu.dispatch_uav_only(&kernels.matmul_bias_gelu_f32w_32x32, &root_constants, &uavs, [grid_x, grid_y, 1])
+        .map_err(|e| anyhow::anyhow!("matmul_bias_gelu_f32w dispatch: {e}"))
+}
+
 /// Dispatch layernorm with f32 input: out_f16 = LN(x_f32) * (gamma + 1.0)
 pub fn triton_d3d12_layernorm_f32in(
     kernels: &TritonD3D12Kernels,
