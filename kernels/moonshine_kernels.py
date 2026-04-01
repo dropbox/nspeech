@@ -87,10 +87,19 @@ def matmul_f16a_f32w(
     tl.store(c_ptrs, acc.to(tl.float16), mask=mask)
 
 
+# ─── Activation functions (standard Triton pattern) ──────────────────────────
+
+@triton.jit
+def gelu(x):
+    return x * (0.5 * (1.0 + tl.math.erf(x * 0.7071067811865476)))
+
+@triton.jit
+def silu(x):
+    return x / (1.0 + tl.exp(-x))
+
+
 # ─── Matmul + bias + optional activation ─────────────────────────────────────
-# ACTIVATION is a tl.constexpr: 0=none, 1=GELU, 2=SiLU.
-# Dead branches are eliminated at compile time, so each specialization
-# produces identical code to a hand-written single-activation kernel.
+# ACTIVATION: pass a @triton.jit function (gelu, silu, ...) or None.
 
 @triton.jit
 def matmul_bias_fp16(
@@ -100,7 +109,7 @@ def matmul_bias_fp16(
     stride_bk, stride_bn,
     stride_cm, stride_cn,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    ACTIVATION: tl.constexpr = 0,
+    ACTIVATION: tl.constexpr = None,
 ):
     """C[M,N] = act(A[M,K] @ B[K,N] + bias[N]), all fp16."""
     pid_m = tl.program_id(0)
@@ -122,14 +131,9 @@ def matmul_bias_fp16(
         b_ptrs += BLOCK_K * stride_bk
 
     bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
-    x = acc + bias[None, :].to(tl.float32)
-
-    if ACTIVATION == 1:  # GELU
-        c = x * (0.5 * (1.0 + tl.math.erf(x * 0.7071067811865476)))
-    elif ACTIVATION == 2:  # SiLU
-        c = x / (1.0 + tl.exp(-x))
-    else:
-        c = x
+    c = acc + bias[None, :].to(tl.float32)
+    if ACTIVATION is not None:
+        c = ACTIVATION(c)
 
     c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
@@ -144,7 +148,7 @@ def matmul_bias_f16a_f32w(
     stride_bk, stride_bn,
     stride_cm, stride_cn,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    ACTIVATION: tl.constexpr = 0,
+    ACTIVATION: tl.constexpr = None,
 ):
     """C_f16[M,N] = act(A_f16[M,K] @ B_f32[K,N] + bias_f32[N])."""
     pid_m = tl.program_id(0)
@@ -166,14 +170,9 @@ def matmul_bias_f16a_f32w(
         b_ptrs += BLOCK_K * stride_bk
 
     bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
-    x = acc + bias[None, :]
-
-    if ACTIVATION == 1:  # GELU
-        c = x * (0.5 * (1.0 + tl.math.erf(x * 0.7071067811865476)))
-    elif ACTIVATION == 2:  # SiLU
-        c = x / (1.0 + tl.exp(-x))
-    else:
-        c = x
+    c = acc + bias[None, :]
+    if ACTIVATION is not None:
+        c = ACTIVATION(c)
 
     c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)

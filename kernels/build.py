@@ -77,10 +77,20 @@ def gen_ttir():
             r = compile_kernel(fn=fn, signature=sig, num_warps=nw, grid=grid)
             ir = r.ttgir_text or r.ttir_text
             write_if_changed(ttir_dir / f"{name}.ttir", ir)
+            # Serialize constants — replace non-JSON-serializable objects (e.g.
+            # @triton.jit functions used as constexpr meta-parameters) with their name.
+            serializable_constants = {}
+            for k, v in r.constants.items():
+                if hasattr(v, '__name__'):
+                    serializable_constants[k] = v.__name__
+                elif v is None:
+                    serializable_constants[k] = None
+                else:
+                    serializable_constants[k] = v
             write_if_changed(ttir_dir / f"{name}.json", json.dumps({
                 "kernel_name": r.kernel_name,
                 "params": r.params,
-                "constants": r.constants,
+                "constants": serializable_constants,
                 "threadgroup_size": r.threadgroup_size,
                 "grid": grid,
                 "force_acc_fp16": opts.get("force_acc_fp16", False),
