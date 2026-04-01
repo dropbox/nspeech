@@ -23,9 +23,9 @@ fail()   { FAIL=$((FAIL+1)); RESULTS+="  FAIL  $1\n"; }
 
 # ── 1. Build kernels + Rust binaries ───────────────────────────────────────
 
-header "Building kernels"
-# Generate TTIR + ninja rules (if sources changed)
-(cd kernels && python build.py) 2>&1 | tail -5
+#header "Building kernels"
+## Generate TTIR + ninja rules (if sources changed)
+#(cd kernels && python build.py) 2>&1 | tail -5
 
 header "Building for M2 Mac (aarch64-apple-darwin)"
 cargo build --release --features triton-metal --example $EXAMPLE 2>&1 \

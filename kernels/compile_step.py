@@ -2,9 +2,9 @@
 """Per-file compilation step for ninja.
 
 Usage:
-    python compile_step.py msl_apple  INPUT.ttir  OUTPUT.metal
-    python compile_step.py msl_intel  INPUT.ttir  OUTPUT.metal
-    python compile_step.py air_apple  INPUT.ttir  OUTPUT.ll
+    python compile_step.py msl_metal         INPUT.ttir  OUTPUT.metal
+    python compile_step.py msl_metal_nosimd  INPUT.ttir  OUTPUT.metal
+    python compile_step.py air_metal         INPUT.ttir  OUTPUT.ll
     python compile_step.py hlsl       INPUT.ttir  OUTPUT.hlsl
 
 Metallib compilation is handled directly by xcrun in build.ninja:
@@ -34,19 +34,19 @@ def write_if_changed(path: Path, content: str) -> bool:
 def main():
     cmd, inp, out = sys.argv[1], sys.argv[2], sys.argv[3]
 
-    if cmd == "msl_apple":
+    if cmd == "msl_metal":
         from backend.codegen import ttir_to_msl_with_metadata
         msl, _, _, _ = ttir_to_msl_with_metadata(
             Path(inp).read_text(), block_size=256, use_simdgroup=True)
         write_if_changed(Path(out), msl)
 
-    elif cmd == "msl_intel":
+    elif cmd == "msl_metal_nosimd":
         from backend.codegen import ttir_to_msl_with_metadata
         msl, _, _, _ = ttir_to_msl_with_metadata(
             Path(inp).read_text(), block_size=256, use_simdgroup=False)
         write_if_changed(Path(out), msl)
 
-    elif cmd == "air_apple":
+    elif cmd == "air_metal":
         from backend.codegen.air_emitter import ttgir_to_air
         ir_text, kname, tg_mem, bs = ttgir_to_air(Path(inp).read_text(), block_size=256)
         write_if_changed(Path(out), ir_text)

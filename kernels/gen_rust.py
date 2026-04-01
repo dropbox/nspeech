@@ -67,7 +67,7 @@ def gen_metal(metadata, metal_kernels):
 
     # include_bytes! paths are relative to the file containing the macro,
     # which is kernels/out/generated/triton_metal_gen.rs.
-    # So ../apple/ means kernels/out/apple/.
+    # So ../metal/ means kernels/out/metal/.
 
     # ── kernel_data module (aarch64) ──
     lines.append("#[cfg(target_arch = \"aarch64\")]")
@@ -79,7 +79,7 @@ def gen_metal(metadata, metal_kernels):
         if meta.get("air"):
             path = f"../air/{name}.metallib"
         else:
-            path = f"../apple/{name}.metallib"
+            path = f"../metal/{name}.metallib"
         lines.append(f'            "{name}" => Some(include_bytes!("{path}")),')
     lines.append("            _ => None,")
     lines.append("        }")
@@ -93,7 +93,7 @@ def gen_metal(metadata, metal_kernels):
     lines.append("    pub fn load_kernel(name: &str) -> Option<&'static [u8]> {")
     lines.append("        match name {")
     for name in metal_names:
-        path = f"../intel/{name}.metallib"
+        path = f"../metal_nosimd/{name}.metallib"
         lines.append(f'            "{name}" => Some(include_bytes!("{path}")),')
     lines.append("            _ => None,")
     lines.append("        }")

@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Build all Moonshine Triton kernels.
+"""Build Moonshine Triton kernels.
 
-Generates TTIR from @triton.jit, writes build.ninja, runs ninja.
-Output: out/{apple,intel}/*.metallib, out/hlsl/*.hlsl
+Generates TTIR from @triton.jit, writes per-platform ninja files, runs ninja.
+Output: out/{metal,metal_nosimd}/*.metallib, out/hlsl/*.hlsl
 
-    python build.py
+    python build.py                    # all platforms
+    python build.py metal              # Apple Silicon metallibs only
+    python build.py metal_nosimd       # Intel Mac metallibs only
+    python build.py hlsl               # HLSL + DXIL only
+    python build.py metal hlsl         # multiple platforms
 """
 import json
 import os
@@ -89,58 +93,103 @@ def gen_ttir():
     print(f"TTIR: {ok}/{len(configs)} in {time.time()-t0:.1f}s\n")
 
 
-def gen_ninja():
-    """Write build.ninja for TTIR → MSL/metallib/HLSL."""
-    sys.path.insert(0, str(SCRIPT_DIR))
-    from kernel_configs import METAL_KERNELS, HLSL_EXTRA_KERNELS, get_hlsl_kernels, KERNEL_METADATA
-
-    ttir = OUT / "ttir"
-    apple = OUT / "apple"
-    intel = OUT / "intel"
-    hlsl = OUT / "hlsl"
-    for d in [apple, intel, hlsl]:
-        d.mkdir(parents=True, exist_ok=True)
-
-    # Compiler source files — ninja rebuilds when these change
+def _ninja_preamble():
+    """Common ninja preamble: python path and compile_step path."""
     codegen_dir = TRITON_METAL / "backend" / "codegen"
     compiler_deps = " ".join(str(p) for p in sorted(codegen_dir.glob("*.py")))
     implicit = f"| {compiler_deps} {COMPILE_STEP}"
+    return [
+        "# Auto-generated — do not edit",
+        f"python = {PYTHON}",
+        f"step = {COMPILE_STEP}",
+        "",
+    ], implicit
 
-    w = []
-    w.append("# Auto-generated — do not edit")
-    w.append(f"python = {PYTHON}")
-    w.append(f"step = {COMPILE_STEP}")
+
+def gen_ninja_metal():
+    """Write build_metal.ninja for TTIR → Apple Silicon metallib (simdgroup_matrix)."""
+    sys.path.insert(0, str(SCRIPT_DIR))
+    from kernel_configs import METAL_KERNELS
+
+    ttir = OUT / "ttir"
+    metal = OUT / "metal"
+    metal.mkdir(parents=True, exist_ok=True)
+
+    w, implicit = _ninja_preamble()
+    w.append("rule msl_metal\n  command = $python $step msl_metal $in $out\n  restat = 1\n  description = MSL(metal) $out")
+    w.append("rule metallib_metal\n  command = xcrun metal -std=metal3.1 -O3 -ffast-math -w -o $out $in\n  description = METALLIB(metal) $out")
     w.append("")
-    w.append("rule msl_apple\n  command = $python $step msl_apple $in $out\n  restat = 1\n  description = MSL(apple) $out")
-    w.append("rule msl_intel\n  command = $python $step msl_intel $in $out\n  restat = 1\n  description = MSL(intel) $out")
-    w.append("rule metallib_apple\n  command = xcrun metal -std=metal3.1 -O3 -ffast-math -w -o $out $in\n  description = METALLIB(apple) $out")
-    w.append("rule metallib_intel\n  command = xcrun metal -std=macos-metal2.4 -mmacosx-version-min=14.0 -O3 -ffast-math -w -o $out $in\n  description = METALLIB(intel) $out")
-    # AIR disabled for now — re-enable when emitter covers all ops
-    # w.append("rule air_emit\n  command = $python $step air_apple $in $out\n  restat = 1\n  description = AIR(emit) $out")
-    # w.append("rule air_asm\n  command = xcrun metal-as -o $out $in\n  description = AIR(asm) $out")
-    # w.append("rule air_link\n  command = xcrun metallib -o $out $in\n  description = AIR(link) $out")
-    w.append("rule hlsl\n  command = $python $step hlsl $in $out\n  restat = 1\n  description = HLSL $out")
 
-    w.append("")
-
-    apple_libs, intel_libs, hlsl_files = [], [], []
-
+    libs = []
     for cfg in METAL_KERNELS:
         name = cfg[0]
         t = ttir / f"{name}.ttir"
         if not t.exists():
             continue
-        am = apple / f"{name}.metal"
-        al = apple / f"{name}.metallib"
-        im = intel / f"{name}.metal"
-        il = intel / f"{name}.metallib"
-        w.append(f"build {am}: msl_apple {t} {implicit}")
-        w.append(f"build {al}: metallib_apple {am}")
-        w.append(f"build {im}: msl_intel {t} {implicit}")
-        w.append(f"build {il}: metallib_intel {im}")
-        apple_libs.append(str(al))
-        intel_libs.append(str(il))
+        am = metal / f"{name}.metal"
+        al = metal / f"{name}.metallib"
+        w.append(f"build {am}: msl_metal {t} {implicit}")
+        w.append(f"build {al}: metallib_metal {am}")
+        libs.append(str(al))
 
+    w.append("")
+    w.append(f"build metal: phony {' '.join(libs)}")
+    w.append(f"default metal")
+    w.append("")
+
+    write_if_changed(OUT / "build_metal.ninja", "\n".join(w))
+    print(f"build_metal.ninja: {len(libs)} metallibs")
+
+
+def gen_ninja_metal_nosimd():
+    """Write build_metal_nosimd.ninja for TTIR → Metal metallib (no simdgroup_matrix)."""
+    sys.path.insert(0, str(SCRIPT_DIR))
+    from kernel_configs import METAL_KERNELS
+
+    ttir = OUT / "ttir"
+    metal_nosimd = OUT / "metal_nosimd"
+    metal_nosimd.mkdir(parents=True, exist_ok=True)
+
+    w, implicit = _ninja_preamble()
+    w.append("rule msl_metal_nosimd\n  command = $python $step msl_metal_nosimd $in $out\n  restat = 1\n  description = MSL(metal_nosimd) $out")
+    w.append("rule metallib_metal_nosimd\n  command = xcrun metal -std=macos-metal2.4 -mmacosx-version-min=14.0 -O3 -ffast-math -w -o $out $in\n  description = METALLIB(metal_nosimd) $out")
+    w.append("")
+
+    libs = []
+    for cfg in METAL_KERNELS:
+        name = cfg[0]
+        t = ttir / f"{name}.ttir"
+        if not t.exists():
+            continue
+        im = metal_nosimd / f"{name}.metal"
+        il = metal_nosimd / f"{name}.metallib"
+        w.append(f"build {im}: msl_metal_nosimd {t} {implicit}")
+        w.append(f"build {il}: metallib_metal_nosimd {im}")
+        libs.append(str(il))
+
+    w.append("")
+    w.append(f"build metal_nosimd: phony {' '.join(libs)}")
+    w.append(f"default metal_nosimd")
+    w.append("")
+
+    write_if_changed(OUT / "build_metal_nosimd.ninja", "\n".join(w))
+    print(f"build_metal_nosimd.ninja: {len(libs)} metallibs")
+
+
+def gen_ninja_hlsl():
+    """Write build_hlsl.ninja for TTIR → HLSL."""
+    sys.path.insert(0, str(SCRIPT_DIR))
+    from kernel_configs import get_hlsl_kernels
+
+    ttir = OUT / "ttir"
+    hlsl = OUT / "hlsl"
+    hlsl.mkdir(parents=True, exist_ok=True)
+
+    w, implicit = _ninja_preamble()
+    w.append("rule hlsl\n  command = $python $step hlsl $in $out\n  restat = 1\n  description = HLSL $out")
+    w.append("")
+
+    hlsl_files = []
     hlsl_seen = set()
     for cfg in get_hlsl_kernels():
         name = cfg[0]
@@ -155,33 +204,35 @@ def gen_ninja():
         hlsl_files.append(str(h))
 
     w.append("")
-    w.append(f"build apple: phony {' '.join(apple_libs)}")
-    w.append(f"build intel: phony {' '.join(intel_libs)}")
     w.append(f"build hlsl_all: phony {' '.join(hlsl_files)}")
-    # DXIL compilation happens after ninja, via compile_dxil()
-    w.append(f"default apple intel hlsl_all")
+    w.append(f"default hlsl_all")
     w.append("")
 
-    write_if_changed(OUT / "build.ninja", "\n".join(w))
-    print(f"build.ninja: {len(apple_libs)} apple, {len(intel_libs)} intel, {len(hlsl_files)} hlsl")
+    write_if_changed(OUT / "build_hlsl.ninja", "\n".join(w))
+    print(f"build_hlsl.ninja: {len(hlsl_files)} hlsl")
 
 
-def run_ninja():
+def run_ninja(platform):
+    """Run ninja for a specific platform."""
+    ninja_file = OUT / f"build_{platform}.ninja"
+    if not ninja_file.exists():
+        print(f"ninja: no {ninja_file.name}, skipping")
+        return True
     ninja = NINJA if Path(NINJA).exists() else "ninja"
     t0 = time.time()
-    r = subprocess.run([ninja, "-f", str(OUT / "build.ninja")])
+    r = subprocess.run([ninja, "-f", str(ninja_file)])
     dt = time.time() - t0
-    # Critical: all apple + intel metallibs must exist
-    from kernel_configs import METAL_KERNELS
-    ttir = OUT / "ttir"
-    missing = [c[0] for c in METAL_KERNELS
-               if (ttir / f"{c[0]}.ttir").exists()
-               and (not (OUT / "apple" / f"{c[0]}.metallib").exists()
-                    or not (OUT / "intel" / f"{c[0]}.metallib").exists())]
-    if missing:
-        print(f"ninja: {dt:.1f}s - FATAL: missing metallibs for {missing}")
-        return False
-    print(f"ninja: {dt:.1f}s (exit={r.returncode})")
+    if platform in ("metal", "metal_nosimd"):
+        from kernel_configs import METAL_KERNELS
+        ttir = OUT / "ttir"
+        subdir = OUT / platform
+        missing = [c[0] for c in METAL_KERNELS
+                   if (ttir / f"{c[0]}.ttir").exists()
+                   and not (subdir / f"{c[0]}.metallib").exists()]
+        if missing:
+            print(f"ninja({platform}): {dt:.1f}s - FATAL: missing metallibs for {missing}")
+            return False
+    print(f"ninja({platform}): {dt:.1f}s (exit={r.returncode})")
     return True
 
 
@@ -313,10 +364,21 @@ def gen_rust():
     gen_rust_main()
 
 
+VALID_PLATFORMS = ("metal", "metal_nosimd", "hlsl")
+
 if __name__ == "__main__":
+    platforms = sys.argv[1:] or list(VALID_PLATFORMS)
+    for p in platforms:
+        if p not in VALID_PLATFORMS:
+            print(f"Unknown platform: {p} (valid: {', '.join(VALID_PLATFORMS)})")
+            sys.exit(1)
+
     gen_ttir()
-    gen_ninja()
-    if not run_ninja():
-        sys.exit(1)
-    compile_dxil()
+    for p in platforms:
+        {"metal": gen_ninja_metal, "metal_nosimd": gen_ninja_metal_nosimd, "hlsl": gen_ninja_hlsl}[p]()
+    for p in platforms:
+        if not run_ninja(p):
+            sys.exit(1)
+    if "hlsl" in platforms:
+        compile_dxil()
     gen_rust()
