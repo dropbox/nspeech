@@ -87,44 +87,10 @@ def matmul_f16a_f32w(
     tl.store(c_ptrs, acc.to(tl.float16), mask=mask)
 
 
-@triton.jit
-def matmul_bias_f16a_f32w(
-    a_ptr, b_ptr, bias_ptr, c_ptr,
-    M, N, K,
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-):
-    """C[M,N] = A_f16[M,K] @ B_f32[K,N] + bias_f32[N], f32 acc, f16 output."""
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-
-    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
-
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in range(0, K, BLOCK_K):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] + k < K, other=0.0).to(tl.float32)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] + k < K, other=0.0)
-        acc += tl.dot(a, b)
-        a_ptrs += BLOCK_K * stride_ak
-        b_ptrs += BLOCK_K * stride_bk
-
-    # Add bias
-    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
-    acc += bias[None, :]
-
-    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(c_ptrs, acc.to(tl.float16), mask=mask)
-
-
-# ─── Matmul + bias — for FFN fc1, fc2 ────────────────────────────────────────
+# ─── Matmul + bias + optional activation ─────────────────────────────────────
+# ACTIVATION is a tl.constexpr: 0=none, 1=GELU, 2=SiLU.
+# Dead branches are eliminated at compile time, so each specialization
+# produces identical code to a hand-written single-activation kernel.
 
 @triton.jit
 def matmul_bias_fp16(
@@ -134,8 +100,9 @@ def matmul_bias_fp16(
     stride_bk, stride_bn,
     stride_cm, stride_cn,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    ACTIVATION: tl.constexpr = 0,
 ):
-    """C[M,N] = A[M,K] @ B[K,N] + bias[N], all fp16."""
+    """C[M,N] = act(A[M,K] @ B[K,N] + bias[N]), all fp16."""
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
@@ -154,52 +121,15 @@ def matmul_bias_fp16(
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
 
-    # Add bias
-    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
-    acc += bias[None, :].to(tl.float32)
-
-    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(c_ptrs, acc.to(tl.float16), mask=mask)
-
-
-# ─── Matmul + bias + GELU — fused FFN fc1 ────────────────────────────────────
-
-@triton.jit
-def matmul_bias_gelu_fp16(
-    a_ptr, b_ptr, bias_ptr, c_ptr,
-    M, N, K,
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-):
-    """C[M,N] = GELU(A[M,K] @ B[K,N] + bias[N]), all fp16.
-    Fuses matmul + bias + GELU to avoid writing intermediate to memory.
-    """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-
-    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
-
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in range(0, K, BLOCK_K):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] + k < K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] + k < K, other=0.0)
-        acc += tl.dot(a, b)
-        a_ptrs += BLOCK_K * stride_ak
-        b_ptrs += BLOCK_K * stride_bk
-
-    # Add bias + GELU in fp32
     bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
     x = acc + bias[None, :].to(tl.float32)
-    # GELU(x) = x * 0.5 * (1 + erf(x / sqrt(2)))
-    c = x * (0.5 * (1.0 + tl.math.erf(x * 0.7071067811865476)))
+
+    if ACTIVATION == 1:  # GELU
+        c = x * (0.5 * (1.0 + tl.math.erf(x * 0.7071067811865476)))
+    elif ACTIVATION == 2:  # SiLU
+        c = x / (1.0 + tl.exp(-x))
+    else:
+        c = x
 
     c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
@@ -207,58 +137,16 @@ def matmul_bias_gelu_fp16(
 
 
 @triton.jit
-def matmul_bias_silu_fp16(
+def matmul_bias_f16a_f32w(
     a_ptr, b_ptr, bias_ptr, c_ptr,
     M, N, K,
     stride_am, stride_ak,
     stride_bk, stride_bn,
     stride_cm, stride_cn,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    ACTIVATION: tl.constexpr = 0,
 ):
-    """C[M,N] = SiLU(A[M,K] @ B[K,N] + bias[N]), all fp16.
-    Fuses matmul + bias + SiLU to avoid writing intermediate to memory.
-    """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-
-    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
-
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in range(0, K, BLOCK_K):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] + k < K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] + k < K, other=0.0)
-        acc += tl.dot(a, b)
-        a_ptrs += BLOCK_K * stride_ak
-        b_ptrs += BLOCK_K * stride_bk
-
-    # Add bias + SiLU in fp32
-    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
-    x = acc + bias[None, :].to(tl.float32)
-    # SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
-    c = x / (1.0 + tl.exp(-x))
-
-    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(c_ptrs, c.to(tl.float16), mask=mask)
-
-
-@triton.jit
-def matmul_bias_gelu_f16a_f32w(
-    a_ptr, b_ptr, bias_ptr, c_ptr,
-    M, N, K,
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-):
-    """C_f16[M,N] = GELU(A_f16[M,K] @ B_f32[K,N] + bias_f32[N]).
-    Fuses matmul + bias + GELU, mixed precision (f16 activations, f32 weights).
-    """
+    """C_f16[M,N] = act(A_f16[M,K] @ B_f32[K,N] + bias_f32[N])."""
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
@@ -277,50 +165,15 @@ def matmul_bias_gelu_f16a_f32w(
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
 
-    # Add bias + GELU in fp32
     bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
     x = acc + bias[None, :]
-    c = x * (0.5 * (1.0 + tl.math.erf(x * 0.7071067811865476)))
 
-    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(c_ptrs, c.to(tl.float16), mask=mask)
-
-
-@triton.jit
-def matmul_bias_silu_f16a_f32w(
-    a_ptr, b_ptr, bias_ptr, c_ptr,
-    M, N, K,
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-):
-    """C_f16[M,N] = SiLU(A_f16[M,K] @ B_f32[K,N] + bias_f32[N]).
-    Fuses matmul + bias + SiLU, mixed precision (f16 activations, f32 weights).
-    """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-
-    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
-
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in range(0, K, BLOCK_K):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] + k < K, other=0.0).to(tl.float32)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] + k < K, other=0.0)
-        acc += tl.dot(a, b)
-        a_ptrs += BLOCK_K * stride_ak
-        b_ptrs += BLOCK_K * stride_bk
-
-    # Add bias + SiLU in fp32
-    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
-    x = acc + bias[None, :]
-    c = x / (1.0 + tl.exp(-x))
+    if ACTIVATION == 1:  # GELU
+        c = x * (0.5 * (1.0 + tl.math.erf(x * 0.7071067811865476)))
+    elif ACTIVATION == 2:  # SiLU
+        c = x / (1.0 + tl.exp(-x))
+    else:
+        c = x
 
     c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
