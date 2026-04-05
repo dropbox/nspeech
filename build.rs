@@ -104,9 +104,14 @@ fn main() {
         }
     }
 
-    // Find python
-    let python = triton_dir.join("env/bin/python");
-    let python = if python.exists() { python } else { PathBuf::from("python3") };
+    // Find python — venv uses Scripts/ on Windows, bin/ elsewhere.
+    // Use host OS (not target), since build.py runs on the build machine.
+    let venv_python = if cfg!(windows) {
+        triton_dir.join("env/Scripts/python.exe")
+    } else {
+        triton_dir.join("env/bin/python")
+    };
+    let python = if venv_python.exists() { venv_python } else { PathBuf::from("python3") };
 
     let platform_str = platforms.join(", ");
     println!("cargo:warning=Compiling Triton kernels for [{platform_str}] (sources changed)...");

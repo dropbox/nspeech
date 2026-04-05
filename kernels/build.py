@@ -38,8 +38,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 OUT = SCRIPT_DIR / "out"
 TRITON = SCRIPT_DIR.parent.parent / "triton"
 TRITON_METAL = TRITON / "third_party" / "metal"
-PYTHON = str(TRITON / "env" / "bin" / "python")
-NINJA = str(TRITON / "env" / "bin" / "ninja")
+_VENV = TRITON / "env"
+_BIN = _VENV / "Scripts" if sys.platform == "win32" else _VENV / "bin"
+PYTHON = str(_BIN / "python")
+NINJA = str(_BIN / "ninja")
 COMPILE_STEP = str(SCRIPT_DIR / "compile_step.py")
 
 
