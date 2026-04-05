@@ -224,8 +224,6 @@ fn dispatch_rope_qk_cache_fused(k: &D3D12Kernels, q: &GpuBuffer, kk: &GpuBuffer,
                                   n_q_heads: usize, n_kv_heads: usize, head_dim: usize,
                                   half_rot: usize, pos: usize, max_kv_len: usize) -> Result<()> {
     let rc: Vec<u32> = vec![
-        i32_as_u32(n_q_heads as i32), i32_as_u32(n_kv_heads as i32),
-        i32_as_u32(head_dim as i32), i32_as_u32(half_rot as i32),
         i32_as_u32(pos as i32), i32_as_u32(max_kv_len as i32), 1, 1, 1,
     ];
     let kv_cache_total = (n_kv_heads * max_kv_len * head_dim) as u32;

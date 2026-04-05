@@ -143,7 +143,6 @@ impl DecoderBackend for MetalBackend {
         let enc = self.enc();
         enc_rope_qk_cache_fused(&enc, &self.kernels.rope_qk_cache_fused,
             q, k, rope, cache_k,
-            p.n_q_heads, p.n_kv_heads, p.head_dim, p.half_rot,
             p.pos, p.max_kv_len);
         enc_kv_cache_append(&enc, &self.kernels.kv_cache_append,
             v, cache_v,

@@ -621,35 +621,6 @@ pub fn triton_attention_decode(
     })
 }
 
-/// Fused RoPE(Q) + RoPE(K) + K cache copy
-pub fn triton_rope_qk_cache_fused(
-    device: &MetalDevice,
-    pipeline: &ComputePipeline,
-    q: &Tensor, k: &Tensor, rope_table: &Tensor, cache_k: &Tensor,
-    n_q_heads: usize, n_kv_heads: usize, head_dim: usize,
-    half_rot: usize, pos: usize, max_kv_len: usize,
-) -> Result<()> {
-    with_metal_buffers!(q, k, rope_table, cache_k, |q_buf, q_off, k_buf, k_off, r_buf, r_off, c_buf, c_off| {
-        let encoder = device.command_encoder()?;
-        encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(q_buf), q_off);
-        encoder.set_buffer(1, Some(k_buf), k_off);
-        encoder.set_buffer(2, Some(r_buf), r_off);
-        encoder.set_buffer(3, Some(c_buf), c_off);
-        encoder.set_bytes(4, &(n_q_heads as i32));
-        encoder.set_bytes(5, &(n_kv_heads as i32));
-        encoder.set_bytes(6, &(head_dim as i32));
-        encoder.set_bytes(7, &(half_rot as i32));
-        encoder.set_bytes(8, &(pos as i32));
-        encoder.set_bytes(9, &(max_kv_len as i32));
-        encoder.dispatch_thread_groups(
-            MTLSize { width: 1, height: 1, depth: 1 },
-            tg_size(pipeline, 512),
-        );
-        Ok::<(), anyhow::Error>(())
-    })
-}
-
 /// KV cache append
 pub fn triton_kv_cache_append(
     device: &MetalDevice,
@@ -949,20 +920,15 @@ pub fn enc_attention_splitkv(
 pub fn enc_rope_qk_cache_fused(
     enc: &ComputeCommandEncoder, pipeline: &ComputePipeline,
     q: &GpuBuffer, k: &GpuBuffer, rope_table: &GpuBuffer, cache_k: &GpuBuffer,
-    n_q_heads: usize, n_kv_heads: usize, head_dim: usize,
-    half_rot: usize, pos: usize, max_kv_len: usize,
+    pos: usize, max_kv_len: usize,
 ) {
     enc.set_compute_pipeline_state(pipeline);
     enc.set_buffer(0, Some(q.buf()), q.offset);
     enc.set_buffer(1, Some(k.buf()), k.offset);
     enc.set_buffer(2, Some(rope_table.buf()), rope_table.offset);
     enc.set_buffer(3, Some(cache_k.buf()), cache_k.offset);
-    enc.set_bytes(4, &(n_q_heads as i32));
-    enc.set_bytes(5, &(n_kv_heads as i32));
-    enc.set_bytes(6, &(head_dim as i32));
-    enc.set_bytes(7, &(half_rot as i32));
-    enc.set_bytes(8, &(pos as i32));
-    enc.set_bytes(9, &(max_kv_len as i32));
+    enc.set_bytes(4, &(pos as i32));
+    enc.set_bytes(5, &(max_kv_len as i32));
     enc.dispatch_thread_groups(
         MTLSize { width: 1, height: 1, depth: 1 },
         tg_size(pipeline, 512),

@@ -1252,7 +1252,8 @@ def gemv_qkv_fused(
 @triton.jit
 def rope_qk_cache_fused(
     q_ptr, k_ptr, rope_table_ptr, cache_k_ptr,
-    n_q_heads, n_kv_heads, head_dim, half_rot,
+    N_Q_HEADS: tl.constexpr, N_KV_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr, HALF_ROT: tl.constexpr,
     pos, max_kv_len,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -1266,19 +1267,19 @@ def rope_qk_cache_fused(
     tid = tl.arange(0, BLOCK_SIZE)
 
     # Table base for this position
-    table_base = pos * half_rot * 2
-    rotary_dim = half_rot * 2
+    table_base = pos * HALF_ROT * 2
+    rotary_dim = HALF_ROT * 2
 
     # Phase 1: RoPE on Q
-    q_pairs = n_q_heads * half_rot
+    q_pairs = N_Q_HEADS * HALF_ROT
     q_mask = tid < q_pairs
-    q_pair_idx = tid % half_rot
-    q_head_idx = tid // half_rot
+    q_pair_idx = tid % HALF_ROT
+    q_head_idx = tid // HALF_ROT
 
     cos_val = tl.load(rope_table_ptr + table_base + q_pair_idx, mask=q_mask, other=1.0).to(tl.float32)
-    sin_val = tl.load(rope_table_ptr + table_base + half_rot + q_pair_idx, mask=q_mask, other=0.0).to(tl.float32)
+    sin_val = tl.load(rope_table_ptr + table_base + HALF_ROT + q_pair_idx, mask=q_mask, other=0.0).to(tl.float32)
 
-    q_base = q_head_idx * head_dim + q_pair_idx * 2
+    q_base = q_head_idx * HEAD_DIM + q_pair_idx * 2
     q0 = tl.load(q_ptr + q_base, mask=q_mask, other=0.0).to(tl.float32)
     q1 = tl.load(q_ptr + q_base + 1, mask=q_mask, other=0.0).to(tl.float32)
 
@@ -1286,15 +1287,15 @@ def rope_qk_cache_fused(
     tl.store(q_ptr + q_base + 1, (q1 * cos_val + q0 * sin_val).to(tl.float16), mask=q_mask)
 
     # Phase 2: RoPE on K + direct cache copy (fused per-thread, no barrier needed)
-    k_pairs = n_kv_heads * half_rot
+    k_pairs = N_KV_HEADS * HALF_ROT
     k_mask = tid < k_pairs
-    k_pair_idx = tid % half_rot
-    k_head_idx = tid // half_rot
+    k_pair_idx = tid % HALF_ROT
+    k_head_idx = tid // HALF_ROT
 
     cos_k = tl.load(rope_table_ptr + table_base + k_pair_idx, mask=k_mask, other=1.0).to(tl.float32)
-    sin_k = tl.load(rope_table_ptr + table_base + half_rot + k_pair_idx, mask=k_mask, other=0.0).to(tl.float32)
+    sin_k = tl.load(rope_table_ptr + table_base + HALF_ROT + k_pair_idx, mask=k_mask, other=0.0).to(tl.float32)
 
-    k_base = k_head_idx * head_dim + k_pair_idx * 2
+    k_base = k_head_idx * HEAD_DIM + k_pair_idx * 2
     k0 = tl.load(k_ptr + k_base, mask=k_mask, other=0.0).to(tl.float32)
     k1 = tl.load(k_ptr + k_base + 1, mask=k_mask, other=0.0).to(tl.float32)
 
@@ -1305,20 +1306,20 @@ def rope_qk_cache_fused(
     tl.store(k_ptr + k_base + 1, k1_rot, mask=k_mask)
 
     # Copy rotated K to cache (same thread wrote it, no cross-thread dependency)
-    cache_k_base = k_head_idx * max_kv_len * head_dim + pos * head_dim + k_pair_idx * 2
+    cache_k_base = k_head_idx * max_kv_len * HEAD_DIM + pos * HEAD_DIM + k_pair_idx * 2
     tl.store(cache_k_ptr + cache_k_base, k0_rot, mask=k_mask)
     tl.store(cache_k_ptr + cache_k_base + 1, k1_rot, mask=k_mask)
 
     # Phase 3: Copy pass-through K elements to cache (elements rotary_dim..head_dim)
-    pass_per_head = head_dim - rotary_dim
-    k_pass_total = n_kv_heads * pass_per_head
+    pass_per_head = HEAD_DIM - rotary_dim
+    k_pass_total = N_KV_HEADS * pass_per_head
     k_pass_mask = tid < k_pass_total
     k_pass_head = tid // pass_per_head
     k_pass_offset = tid % pass_per_head
 
-    k_src = k_pass_head * head_dim + rotary_dim + k_pass_offset
+    k_src = k_pass_head * HEAD_DIM + rotary_dim + k_pass_offset
     k_val = tl.load(k_ptr + k_src, mask=k_pass_mask, other=0.0)
-    cache_dst = k_pass_head * max_kv_len * head_dim + pos * head_dim + rotary_dim + k_pass_offset
+    cache_dst = k_pass_head * max_kv_len * HEAD_DIM + pos * HEAD_DIM + rotary_dim + k_pass_offset
     tl.store(cache_k_ptr + cache_dst, k_val, mask=k_pass_mask)
 
 

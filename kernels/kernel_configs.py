@@ -100,7 +100,7 @@ METAL_KERNELS = [
 
     # ── Decoder: RoPE + cache ──
     ("rope_qk_cache_fused", "rope_qk_cache_fused",
-     "*fp16, *fp16, *fp32, *fp16, i32, i32, i32, i32, i32, i32, 512",
+     "*fp16, *fp16, *fp32, *fp16, 10, 10, 64, 16, i32, i32, 512",
      4, ["1", "1", "1"]),
     ("kv_cache_append", "kv_cache_append",
      "*fp16, *fp16, i32, i32, i32, i32, 256",
