@@ -920,17 +920,17 @@ def gemv_bias_glu_fused(
 def gemv_splitk_partial(
     x_ptr, w_ptr, partial_ptr,
     N, K, stride_wk,
-    n_n_blocks, k_per_split, stride_partial,
-    BLOCK_N: tl.constexpr,
+    k_per_split, stride_partial,
+    BLOCK_N: tl.constexpr, N_N_BLOCKS: tl.constexpr,
 ):
     """K-split partial GEMV with f16 partials.
-    Grid: (n_n_blocks * n_splits, 1, 1).
+    Grid: (N_N_BLOCKS * n_splits, 1, 1).
     partial_ptr: f16[n_splits, N], stride_partial = N.
     Accumulates in f32, stores as f16.
     """
     pid = tl.program_id(0)
-    pid_n = pid % n_n_blocks
-    pid_k = pid // n_n_blocks
+    pid_n = pid % N_N_BLOCKS
+    pid_k = pid // N_N_BLOCKS
     col = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     k_start = pid_k * k_per_split
 
@@ -1031,17 +1031,17 @@ def gemv_qkv_splitk_partial(
     x_ptr, wq_ptr, wk_ptr, wv_ptr,
     partial_ptr,
     N, K, stride_wk,
-    n_n_blocks, k_per_split, stride_partial,
-    BLOCK_N: tl.constexpr,
+    k_per_split, stride_partial,
+    BLOCK_N: tl.constexpr, N_N_BLOCKS: tl.constexpr,
 ):
     """Fused Q/K/V split-K partial GEMV. Single dispatch for all 3 projections.
-    Grid: (n_n_blocks * n_splits, 3, 1). program_id(1) selects Q/K/V.
+    Grid: (N_N_BLOCKS * n_splits, 3, 1). program_id(1) selects Q/K/V.
     partial_ptr: f16[3, n_splits, N]. stride_partial = N.
     """
     pid = tl.program_id(0)
     proj = tl.program_id(1)   # 0=Q, 1=K, 2=V
-    pid_n = pid % n_n_blocks
-    pid_k = pid // n_n_blocks
+    pid_n = pid % N_N_BLOCKS
+    pid_k = pid // N_N_BLOCKS
     col = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     k_start = pid_k * k_per_split
 
@@ -1098,15 +1098,15 @@ def gemv_qkv_splitk_reduce(
 def gemv_glu_splitk_partial(
     x_ptr, w_ptr, partial_ptr,
     N, K, stride_wk,
-    n_n_blocks, k_per_split, stride_partial,
-    BLOCK_N: tl.constexpr,
+    k_per_split, stride_partial,
+    BLOCK_N: tl.constexpr, N_N_BLOCKS: tl.constexpr,
 ):
     """K-split partial GEMV for GLU with f16 partials.
     partial_ptr: f16[n_splits, 2*N]. stride_partial = 2*N.
     """
     pid = tl.program_id(0)
-    pid_n = pid % n_n_blocks
-    pid_k = pid // n_n_blocks
+    pid_n = pid % N_N_BLOCKS
+    pid_k = pid // N_N_BLOCKS
     col = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     col_gate = col + N
     k_start = pid_k * k_per_split

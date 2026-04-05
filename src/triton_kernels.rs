@@ -1023,7 +1023,7 @@ pub fn enc_gemv_splitk_bias(
     let stride_wk = n;
     let stride_partial = n;
 
-    // Phase 1: partial GEMV
+    // Phase 1: partial GEMV (n_n_blocks baked into kernel as constexpr)
     enc.set_compute_pipeline_state(partial_pipeline);
     enc.set_buffer(0, Some(x.buf()), x.offset);
     enc.set_buffer(1, Some(w.buf()), w.offset);
@@ -1031,9 +1031,8 @@ pub fn enc_gemv_splitk_bias(
     enc.set_bytes(3, &(n as i32));
     enc.set_bytes(4, &(k as i32));
     enc.set_bytes(5, &(stride_wk as i32));
-    enc.set_bytes(6, &(n_n_blocks as i32));
-    enc.set_bytes(7, &(k_per_split as i32));
-    enc.set_bytes(8, &(stride_partial as i32));
+    enc.set_bytes(6, &(k_per_split as i32));
+    enc.set_bytes(7, &(stride_partial as i32));
     enc.dispatch_thread_groups(
         MTLSize { width: n_n_blocks * n_splits, height: 1, depth: 1 },
         tg_size(partial_pipeline, 128),
@@ -1063,7 +1062,7 @@ pub fn enc_gemv_splitk(
     let stride_wk = n;
     let stride_partial = n;
 
-    // Phase 1: partial GEMV
+    // Phase 1: partial GEMV (n_n_blocks baked into kernel as constexpr)
     enc.set_compute_pipeline_state(partial_pipeline);
     enc.set_buffer(0, Some(x.buf()), x.offset);
     enc.set_buffer(1, Some(w.buf()), w.offset);
@@ -1071,9 +1070,8 @@ pub fn enc_gemv_splitk(
     enc.set_bytes(3, &(n as i32));
     enc.set_bytes(4, &(k as i32));
     enc.set_bytes(5, &(stride_wk as i32));
-    enc.set_bytes(6, &(n_n_blocks as i32));
-    enc.set_bytes(7, &(k_per_split as i32));
-    enc.set_bytes(8, &(stride_partial as i32));
+    enc.set_bytes(6, &(k_per_split as i32));
+    enc.set_bytes(7, &(stride_partial as i32));
     enc.dispatch_thread_groups(
         MTLSize { width: n_n_blocks * n_splits, height: 1, depth: 1 },
         tg_size(partial_pipeline, 128),
@@ -1104,7 +1102,7 @@ pub fn enc_gemv_qkv_splitk(
     let stride_wk = n;
     let stride_partial = n;
 
-    // Phase 1: fused QKV partial (grid: n_n_blocks*n_splits × 3)
+    // Phase 1: fused QKV partial (n_n_blocks baked into kernel as constexpr)
     enc.set_compute_pipeline_state(partial_pipeline);
     enc.set_buffer(0, Some(x.buf()), x.offset);
     enc.set_buffer(1, Some(wq.buf()), wq.offset);
@@ -1114,9 +1112,8 @@ pub fn enc_gemv_qkv_splitk(
     enc.set_bytes(5, &(n as i32));
     enc.set_bytes(6, &(k as i32));
     enc.set_bytes(7, &(stride_wk as i32));
-    enc.set_bytes(8, &(n_n_blocks as i32));
-    enc.set_bytes(9, &(k_per_split as i32));
-    enc.set_bytes(10, &(stride_partial as i32));
+    enc.set_bytes(8, &(k_per_split as i32));
+    enc.set_bytes(9, &(stride_partial as i32));
     enc.dispatch_thread_groups(
         MTLSize { width: n_n_blocks * n_splits, height: 3, depth: 1 },
         tg_size(partial_pipeline, 128),
@@ -1147,7 +1144,7 @@ pub fn enc_gemv_glu_splitk(
     let stride_wk = n_intermediate * 2;
     let stride_partial = n_intermediate * 2;
 
-    // Phase 1: partial GEMV (x-half + gate-half)
+    // Phase 1: partial GEMV (n_n_blocks baked into kernel as constexpr)
     enc.set_compute_pipeline_state(partial_pipeline);
     enc.set_buffer(0, Some(x.buf()), x.offset);
     enc.set_buffer(1, Some(w.buf()), w.offset);
@@ -1155,9 +1152,8 @@ pub fn enc_gemv_glu_splitk(
     enc.set_bytes(3, &(n_intermediate as i32));
     enc.set_bytes(4, &(k as i32));
     enc.set_bytes(5, &(stride_wk as i32));
-    enc.set_bytes(6, &(n_n_blocks as i32));
-    enc.set_bytes(7, &(k_per_split as i32));
-    enc.set_bytes(8, &(stride_partial as i32));
+    enc.set_bytes(6, &(k_per_split as i32));
+    enc.set_bytes(7, &(stride_partial as i32));
     enc.dispatch_thread_groups(
         MTLSize { width: n_n_blocks * n_splits, height: 1, depth: 1 },
         tg_size(partial_pipeline, 128),
