@@ -279,7 +279,16 @@ def compile_dxil():
     if not kernels:
         return
 
-    # Try Windows DXC via SSH (produces optimal code for Intel GPUs)
+    # On Windows, use the local Windows SDK DXC directly
+    if sys.platform == "win32":
+        dxc_win = Path(r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\dxc.exe")
+        if dxc_win.exists():
+            _compile_dxil_local(kernels, hlsl_dir, dxil_dir, dxc_win)
+            return
+        print("DXIL: Windows SDK DXC not found, skipping")
+        return
+
+    # From Mac: try Windows DXC via SSH (produces optimal code for Intel GPUs)
     if _compile_dxil_remote(kernels, hlsl_dir, dxil_dir):
         return
 
@@ -353,9 +362,10 @@ def _compile_dxil_remote(kernels, hlsl_dir, dxil_dir):
 
 
 def _compile_dxil_local(kernels, hlsl_dir, dxil_dir, dxc_bin):
-    """Compile DXIL with local Mac DXC (fallback)."""
-    dxc_lib = SCRIPT_DIR / "dxc"
-    env = {**os.environ, "DYLD_LIBRARY_PATH": str(dxc_lib)}
+    """Compile DXIL with local DXC."""
+    env = os.environ.copy()
+    if sys.platform == "darwin":
+        env["DYLD_LIBRARY_PATH"] = str(SCRIPT_DIR / "dxc")
     ok = 0
     for name, entry in sorted(kernels.items()):
         hlsl_path = hlsl_dir / f"{name}.hlsl"
@@ -367,7 +377,7 @@ def _compile_dxil_local(kernels, hlsl_dir, dxil_dir, dxc_bin):
         )
         if r.returncode == 0 and dxil_path.exists() and dxil_path.stat().st_size > 0:
             ok += 1
-    print(f"DXIL: {ok}/{len(kernels)} compiled locally (Mac DXC)")
+    print(f"DXIL: {ok}/{len(kernels)} compiled locally")
 
 
 def gen_rust():
