@@ -252,8 +252,6 @@ pub struct D3D12Backend {
     kernels: D3D12Kernels,
     logits_readback: GpuBuffer,
     embed_staging: GpuBuffer,
-    vocab_size: usize,
-    dim: usize,
 }
 
 impl D3D12Backend {
@@ -269,8 +267,6 @@ impl D3D12Backend {
             kernels,
             logits_readback,
             embed_staging,
-            vocab_size,
-            dim,
         })
     }
 

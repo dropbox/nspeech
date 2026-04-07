@@ -237,9 +237,9 @@ def gen_d3d12(metadata, metal_kernels, hlsl_extra):
     d3d12_encoder = [n for n in d3d12_kernels if metadata[n].get("group") == "encoder"]
     d3d12_decoder = [n for n in d3d12_kernels if metadata[n].get("group") == "decoder"]
 
-    # ── DXIL constants ──
+    # ── DXIL constants (encoder only; decoder has hand-written consts) ──
     # Paths relative to kernels/out/generated/triton_d3d12_gen.rs
-    for name in d3d12_kernels:
+    for name in d3d12_encoder:
         meta = metadata[name]
         alias = meta["alias"]
         const_name = f"DXIL_{alias.upper()}"
@@ -291,42 +291,8 @@ def gen_d3d12(metadata, metal_kernels, hlsl_extra):
     lines.append("}")
     lines.append("")
 
-    # ── D3D12DecoderKernels struct ──
-    lines.append("/// All compiled Triton D3D12 kernel pipelines for the decoder.")
-    lines.append("pub struct D3D12DecoderKernels {")
-    lines.append("    pub(crate) gpu: Arc<Gpu>,")
-    for name in d3d12_decoder:
-        meta = metadata[name]
-        alias = meta["alias"]
-        optional = meta.get("optional", False)
-        typ = "Option<ID3D12PipelineState>" if optional else "ID3D12PipelineState"
-        lines.append(f"    pub(crate) {alias}: {typ},")
-    lines.append("}")
-    lines.append("")
-
-    # ── D3D12DecoderKernels::load() ──
-    lines.append("impl D3D12DecoderKernels {")
-    lines.append("    pub fn load(gpu: &Arc<Gpu>) -> Result<Self> {")
-    lines.append("        let load_pso = |name: &str, dxil: &[u8]| -> Result<ID3D12PipelineState> {")
-    lines.append("            gpu.create_compute_pso(dxil)")
-    lines.append("                .map_err(|e| anyhow::anyhow!(\"Failed to create PSO for {name}: {e}\"))")
-    lines.append("        };")
-    lines.append("")
-    lines.append("        Ok(Self {")
-    lines.append("            gpu: gpu.clone(),")
-    for name in d3d12_decoder:
-        meta = metadata[name]
-        alias = meta["alias"]
-        optional = meta.get("optional", False)
-        const_name = f"DXIL_{alias.upper()}"
-        if optional:
-            lines.append(f'            {alias}: load_pso("{name}", {const_name}).ok(),')
-        else:
-            lines.append(f'            {alias}: load_pso("{name}", {const_name})?,')
-    lines.append("        })")
-    lines.append("    }")
-    lines.append("}")
-    lines.append("")
+    # Note: D3D12 decoder kernels are hand-written in gpu_decoder_d3d12.rs
+    # with their own include_bytes! consts and D3D12Kernels struct.
 
     return "\n".join(lines) + "\n"
 
