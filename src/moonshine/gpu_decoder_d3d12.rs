@@ -24,7 +24,6 @@ fn uav_f32<'a>(buf: &'a GpuBuffer, count: u32) -> BufferBinding<'a> {
 // ── Pre-compiled DXIL bytecode ──
 
 const DXIL_MATMUL_F32W_64: &[u8] = include_bytes!("../../kernels/out/dxil/matmul_f16a_f32w_64x64x32.dxil");
-const DXIL_MATMUL_F32W_32: &[u8] = include_bytes!("../../kernels/out/dxil/matmul_f16a_f32w_32x32x32.dxil");
 const DXIL_LAYERNORM_STD_F32IN: &[u8] = include_bytes!("../../kernels/out/dxil/layernorm_standard_f32in_640.dxil");
 const DXIL_GEMV_F16W: &[u8] = include_bytes!("../../kernels/out/dxil/gemv_f16w.dxil");
 const DXIL_GEMV_BIAS_F16W: &[u8] = include_bytes!("../../kernels/out/dxil/gemv_bias_f16w.dxil");
@@ -40,7 +39,6 @@ const DXIL_GEMV_RESADD_LN: &[u8] = include_bytes!("../../kernels/out/dxil/gemv_r
 struct D3D12Kernels {
     gpu: Arc<Gpu>,
     matmul_f32w_64: ID3D12PipelineState,
-    matmul_f32w_32: ID3D12PipelineState,
     gemv_f16w: ID3D12PipelineState,
     gemv_bias_f16w: ID3D12PipelineState,
     layernorm_std_f32in: ID3D12PipelineState,
@@ -61,7 +59,6 @@ impl D3D12Kernels {
         Ok(Self {
             gpu: gpu.clone(),
             matmul_f32w_64: load("matmul_f32w_64", DXIL_MATMUL_F32W_64)?,
-            matmul_f32w_32: load("matmul_f32w_32", DXIL_MATMUL_F32W_32)?,
             gemv_f16w: load("gemv_f16w", DXIL_GEMV_F16W)?,
             gemv_bias_f16w: load("gemv_bias_f16w", DXIL_GEMV_BIAS_F16W)?,
             layernorm_std_f32in: load("layernorm_std_f32in", DXIL_LAYERNORM_STD_F32IN)?,
@@ -124,11 +121,7 @@ fn dispatch_gemv_bias_f16w(k: &D3D12Kernels, x: &GpuBuffer, w: &GpuBuffer,
 
 fn dispatch_matmul_f32w(k: &D3D12Kernels, a: &GpuBuffer, b: &GpuBuffer, out: &GpuBuffer,
                          m: usize, n: usize, kk: usize) -> Result<()> {
-    let (pso, bm, bn) = if m <= 32 {
-        (&k.matmul_f32w_32, 32, 32)
-    } else {
-        (&k.matmul_f32w_64, 64, 64)
-    };
+    let (pso, bm, bn) = (&k.matmul_f32w_64, 64, 64);
     let grid_x = cdiv(m, bm) as u32;
     let grid_y = cdiv(n, bn) as u32;
     let rc: Vec<u32> = vec![

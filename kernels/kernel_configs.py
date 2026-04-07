@@ -236,6 +236,7 @@ KERNEL_METADATA = {
     },
     "layernorm_standard_f32in_640": {
         "alias": "layernorm_std_f32in", "group": "decoder", "tg_mem": 4096,
+        "d3d12": True,
     },
     "gelu_fp16": {
         "alias": "gelu", "group": "encoder", "d3d12": True,

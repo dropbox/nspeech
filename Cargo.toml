@@ -80,7 +80,7 @@ candle-core = { git = "https://github.com/huggingface/candle", branch = "main" }
 candle-nn = { git = "https://github.com/huggingface/candle", branch = "main" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-candle-core = { git = "https://github.com/huggingface/candle", branch = "main", features = ["d3d12"] }
+candle-core = { git = "https://github.com/huggingface/candle", branch = "main" }
 candle-nn = { git = "https://github.com/huggingface/candle", branch = "main" }
 
 # Override candle git deps with local worktree that has D3D12 backend
