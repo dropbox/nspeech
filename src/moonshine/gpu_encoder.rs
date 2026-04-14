@@ -23,17 +23,20 @@ fn cdiv(a: usize, b: usize) -> usize {
 /// All methods take `&self` — backends use interior mutability if needed.
 pub trait EncoderBackend: Sized {
     type Buf;
+    /// Weight type for matmul. Both Metal and D3D12 use f16 GpuBuffer.
+    type Weight;
 
     // ── Buffer management ──
     fn alloc_activation(&self, count: usize) -> Result<Self::Buf>;  // f16
     fn alloc_residual(&self, count: usize) -> Result<Self::Buf>;    // f16 on Metal, f32 on D3D12
 
     // ── Weight upload (CPU f32 → GPU) ──
-    /// Upload 2D matmul weight. Metal: f16, D3D12: f32 (preserves Q8 precision).
-    fn upload_matmul_weight(&self, data_f32: &[f32]) -> Result<Self::Buf>;
+    /// Upload 2D matmul weight [rows, cols] (already transposed to [K, N]).
+    /// Metal: converts to f16. D3D12: Q8-packs with per-column scales.
+    fn upload_matmul_weight(&self, data_f32: &[f32], rows: usize, cols: usize) -> Result<Self::Weight>;
     /// Upload 1D data as f16 (gamma).
     fn upload_f16_1d(&self, data_f32: &[f32]) -> Result<Self::Buf>;
-    /// Upload 1D bias data. Default: f16 (Metal). D3D12 overrides to f32.
+    /// Upload 1D bias data as f16.
     fn upload_bias_1d(&self, data_f32: &[f32]) -> Result<Self::Buf> {
         self.upload_f16_1d(data_f32)
     }
@@ -51,6 +54,11 @@ pub trait EncoderBackend: Sized {
     fn begin_pass(&self) -> Result<()> { Ok(()) }
     /// End GPU command pass and wait for completion.
     fn end_pass(&self) -> Result<()> { Ok(()) }
+    /// Insert a UAV barrier between dependent dispatches.
+    /// D3D12: record_uav_barrier. Metal: no-op (implicit).
+    fn barrier(&self) {}
+    /// Flush and re-open the command batch (D3D12: avoids TDR timeout).
+    fn flush(&self) -> Result<()> { Ok(()) }
 
     // ── Forward operations ──
     /// Bare layernorm: out_f16 = LN(hidden). No gamma scaling.
@@ -61,14 +69,14 @@ pub trait EncoderBackend: Sized {
     /// LayerNorm with unit-offset gamma: out_f16 = LN(hidden) * (1 + gamma).
     fn layernorm_unit_offset(&self, hidden: &Self::Buf, gamma: &Self::Buf,
                               out: &Self::Buf, n_rows: usize, n_cols: usize);
-    /// Matmul: out_f16 = a_f16 @ b_weight, where b_weight dtype is backend-specific.
-    fn matmul(&self, a: &Self::Buf, b: &Self::Buf, out: &Self::Buf,
+    /// Matmul: out_f16 = a_f16 @ b_weight, where b_weight type is backend-specific.
+    fn matmul(&self, a: &Self::Buf, b: &Self::Weight, out: &Self::Buf,
               m: usize, n: usize, k: usize);
-    /// Matmul + bias: out_f16 = a_f16 @ b_weight + bias_f16.
-    fn matmul_bias(&self, a: &Self::Buf, b: &Self::Buf, bias: &Self::Buf,
+    /// Matmul + bias: out_f16 = a_f16 @ b_weight + bias.
+    fn matmul_bias(&self, a: &Self::Buf, b: &Self::Weight, bias: &Self::Buf,
                     out: &Self::Buf, m: usize, n: usize, k: usize);
     /// Matmul + bias + GELU: out = GELU(a @ b + bias). Default: matmul_bias + gelu.
-    fn matmul_bias_gelu(&self, a: &Self::Buf, b: &Self::Buf, bias: &Self::Buf,
+    fn matmul_bias_gelu(&self, a: &Self::Buf, b: &Self::Weight, bias: &Self::Buf,
                          out: &Self::Buf, m: usize, n: usize, k: usize) {
         self.matmul_bias(a, b, bias, out, m, n, k);
         self.gelu(out, out, m * n);
@@ -124,31 +132,31 @@ pub struct FlashAttentionParams {
 
 // ── Weight structs ──
 
-pub struct EncoderLinearBiasW<B> {
-    pub weight: B,
+pub struct EncoderLinearBiasW<W, B> {
+    pub weight: W,
     pub bias: B,
 }
 
-pub struct EncoderAttentionW<B> {
-    pub q_proj: B,  // baked: (1+gamma) * W
-    pub k_proj: B,
-    pub v_proj: B,
-    pub qkv_proj: Option<B>,  // fused [dim, 3*kv_dim] weight (if backend supports buf_slice)
-    pub o_proj: B,
+pub struct EncoderAttentionW<W> {
+    pub q_proj: W,  // baked: (1+gamma) * W
+    pub k_proj: W,
+    pub v_proj: W,
+    pub qkv_proj: Option<W>,  // fused [dim, 3*kv_dim] weight (if backend supports buf_slice)
+    pub o_proj: W,
     pub num_heads: usize,
     pub head_dim: usize,
     pub kv_dim: usize,
     pub scale: f32,
 }
 
-pub struct EncoderMlpW<B> {
-    pub fc1: EncoderLinearBiasW<B>,  // fc1 weight is baked with post-attn gamma
-    pub fc2: EncoderLinearBiasW<B>,
+pub struct EncoderMlpW<W, B> {
+    pub fc1: EncoderLinearBiasW<W, B>,  // fc1 weight is baked with post-attn gamma
+    pub fc2: EncoderLinearBiasW<W, B>,
 }
 
-pub struct EncoderLayerW<B> {
-    pub self_attn: EncoderAttentionW<B>,
-    pub mlp: EncoderMlpW<B>,
+pub struct EncoderLayerW<W, B> {
+    pub self_attn: EncoderAttentionW<W>,
+    pub mlp: EncoderMlpW<W, B>,
 }
 
 // ── Scratch buffers ──
@@ -200,7 +208,7 @@ fn bake_gamma(weight: &mut [f32], gamma: &[f32], in_dim: usize, out_dim: usize) 
 // ── Encoder data ──
 
 struct EncoderData<B: EncoderBackend> {
-    layers: Vec<EncoderLayerW<B::Buf>>,
+    layers: Vec<EncoderLayerW<B::Weight, B::Buf>>,
     scratch: EncoderScratch<B::Buf>,
     final_norm_gamma: B::Buf,
     sliding_windows: Vec<[usize; 2]>,
@@ -274,15 +282,15 @@ impl<B: EncoderBackend> GpuEncoder<B> {
                     w_qkv.extend_from_slice(&w_k[row * kv_dim..(row + 1) * kv_dim]);
                     w_qkv.extend_from_slice(&w_v[row * kv_dim..(row + 1) * kv_dim]);
                 }
-                Some(backend.upload_matmul_weight(&w_qkv)?)
+                Some(backend.upload_matmul_weight(&w_qkv, dim, 3 * kv_dim)?)
             } else { None };
 
             let self_attn = EncoderAttentionW {
-                q_proj: backend.upload_matmul_weight(&w_q)?,
-                k_proj: backend.upload_matmul_weight(&w_k)?,
-                v_proj: backend.upload_matmul_weight(&w_v)?,
+                q_proj: backend.upload_matmul_weight(&w_q, dim, kv_dim)?,
+                k_proj: backend.upload_matmul_weight(&w_k, dim, kv_dim)?,
+                v_proj: backend.upload_matmul_weight(&w_v, dim, kv_dim)?,
                 qkv_proj,
-                o_proj: backend.upload_matmul_weight(&dequant_2d((dim, kv_dim), &avb.pp("o_proj"))?)?,
+                o_proj: backend.upload_matmul_weight(&dequant_2d((dim, kv_dim), &avb.pp("o_proj"))?, kv_dim, dim)?,
                 num_heads: cfg.encoder_num_heads,
                 head_dim: cfg.encoder_head_dim,
                 kv_dim,
@@ -295,11 +303,11 @@ impl<B: EncoderBackend> GpuEncoder<B> {
 
             let mlp = EncoderMlpW {
                 fc1: EncoderLinearBiasW {
-                    weight: backend.upload_matmul_weight(&w_fc1)?,
+                    weight: backend.upload_matmul_weight(&w_fc1, dim, intermediate)?,
                     bias: backend.upload_bias_1d(&dequant_1d(intermediate, "bias", &lvb.pp("mlp").pp("fc1"))?)?,
                 },
                 fc2: EncoderLinearBiasW {
-                    weight: backend.upload_matmul_weight(&dequant_2d((dim, intermediate), &lvb.pp("mlp").pp("fc2"))?)?,
+                    weight: backend.upload_matmul_weight(&dequant_2d((dim, intermediate), &lvb.pp("mlp").pp("fc2"))?, intermediate, dim)?,
                     bias: backend.upload_bias_1d(&dequant_1d(dim, "bias", &lvb.pp("mlp").pp("fc2"))?)?,
                 },
             };
@@ -363,16 +371,18 @@ impl<B: EncoderBackend> GpuEncoder<B> {
             let n_elem = padded_seq * dim;
 
             // Pre-norm (bare LN — gamma baked into QKV weights)
+            // No barrier needed: flush() at end of previous layer fully syncs
             b.layernorm_bare(res_in, &s.normed, padded_seq, dim);
 
-            // Q/K/V projections
+            // Q/K/V projections (all read normed — one barrier, then independent)
             let [win_left, win_right] = self.d.sliding_windows[i];
+            b.barrier();
             if let (Some(qkv_w), Some(qkv_buf)) = (&layer.self_attn.qkv_proj, &s.qkv) {
-                // Fused path: single matmul → [T, 3*kv_dim], slice into Q/K/V
                 b.matmul(&s.normed, qkv_w, qkv_buf, padded_seq, 3 * kv_dim, dim);
                 let q = b.buf_slice(qkv_buf, 0);
                 let k = b.buf_slice(qkv_buf, kv_dim * 2); // f16 = 2 bytes
                 let v = b.buf_slice(qkv_buf, 2 * kv_dim * 2);
+                b.barrier();
                 b.flash_attention(&q, &k, &v, &s.attn_out, &FlashAttentionParams {
                     n_heads: layer.self_attn.num_heads,
                     padded_seq,
@@ -386,10 +396,11 @@ impl<B: EncoderBackend> GpuEncoder<B> {
                     window_right: win_right as i32,
                 });
             } else {
-                // Separate path: 3 matmuls
+                // 3 independent matmuls — no barriers between them
                 b.matmul(&s.normed, &layer.self_attn.q_proj, &s.q, padded_seq, kv_dim, dim);
                 b.matmul(&s.normed, &layer.self_attn.k_proj, &s.k, padded_seq, kv_dim, dim);
                 b.matmul(&s.normed, &layer.self_attn.v_proj, &s.v, padded_seq, kv_dim, dim);
+                b.barrier();
                 b.flash_attention(&s.q, &s.k, &s.v, &s.attn_out, &FlashAttentionParams {
                     n_heads: layer.self_attn.num_heads,
                     padded_seq,
@@ -405,25 +416,35 @@ impl<B: EncoderBackend> GpuEncoder<B> {
             }
 
             // O projection
+            b.barrier();
             b.matmul(&s.attn_out, &layer.self_attn.o_proj, &s.attn_proj, padded_seq, dim, kv_dim);
 
             // Residual add
+            b.barrier();
             b.residual_add(&s.attn_proj, res_in, res_out, n_elem);
             std::mem::swap(&mut res_in, &mut res_out);
 
             // Post-norm (bare LN — gamma baked into fc1 weights)
+            b.barrier();
             b.layernorm_bare(res_in, &s.normed, padded_seq, dim);
 
-            // FFN: fused matmul_bias_gelu + matmul_bias
+            // FFN: fc1 (fused gelu) → fc2
             let intermediate = self.d.intermediate_size;
+            b.barrier();
             b.matmul_bias_gelu(&s.normed, &layer.mlp.fc1.weight, &layer.mlp.fc1.bias,
                                 &s.fc1, padded_seq, intermediate, dim);
+            b.barrier();
             b.matmul_bias(&s.fc1, &layer.mlp.fc2.weight, &layer.mlp.fc2.bias,
                            &s.fc2, padded_seq, dim, intermediate);
 
             // Residual add
+            b.barrier();
             b.residual_add(&s.fc2, res_in, res_out, n_elem);
             std::mem::swap(&mut res_in, &mut res_out);
+
+            if i == self.d.layers.len() / 2 - 1 {
+                b.flush()?;
+            }
         }
 
         // Final layernorm (with gamma — not baked)

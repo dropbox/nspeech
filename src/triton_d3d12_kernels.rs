@@ -32,14 +32,27 @@ impl TritonD3D12Kernels {
         }
     }
 
-    /// Select the best matmul+bias PSO based on fp16_acc preference.
-    fn select_matmul_bias_pso(&self) -> &ID3D12PipelineState {
+    /// Select the best matmul+bias PSO and tile size.
+    fn select_matmul_bias_pso(&self) -> (&ID3D12PipelineState, usize) {
         if self.prefer_fp16_acc {
             if let Some(ref pso) = self.matmul_bias_acc16_32x32 {
-                return pso;
+                return (pso, 32);
             }
         }
-        &self.matmul_bias_32x32
+        if let Some(ref pso) = self.matmul_bias_64x64 {
+            (pso, 64)
+        } else {
+            (&self.matmul_bias_32x32, 32)
+        }
+    }
+
+    /// Select the best matmul+bias+gelu PSO and tile size.
+    fn select_matmul_bias_gelu_pso(&self) -> (&ID3D12PipelineState, usize) {
+        if let Some(ref pso) = self.matmul_bias_gelu_64x64 {
+            (pso, 64)
+        } else {
+            (&self.matmul_bias_gelu_32x32, 32)
+        }
     }
 }
 
@@ -152,7 +165,7 @@ pub fn triton_d3d12_matmul(
         uav_f16(out, (m * n) as u32),
     ];
 
-    kernels.gpu.dispatch_uav_only(pso, &root_constants, &uavs, [grid_x, grid_y, 1])
+    kernels.gpu.record_dispatch(pso, &root_constants, &uavs, [grid_x, grid_y, 1])
         .map_err(|e| anyhow::anyhow!("matmul dispatch: {e}"))
 }
 
@@ -170,15 +183,11 @@ pub fn triton_d3d12_matmul_bias(
     _block_m: usize,
     _block_n: usize,
 ) -> Result<()> {
-    let pso = kernels.select_matmul_bias_pso();
-    let bm = 32;
-    let bn = 32;
+    let (pso, tile) = kernels.select_matmul_bias_pso();
 
-    let grid_x = cdiv(m, bm) as u32;
-    let grid_y = cdiv(n, bn) as u32;
+    let grid_x = cdiv(m, tile) as u32;
+    let grid_y = cdiv(n, tile) as u32;
 
-    // Pointer args: 0=a, 1=b, 2=bias, 3=c → 4 UAVs
-    // Scalar args: 4=M,5=N,6=K,7=stride_am,...12=stride_cn → 9 scalars + 3 grid
     let root_constants: Vec<u32> = vec![
         i32_as_u32(m as i32),
         i32_as_u32(n as i32),
@@ -199,8 +208,47 @@ pub fn triton_d3d12_matmul_bias(
         uav_f16(out, (m * n) as u32),
     ];
 
-    kernels.gpu.dispatch_uav_only(pso, &root_constants, &uavs, [grid_x, grid_y, 1])
+    kernels.gpu.record_dispatch(pso, &root_constants, &uavs, [grid_x, grid_y, 1])
         .map_err(|e| anyhow::anyhow!("matmul_bias dispatch: {e}"))
+}
+
+/// Dispatch fused matmul+bias+GELU: C_f16[M,N] = GELU(A_f16[M,K] @ B_f16[K,N] + bias_f16[N])
+pub fn triton_d3d12_matmul_bias_gelu(
+    kernels: &TritonD3D12Kernels,
+    a: &GpuBuffer,
+    b: &GpuBuffer,
+    bias: &GpuBuffer,
+    out: &GpuBuffer,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    let (pso, tile) = kernels.select_matmul_bias_gelu_pso();
+    let grid_x = cdiv(m, tile) as u32;
+    let grid_y = cdiv(n, tile) as u32;
+
+    let root_constants: Vec<u32> = vec![
+        i32_as_u32(m as i32),
+        i32_as_u32(n as i32),
+        i32_as_u32(k as i32),
+        i32_as_u32(k as i32),         // stride_am = K
+        i32_as_u32(1),                // stride_ak = 1
+        i32_as_u32(n as i32),         // stride_bk = N
+        i32_as_u32(1),                // stride_bn = 1
+        i32_as_u32(n as i32),         // stride_cm = N
+        i32_as_u32(1),                // stride_cn = 1
+        grid_x, grid_y, 1,
+    ];
+
+    let uavs = [
+        uav_f16(a, (m * k) as u32),
+        uav_f16(b, (k * n) as u32),
+        uav_f16(bias, n as u32),
+        uav_f16(out, (m * n) as u32),
+    ];
+
+    kernels.gpu.record_dispatch(pso, &root_constants, &uavs, [grid_x, grid_y, 1])
+        .map_err(|e| anyhow::anyhow!("matmul_bias_gelu dispatch: {e}"))
 }
 
 /// Dispatch unit-offset layernorm: out = LN(x) * (gamma + 1.0) (F16)
@@ -231,7 +279,7 @@ pub fn triton_d3d12_layernorm(
         uav_f16(out, (n_rows * n_cols) as u32),
     ];
 
-    kernels.gpu.dispatch_uav_only(&kernels.layernorm_unit_offset, &root_constants, &uavs, [grid_x, 1, 1])
+    kernels.gpu.record_dispatch(&kernels.layernorm_unit_offset, &root_constants, &uavs, [grid_x, 1, 1])
         .map_err(|e| anyhow::anyhow!("layernorm dispatch: {e}"))
 }
 
@@ -257,7 +305,7 @@ pub fn triton_d3d12_gelu(
         uav_f16(out, n_elements as u32),
     ];
 
-    kernels.gpu.dispatch_uav_only(&kernels.gelu, &root_constants, &uavs, [grid_x, 1, 1])
+    kernels.gpu.record_dispatch(&kernels.gelu, &root_constants, &uavs, [grid_x, 1, 1])
         .map_err(|e| anyhow::anyhow!("gelu dispatch: {e}"))
 }
 
@@ -285,123 +333,38 @@ pub fn triton_d3d12_residual_add(
         uav_f16(out, n_elements as u32),
     ];
 
-    kernels.gpu.dispatch_uav_only(&kernels.residual_add, &root_constants, &uavs, [grid_x, 1, 1])
+    kernels.gpu.record_dispatch(&kernels.residual_add, &root_constants, &uavs, [grid_x, 1, 1])
         .map_err(|e| anyhow::anyhow!("residual_add dispatch: {e}"))
 }
 
-/// Dispatch mixed-precision matmul: C_f16[M,N] = A_f16[M,K] @ B_f32[K,N]
-pub fn triton_d3d12_matmul_f32w(
+/// Dispatch bias add: out[i] = x[i] + bias[i % n_cols] (all F16)
+///
+/// Pointer args: 0=x, 1=bias, 2=out
+/// Scalar args: 3=n_elements, 4=n_cols
+pub fn triton_d3d12_bias_add(
     kernels: &TritonD3D12Kernels,
-    a: &GpuBuffer,    // f16 activation
-    b: &GpuBuffer,    // f32 weight
-    out: &GpuBuffer,  // f16 output
-    m: usize,
-    n: usize,
-    k: usize,
+    x: &GpuBuffer,
+    bias: &GpuBuffer,
+    out: &GpuBuffer,
+    n_elements: usize,
+    n_cols: usize,
 ) -> Result<()> {
-    let (bm, bn) = (64, 64);
-    let grid_x = cdiv(m, bm) as u32;
-    let grid_y = cdiv(n, bn) as u32;
+    let grid_x = cdiv(n_elements, 1024) as u32;
 
     let root_constants: Vec<u32> = vec![
-        i32_as_u32(m as i32),
-        i32_as_u32(n as i32),
-        i32_as_u32(k as i32),
-        i32_as_u32(k as i32),         // stride_am = K
-        i32_as_u32(1),                // stride_ak = 1
-        i32_as_u32(n as i32),         // stride_bk = N
-        i32_as_u32(1),                // stride_bn = 1
-        i32_as_u32(n as i32),         // stride_cm = N
-        i32_as_u32(1),                // stride_cn = 1
-        grid_x, grid_y, 1,
+        i32_as_u32(n_elements as i32),
+        i32_as_u32(n_cols as i32),
+        grid_x, 1, 1,
     ];
 
     let uavs = [
-        uav_f16(a, (m * k) as u32),
-        uav_f32(b, (k * n) as u32),
-        uav_f16(out, (m * n) as u32),
+        uav_f16(x, n_elements as u32),
+        uav_f16(bias, n_cols as u32),
+        uav_f16(out, n_elements as u32),
     ];
 
-    kernels.gpu.dispatch_uav_only(&kernels.matmul_f32w_64x64, &root_constants, &uavs, [grid_x, grid_y, 1])
-        .map_err(|e| anyhow::anyhow!("matmul_f32w dispatch: {e}"))
-}
-
-/// Dispatch mixed-precision matmul+bias: C_f16[M,N] = A_f16[M,K] @ B_f32[K,N] + bias_f32[N]
-pub fn triton_d3d12_matmul_bias_f32w(
-    kernels: &TritonD3D12Kernels,
-    a: &GpuBuffer,     // f16 activation
-    b: &GpuBuffer,     // f32 weight
-    bias: &GpuBuffer,  // f32 bias
-    out: &GpuBuffer,   // f16 output
-    m: usize,
-    n: usize,
-    k: usize,
-) -> Result<()> {
-    let (bm, bn) = (32, 32);
-    let grid_x = cdiv(m, bm) as u32;
-    let grid_y = cdiv(n, bn) as u32;
-
-    let root_constants: Vec<u32> = vec![
-        i32_as_u32(m as i32),
-        i32_as_u32(n as i32),
-        i32_as_u32(k as i32),
-        i32_as_u32(k as i32),
-        i32_as_u32(1),
-        i32_as_u32(n as i32),
-        i32_as_u32(1),
-        i32_as_u32(n as i32),
-        i32_as_u32(1),
-        grid_x, grid_y, 1,
-    ];
-
-    let uavs = [
-        uav_f16(a, (m * k) as u32),
-        uav_f32(b, (k * n) as u32),
-        uav_f32(bias, n as u32),
-        uav_f16(out, (m * n) as u32),
-    ];
-
-    kernels.gpu.dispatch_uav_only(&kernels.matmul_bias_f32w_32x32, &root_constants, &uavs, [grid_x, grid_y, 1])
-        .map_err(|e| anyhow::anyhow!("matmul_bias_f32w dispatch: {e}"))
-}
-
-/// Dispatch fused matmul+bias+GELU: C_f16[M,N] = GELU(A_f16[M,K] @ B_f32[K,N] + bias_f32[N])
-pub fn triton_d3d12_matmul_bias_gelu_f32w(
-    kernels: &TritonD3D12Kernels,
-    a: &GpuBuffer,     // f16 activation
-    b: &GpuBuffer,     // f32 weight
-    bias: &GpuBuffer,  // f32 bias
-    out: &GpuBuffer,   // f16 output
-    m: usize,
-    n: usize,
-    k: usize,
-) -> Result<()> {
-    let (bm, bn) = (32, 32);
-    let grid_x = cdiv(m, bm) as u32;
-    let grid_y = cdiv(n, bn) as u32;
-
-    let root_constants: Vec<u32> = vec![
-        i32_as_u32(m as i32),
-        i32_as_u32(n as i32),
-        i32_as_u32(k as i32),
-        i32_as_u32(k as i32),
-        i32_as_u32(1),
-        i32_as_u32(n as i32),
-        i32_as_u32(1),
-        i32_as_u32(n as i32),
-        i32_as_u32(1),
-        grid_x, grid_y, 1,
-    ];
-
-    let uavs = [
-        uav_f16(a, (m * k) as u32),
-        uav_f32(b, (k * n) as u32),
-        uav_f32(bias, n as u32),
-        uav_f16(out, (m * n) as u32),
-    ];
-
-    kernels.gpu.dispatch_uav_only(&kernels.matmul_bias_gelu_f32w_32x32, &root_constants, &uavs, [grid_x, grid_y, 1])
-        .map_err(|e| anyhow::anyhow!("matmul_bias_gelu_f32w dispatch: {e}"))
+    kernels.gpu.record_dispatch(&kernels.bias_add, &root_constants, &uavs, [grid_x, 1, 1])
+        .map_err(|e| anyhow::anyhow!("bias_add dispatch: {e}"))
 }
 
 /// Dispatch layernorm with f32 input: out_f16 = LN(x_f32) * (gamma + 1.0)
@@ -429,7 +392,7 @@ pub fn triton_d3d12_layernorm_f32in(
         uav_f16(out, (n_rows * n_cols) as u32),
     ];
 
-    kernels.gpu.dispatch_uav_only(&kernels.layernorm_f32in, &root_constants, &uavs, [grid_x, 1, 1])
+    kernels.gpu.record_dispatch(&kernels.layernorm_f32in, &root_constants, &uavs, [grid_x, 1, 1])
         .map_err(|e| anyhow::anyhow!("layernorm_f32in dispatch: {e}"))
 }
 
@@ -454,7 +417,7 @@ pub fn triton_d3d12_residual_add_f32(
         uav_f32(out, n_elements as u32),
     ];
 
-    kernels.gpu.dispatch_uav_only(&kernels.residual_add_f32, &root_constants, &uavs, [grid_x, 1, 1])
+    kernels.gpu.record_dispatch(&kernels.residual_add_f32, &root_constants, &uavs, [grid_x, 1, 1])
         .map_err(|e| anyhow::anyhow!("residual_add_f32 dispatch: {e}"))
 }
 
@@ -477,7 +440,7 @@ pub fn triton_d3d12_convert_f16_to_f32(
         uav_f32(out, n_elements as u32),
     ];
 
-    kernels.gpu.dispatch_uav_only(&kernels.convert_f16_to_f32, &root_constants, &uavs, [grid_x, 1, 1])
+    kernels.gpu.record_dispatch(&kernels.convert_f16_to_f32, &root_constants, &uavs, [grid_x, 1, 1])
         .map_err(|e| anyhow::anyhow!("convert_f16_to_f32 dispatch: {e}"))
 }
 
@@ -533,7 +496,7 @@ pub fn triton_d3d12_flash_attention(
         uav_f16(out, n_elem),
     ];
 
-    kernels.gpu.dispatch_uav_only(&kernels.flash_attn_d64, &root_constants, &uavs, [grid_x, grid_y, 1])
+    kernels.gpu.record_dispatch(&kernels.flash_attn_d64, &root_constants, &uavs, [grid_x, grid_y, 1])
         .map_err(|e| anyhow::anyhow!("flash_attention dispatch: {e}"))
 }
 
@@ -562,6 +525,6 @@ pub fn triton_d3d12_softmax(
         uav_f16(output, (n_rows * n_cols) as u32),
     ];
 
-    kernels.gpu.dispatch_uav_only(&kernels.softmax, &root_constants, &uavs, [grid_x, 1, 1])
+    kernels.gpu.record_dispatch(&kernels.softmax, &root_constants, &uavs, [grid_x, 1, 1])
         .map_err(|e| anyhow::anyhow!("softmax dispatch: {e}"))
 }

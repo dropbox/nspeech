@@ -175,6 +175,11 @@ HLSL_EXTRA_KERNELS = [
      "*fp16, *fp32, i32, 1024",
      4, ["cdiv(n_elements, 1024)", "1", "1"]),
 
+    # Q8 packed matmul: A(fp16) @ B(int8) * scales(fp16)
+    ("matmul_q8_64x64x32", "matmul_q8",
+     "*fp16:16, *i8:16, *fp16:16, i32, i32, i32, i32, i32, i32, i32, i32, i32, *fp16:16, 64, 64, 32",
+     4, ["cdiv(M, 64)", "cdiv(N, 64)", "1"]),
+
     # HLSL attention decode variants
     ("flash_attention_d64", "flash_attention_fwd",
      "*fp16:16, *fp16:16, *fp16:16, *fp16:16, i32, i32, i32, i32, fp32, i32, i32, 32, 32, 64",
@@ -207,22 +212,22 @@ KERNEL_METADATA = {
         "alias": "matmul_bias_32x32", "group": "encoder", "d3d12": True,
     },
     "matmul_bias_fp16_64x64x32": {
-        "alias": "matmul_bias_64x64", "group": "encoder", "optional": True,
+        "alias": "matmul_bias_64x64", "group": "encoder", "optional": True, "d3d12": True,
     },
     "matmul_bias_fp16_128x128x32": {
         "alias": "matmul_bias_128x128", "group": "encoder", "optional": True,
     },
     "matmul_bias_gelu_fp16_32x32x32": {
-        "alias": "matmul_bias_gelu_32x32", "group": "encoder",
+        "alias": "matmul_bias_gelu_32x32", "group": "encoder", "d3d12": True,
     },
     "matmul_bias_gelu_fp16_64x64x32": {
-        "alias": "matmul_bias_gelu_64x64", "group": "encoder", "optional": True,
+        "alias": "matmul_bias_gelu_64x64", "group": "encoder", "optional": True, "d3d12": True,
     },
     "matmul_bias_gelu_fp16_128x128x32": {
         "alias": "matmul_bias_gelu_128x128", "group": "encoder", "optional": True,
     },
     "matmul_bias_gelu_f16a_f32w_32x32x32": {
-        "alias": "matmul_bias_gelu_f32w_32x32", "group": "encoder", "d3d12": True,
+        "alias": "matmul_bias_gelu_f32w_32x32", "group": "encoder",
     },
     "flash_attention_fwd_32x32x64": {
         "alias": "flash_attention", "group": "encoder", "tg_mem": 8192,
@@ -248,7 +253,7 @@ KERNEL_METADATA = {
         "alias": "softmax", "group": "encoder", "d3d12": True,
     },
     "bias_add_fp16": {
-        "alias": "bias_add", "group": "encoder",
+        "alias": "bias_add", "group": "encoder", "d3d12": True,
     },
     "residual_add_f32": {
         "alias": "residual_add_f32", "group": "encoder", "d3d12": True,
@@ -326,11 +331,11 @@ KERNEL_METADATA = {
     },
     "matmul_f16a_f32w_64x64x32": {
         "alias": "matmul_f32w_64x64", "group": "encoder",
-        "d3d12": True, "d3d12_only": True,
+        "d3d12_only": True,
     },
     "matmul_bias_f16a_f32w_32x32x32": {
         "alias": "matmul_bias_f32w_32x32", "group": "encoder",
-        "d3d12": True, "d3d12_only": True,
+        "d3d12_only": True,
     },
     "layernorm_unit_offset_f32in_768": {
         "alias": "layernorm_f32in", "group": "encoder",
@@ -344,6 +349,12 @@ KERNEL_METADATA = {
     "flash_attention_d64": {
         "alias": "flash_attn_d64", "group": "encoder",
         "d3d12": True, "d3d12_only": True,
+    },
+
+    # ── Q8 packed matmul (D3D12-only, currently unused — ALU-bound on Iris Xe) ──
+    "matmul_q8_64x64x32": {
+        "alias": "matmul_q8_64x64", "group": "encoder",
+        "d3d12_only": True,
     },
 }
 

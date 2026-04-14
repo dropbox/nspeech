@@ -8,10 +8,11 @@ use crate::triton_d3d12_kernels::{
     TritonD3D12Kernels,
     create_f16_buffer, create_f32_buffer,
     upload_f16, upload_f32, download_f16,
-    triton_d3d12_matmul_f32w, triton_d3d12_matmul_bias_f32w,
-    triton_d3d12_matmul_bias_gelu_f32w,
+    triton_d3d12_matmul, triton_d3d12_matmul_bias,
+    triton_d3d12_matmul_bias_gelu,
     triton_d3d12_layernorm_f32in,
-    triton_d3d12_gelu, triton_d3d12_residual_add_f32,
+    triton_d3d12_gelu, triton_d3d12_bias_add,
+    triton_d3d12_residual_add_f32,
     triton_d3d12_flash_attention,
 };
 use super::gpu_encoder::{EncoderBackend, FlashAttentionParams};
@@ -40,6 +41,28 @@ impl D3D12EncoderBackend {
 
 impl EncoderBackend for D3D12EncoderBackend {
     type Buf = GpuBuffer;
+    type Weight = GpuBuffer;  // f16 weights (same as Metal)
+
+    fn begin_pass(&self) -> Result<()> {
+        self.gpu.begin_batch()
+            .map_err(|e| anyhow::anyhow!("begin_batch: {e}"))
+    }
+
+    fn end_pass(&self) -> Result<()> {
+        self.gpu.end_batch()
+            .map_err(|e| anyhow::anyhow!("end_batch: {e}"))
+    }
+
+    fn barrier(&self) {
+        self.gpu.record_uav_barrier();
+    }
+
+    fn flush(&self) -> Result<()> {
+        self.gpu.end_batch()
+            .map_err(|e| anyhow::anyhow!("flush end_batch: {e}"))?;
+        self.gpu.begin_batch()
+            .map_err(|e| anyhow::anyhow!("flush begin_batch: {e}"))
+    }
 
     fn alloc_activation(&self, count: usize) -> Result<GpuBuffer> {
         create_f16_buffer(&self.gpu, count)
@@ -50,11 +73,11 @@ impl EncoderBackend for D3D12EncoderBackend {
         create_f32_buffer(&self.gpu, count)
     }
 
-    fn upload_matmul_weight(&self, data_f32: &[f32]) -> Result<GpuBuffer> {
-        // D3D12 keeps weights in f32 for Q8 precision
-        let buf = create_f32_buffer(&self.gpu, data_f32.len())?;
-        let bytes: Vec<u8> = data_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
-        upload_f32(&self.gpu, &bytes, &buf)?;
+    fn upload_matmul_weight(&self, data_f32: &[f32], _rows: usize, _cols: usize) -> Result<GpuBuffer> {
+        let f16_data: Vec<half::f16> = data_f32.iter().map(|&v| half::f16::from_f32(v)).collect();
+        let buf = create_f16_buffer(&self.gpu, f16_data.len())?;
+        let bytes: Vec<u8> = f16_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        upload_f16(&self.gpu, &bytes, &buf)?;
         Ok(buf)
     }
 
@@ -63,14 +86,6 @@ impl EncoderBackend for D3D12EncoderBackend {
         let buf = create_f16_buffer(&self.gpu, f16_data.len())?;
         let bytes: Vec<u8> = f16_data.iter().flat_map(|v| v.to_le_bytes()).collect();
         upload_f16(&self.gpu, &bytes, &buf)?;
-        Ok(buf)
-    }
-
-    fn upload_bias_1d(&self, data_f32: &[f32]) -> Result<GpuBuffer> {
-        // D3D12 matmul_bias kernel expects f32 bias
-        let buf = create_f32_buffer(&self.gpu, data_f32.len())?;
-        let bytes: Vec<u8> = data_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
-        upload_f32(&self.gpu, &bytes, &buf)?;
         Ok(buf)
     }
 
@@ -93,8 +108,6 @@ impl EncoderBackend for D3D12EncoderBackend {
 
     fn layernorm_bare(&self, hidden: &GpuBuffer, out: &GpuBuffer,
                        n_rows: usize, n_cols: usize) {
-        // D3D12 has no bare LN kernel; use layernorm_f32in with zero gamma
-        // (1 + 0) * LN(x) = LN(x)
         triton_d3d12_layernorm_f32in(&self.kernels, hidden, &self.zero_gamma, out, n_rows, n_cols).unwrap();
     }
 
@@ -105,32 +118,30 @@ impl EncoderBackend for D3D12EncoderBackend {
 
     fn matmul(&self, a: &GpuBuffer, b: &GpuBuffer, out: &GpuBuffer,
               m: usize, n: usize, k: usize) {
-        triton_d3d12_matmul_f32w(&self.kernels, a, b, out, m, n, k).unwrap();
+        triton_d3d12_matmul(&self.kernels, a, b, out, m, n, k, 64, 64).unwrap();
     }
 
     fn matmul_bias(&self, a: &GpuBuffer, b: &GpuBuffer, bias: &GpuBuffer,
                     out: &GpuBuffer, m: usize, n: usize, k: usize) {
-        triton_d3d12_matmul_bias_f32w(&self.kernels, a, b, bias, out, m, n, k).unwrap();
+        triton_d3d12_matmul_bias(&self.kernels, a, b, bias, out, m, n, k, 32, 32).unwrap();
     }
 
     fn matmul_bias_gelu(&self, a: &GpuBuffer, b: &GpuBuffer, bias: &GpuBuffer,
                          out: &GpuBuffer, m: usize, n: usize, k: usize) {
-        triton_d3d12_matmul_bias_gelu_f32w(&self.kernels, a, b, bias, out, m, n, k).unwrap();
+        triton_d3d12_matmul_bias_gelu(&self.kernels, a, b, bias, out, m, n, k).unwrap();
     }
 
     fn gelu(&self, x: &GpuBuffer, out: &GpuBuffer, n_elem: usize) {
         triton_d3d12_gelu(&self.kernels, x, out, n_elem).unwrap();
     }
 
-    fn bias_add(&self, _x: &GpuBuffer, _bias: &GpuBuffer, _out: &GpuBuffer,
-                _n_elem: usize, _n_cols: usize) {
-        // Not used on D3D12 — matmul_bias handles bias directly
-        panic!("D3D12 encoder does not use separate bias_add");
+    fn bias_add(&self, x: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
+                n_elem: usize, n_cols: usize) {
+        triton_d3d12_bias_add(&self.kernels, x, bias, out, n_elem, n_cols).unwrap();
     }
 
     fn residual_add(&self, proj: &GpuBuffer, res_in: &GpuBuffer,
                      res_out: &GpuBuffer, n_elem: usize) {
-        // f16 proj + f32 residual → f32 output
         triton_d3d12_residual_add_f32(&self.kernels, proj, res_in, res_out, n_elem).unwrap();
     }
 
@@ -138,7 +149,7 @@ impl EncoderBackend for D3D12EncoderBackend {
                         out: &GpuBuffer, p: &FlashAttentionParams) {
         triton_d3d12_flash_attention(
             &self.kernels, q, k, v, out,
-            p.n_heads, p.seq_len, p.seq_len, // padded_seq == seq_len for D3D12
+            p.n_heads, p.seq_len, p.seq_len,
             p.head_dim, p.sm_scale,
             p.window_left, p.window_right,
         ).unwrap();

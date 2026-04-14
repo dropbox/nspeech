@@ -101,11 +101,13 @@ fn main() -> Result<()> {
     #[cfg(feature = "triton-d3d12")]
     {
         use speech::moonshine::encoder::MoonshineEncoder;
-        use speech::moonshine::triton_d3d12_encoder::TritonD3D12Encoder;
+        use speech::moonshine::gpu_encoder::GpuEncoder;
+        use speech::moonshine::gpu_encoder_d3d12::D3D12EncoderBackend;
         use std::sync::Arc;
 
         let gpu = Arc::new(candle_d3d12_kernels::Gpu::new(0)?);
-        println!("D3D12 GPU context created\n");
+        let use_fp16_acc = std::env::var("USE_FP16_ACC").map_or(false, |v| v == "1");
+        println!("D3D12 GPU context created (fp16_acc={use_fp16_acc})\n");
 
         // ── Per-layer comparison ──
         for n_layers in [0, 1] {
@@ -116,7 +118,8 @@ fn main() -> Result<()> {
             let cpu_out = cpu_encoder.forward(&features)?;
             let cpu_flat = cpu_out.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
 
-            let d3d12_encoder = TritonD3D12Encoder::new(&cfg_n, vb.pp("model.encoder"), &gpu)?;
+            let backend = D3D12EncoderBackend::new(&gpu, use_fp16_acc, cfg_n.encoder_dim)?;
+            let d3d12_encoder = GpuEncoder::new(backend, &cfg_n, vb.pp("model.encoder"), 2048)?;
             let d3d12_out = d3d12_encoder.forward(&features)?;
             let d3d12_flat = d3d12_out.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
 
@@ -125,7 +128,8 @@ fn main() -> Result<()> {
         }
 
         // ── Full benchmark ──
-        let encoder = TritonD3D12Encoder::new(&cfg, vb.pp("model.encoder"), &gpu)?;
+        let backend = D3D12EncoderBackend::new(&gpu, use_fp16_acc, cfg.encoder_dim)?;
+        let encoder = GpuEncoder::new(backend, &cfg, vb.pp("model.encoder"), 2048)?;
         let n_iters = 3;
         println!("Benchmark ({n_iters} iters)...");
         let t1 = Instant::now();
