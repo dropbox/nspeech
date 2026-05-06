@@ -28,29 +28,30 @@ fn main() -> Result<()> {
 
     let model_dir = Path::new("hf_kokoro");
     let config_path = model_dir.join("config.json");
+    let gguf_path = model_dir.join("kokoro_q8_0.gguf");
     let model_path = model_dir.join("kokoro-v1_0.safetensors");
     let voice_path = model_dir.join("voices").join(format!("{}.safetensors", voice_name));
 
-    // Verify files exist
-    for (path, name) in [
-        (&config_path, "config.json"),
-        (&model_path, "model weights"),
-        (&voice_path, "voice pack"),
-    ] {
-        if !path.exists() {
-            eprintln!("Missing {}: {}", name, path.display());
-            eprintln!("Run: python scripts/download_kokoro.py");
-            std::process::exit(1);
-        }
+    if !config_path.exists() || !voice_path.exists() {
+        eprintln!("Missing model files. Run: python scripts/download_kokoro.py");
+        std::process::exit(1);
+    }
+    if !gguf_path.exists() && !model_path.exists() {
+        eprintln!("Missing model weights (need .gguf or .safetensors)");
+        std::process::exit(1);
     }
 
-    // Load config
     let config_json = std::fs::read_to_string(&config_path)?;
     let config = speech::kokoro::KokoroConfig::from_json(&config_json)?;
 
     eprintln!("Loading model...");
     let device = speech::parakeet::get_device()?;
-    let model = speech::kokoro::KokoroModel::load(&model_path, config.clone(), &device)?;
+    let model = if gguf_path.exists() {
+        eprintln!("  Using quantized GGUF: {}", gguf_path.display());
+        speech::kokoro::KokoroModel::load_gguf(&gguf_path, config.clone(), &device)?
+    } else {
+        speech::kokoro::KokoroModel::load(&model_path, config.clone(), &device)?
+    };
 
     // Phonemize using dictionary-based G2P
     eprintln!("Loading phonemizer dictionaries...");
