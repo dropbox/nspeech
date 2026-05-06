@@ -1,5 +1,6 @@
 pub mod parakeet;
 pub mod moonshine;
+pub mod kokoro;
 pub mod silero;
 pub mod streaming;
 
