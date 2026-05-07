@@ -15,6 +15,8 @@ pub mod text_encoder;
 pub mod prosody;
 pub mod decoder;
 pub mod phonemizer;
+#[cfg(feature = "triton-metal")]
+pub mod gpu_decoder;
 
 pub use config::KokoroConfig;
 pub use model::KokoroModel;
