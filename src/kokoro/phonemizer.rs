@@ -245,16 +245,97 @@ fn split_segments(text: &str) -> Vec<Segment> {
 
 fn normalize_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
         match ch {
             '\u{2018}' | '\u{2019}' => out.push('\''),
             '\u{201C}' | '\u{201D}' => out.push('"'),
             '\u{2014}' => out.push('—'),
             '\u{2026}' => out.push('…'),
+            '0'..='9' => {
+                let mut num_str = String::new();
+                num_str.push(ch);
+                while let Some(&next) = chars.peek() {
+                    if next.is_ascii_digit() {
+                        num_str.push(next);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                out.push_str(&number_to_words(&num_str));
+            }
             _ => out.push(ch),
         }
     }
     out
+}
+
+fn number_to_words(s: &str) -> String {
+    let n: u64 = match s.parse() {
+        Ok(v) => v,
+        Err(_) => return s.to_string(),
+    };
+    if n == 0 {
+        return "zero".to_string();
+    }
+    int_to_words(n)
+}
+
+fn int_to_words(n: u64) -> String {
+    const ONES: &[&str] = &[
+        "", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+        "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+        "seventeen", "eighteen", "nineteen",
+    ];
+    const TENS: &[&str] = &[
+        "", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
+    ];
+
+    if n == 0 {
+        return String::new();
+    }
+    if n < 20 {
+        return ONES[n as usize].to_string();
+    }
+    if n < 100 {
+        let t = TENS[(n / 10) as usize].to_string();
+        let o = n % 10;
+        if o > 0 {
+            return format!("{} {}", t, ONES[o as usize]);
+        }
+        return t;
+    }
+    if n < 1000 {
+        let h = format!("{} hundred", ONES[(n / 100) as usize]);
+        let rem = n % 100;
+        if rem > 0 {
+            return format!("{} {}", h, int_to_words(rem));
+        }
+        return h;
+    }
+    if n < 1_000_000 {
+        let t = format!("{} thousand", int_to_words(n / 1000));
+        let rem = n % 1000;
+        if rem > 0 {
+            return format!("{} {}", t, int_to_words(rem));
+        }
+        return t;
+    }
+    if n < 1_000_000_000 {
+        let m = format!("{} million", int_to_words(n / 1_000_000));
+        let rem = n % 1_000_000;
+        if rem > 0 {
+            return format!("{} {}", m, int_to_words(rem));
+        }
+        return m;
+    }
+    let b = format!("{} billion", int_to_words(n / 1_000_000_000));
+    let rem = n % 1_000_000_000;
+    if rem > 0 {
+        return format!("{} {}", b, int_to_words(rem));
+    }
+    b
 }
 
 /// Tokenize an IPA string into Kokoro vocab token IDs.
