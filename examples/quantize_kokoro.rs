@@ -52,7 +52,7 @@ fn main() -> Result<()> {
     };
 
     let in_path = "hf_kokoro/kokoro-v1_0.safetensors";
-    let out_path = format!("hf_kokoro/kokoro_{}.gguf", format_str);
+    let out_path = format!("assets/kokoro_{}.gguf", format_str);
 
     eprintln!("Quantizing Kokoro to {:?}", quant_format);
     eprintln!("  Input:  {}", in_path);

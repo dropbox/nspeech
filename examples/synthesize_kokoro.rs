@@ -2,14 +2,6 @@
 //!
 //! Usage:
 //!   cargo run --example synthesize_kokoro --release -- "Hello, world!" output.wav
-//!
-//! Requires:
-//!   - hf_kokoro/kokoro-v1_0.safetensors (model weights)
-//!   - hf_kokoro/config.json
-//!   - hf_kokoro/voices/af_heart.pt (or any voice pack)
-//!
-//! Download with:
-//!   python scripts/download_kokoro.py
 
 use anyhow::Result;
 use std::path::Path;
@@ -18,7 +10,6 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!("Usage: {} <text-or-ipa> <output.wav> [voice]", args[0]);
-        eprintln!("  voice: name of voice pack in hf_kokoro/voices/ (default: af_heart)");
         std::process::exit(1);
     }
 
@@ -26,18 +17,13 @@ fn main() -> Result<()> {
     let output_path = &args[2];
     let voice_name = args.get(3).map(|s| s.as_str()).unwrap_or("af_heart");
 
-    let model_dir = Path::new("hf_kokoro");
-    let config_path = model_dir.join("config.json");
-    let gguf_path = model_dir.join("kokoro_q8_0.gguf");
-    let model_path = model_dir.join("kokoro-v1_0.safetensors");
-    let voice_path = model_dir.join("voices").join(format!("{}.safetensors", voice_name));
+    let assets = Path::new("assets");
+    let config_path = assets.join("kokoro-config.json");
+    let gguf_path = assets.join("kokoro_q8_0.gguf");
+    let voice_path = assets.join(format!("kokoro-{}.safetensors", voice_name));
 
-    if !config_path.exists() || !voice_path.exists() {
-        eprintln!("Missing model files. Run: python scripts/download_kokoro.py");
-        std::process::exit(1);
-    }
-    if !gguf_path.exists() && !model_path.exists() {
-        eprintln!("Missing model weights (need .gguf or .safetensors)");
+    if !config_path.exists() || !gguf_path.exists() || !voice_path.exists() {
+        eprintln!("Missing model files in assets/. Need: kokoro-config.json, kokoro_q8_0.gguf, kokoro-{voice_name}.safetensors");
         std::process::exit(1);
     }
 
@@ -46,18 +32,12 @@ fn main() -> Result<()> {
 
     eprintln!("Loading model...");
     let device = speech::parakeet::get_device()?;
-    let model = if gguf_path.exists() {
-        eprintln!("  Using quantized GGUF: {}", gguf_path.display());
-        speech::kokoro::KokoroModel::load_gguf(&gguf_path, config.clone(), &device)?
-    } else {
-        speech::kokoro::KokoroModel::load(&model_path, config.clone(), &device)?
-    };
+    let model = speech::kokoro::KokoroModel::load_gguf(&gguf_path, config.clone(), &device)?;
 
-    // Phonemize using dictionary-based G2P
     eprintln!("Loading phonemizer dictionaries...");
-    let gold_json = std::fs::read_to_string(model_dir.join("us_gold.json"))
+    let gold_json = std::fs::read_to_string(assets.join("us_gold.json"))
         .unwrap_or_else(|_| "{}".to_string());
-    let silver_json = std::fs::read_to_string(model_dir.join("us_silver.json"))
+    let silver_json = std::fs::read_to_string(assets.join("us_silver.json"))
         .unwrap_or_else(|_| "{}".to_string());
     let phonemizer = speech::kokoro::Phonemizer::new(&gold_json, &silver_json, &config.vocab)?;
 
@@ -72,7 +52,6 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    // Load voice (use padded length: tokens + 2 padding tokens)
     eprintln!("Loading voice: {}", voice_name);
     let style = speech::kokoro::KokoroModel::load_voice(&voice_path, tokens.len() + 2, &device)?;
 
