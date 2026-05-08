@@ -289,6 +289,9 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
 
     fn matmul_bias(&self, a: &GpuBuffer, b: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
                    m: usize, n: usize, k: usize) -> Result<()> {
+        let total = m * n;
+        let tmp = self.alloc(total)?;
+
         let grid_x = cdiv(m, 64) as u32;
         let grid_y = cdiv(n, 64) as u32;
         let rc: Vec<u32> = vec![
@@ -301,17 +304,16 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
         let uavs = [
             uav_f16(a, (m * k) as u32),
             uav_f16(b, (k * n) as u32),
-            uav_f16(out, (m * n) as u32),
+            uav_f16(&tmp, total as u32),
         ];
         self.gpu.record_dispatch(&self.kernels.matmul, &rc, &uavs, [grid_x, grid_y, 1])
             .map_err(|e| anyhow::anyhow!("matmul: {e}"))?;
 
-        // Row-broadcast bias add: out[i] += bias[i / n]
-        let total = m * n;
+        // Row-broadcast bias add: out[i] = tmp[i] + bias[i / n]
         let bias_grid = cdiv(total, 1024) as u32;
         let bias_rc: Vec<u32> = vec![total as u32, n as u32, bias_grid, 1, 1];
         let bias_uavs = [
-            uav_f16(out, total as u32),
+            uav_f16(&tmp, total as u32),
             uav_f16(bias, m as u32),
             uav_f16(out, total as u32),
         ];
