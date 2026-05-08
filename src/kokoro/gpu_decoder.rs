@@ -250,9 +250,10 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
                 c_in: usize, c_out: usize, t_in: usize, t_out: usize,
                 k: usize, stride: usize, padding: usize, dilation: usize) -> Result<()> {
         let kk = c_in * k;
-        if kk % 32 == 0 && c_out % 64 == 0 && t_out % 64 == 0 {
+        let matmul_ok = self.kernels.matmul.max_total_threads_per_threadgroup() >= 256;
+        if matmul_ok && kk % 32 == 0 && c_out % 64 == 0 && t_out % 64 == 0 {
             self.conv1d_matmul(x, w, bias, out, c_in, c_out, t_in, t_out, k, stride, padding, dilation)
-        } else if kk % 32 == 0 && c_out % 64 == 0 {
+        } else if matmul_ok && kk % 32 == 0 && c_out % 64 == 0 {
             self.conv1d_matmul_npad(x, w, bias, out, c_in, c_out, t_in, t_out, k, stride, padding, dilation)
         } else {
             self.conv1d(x, w, bias, out, c_in, c_out, t_in, t_out, k, stride, padding, dilation)
@@ -297,9 +298,10 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         let lrelu_tmp = self.alloc(n)?;
         self.leaky_relu(x, &lrelu_tmp, n, 0.01)?;
         let kk = c_in * k;
-        if kk % 32 == 0 && c_out % 64 == 0 && t_out % 64 == 0 {
+        let matmul_ok = self.kernels.matmul.max_total_threads_per_threadgroup() >= 256;
+        if matmul_ok && kk % 32 == 0 && c_out % 64 == 0 && t_out % 64 == 0 {
             self.conv1d_matmul(&lrelu_tmp, w, bias, out, c_in, c_out, t_in, t_out, k, stride, padding, dilation)
-        } else if kk % 32 == 0 && c_out % 64 == 0 {
+        } else if matmul_ok && kk % 32 == 0 && c_out % 64 == 0 {
             self.conv1d_matmul_npad(&lrelu_tmp, w, bias, out, c_in, c_out, t_in, t_out, k, stride, padding, dilation)
         } else {
             self.conv1d(&lrelu_tmp, w, bias, out, c_in, c_out, t_in, t_out, k, stride, padding, dilation)

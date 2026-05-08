@@ -416,9 +416,9 @@ def gen_kokoro_d3d12(metadata, kokoro_kernels):
             continue
         const_name = f"DXIL_KOKORO_{meta['alias'].upper()}"
         lines.append(f'const {const_name}: &[u8] = include_bytes!("../dxil/{name}.dxil");')
-    # Shared matmul kernel (from moonshine, used for im2col-based conv1d)
-    if (dxil_dir / "matmul_bias_fp16_32x32x32.dxil").exists():
-        lines.append(f'const DXIL_MATMUL_BIAS_32X32: &[u8] = include_bytes!("../dxil/matmul_bias_fp16_32x32x32.dxil");')
+    # Shared matmul kernel (plain, no bias — used with row_bias_add for conv1d)
+    if (dxil_dir / "matmul_fp16_64x64x32.dxil").exists():
+        lines.append(f'const DXIL_MATMUL_64X64: &[u8] = include_bytes!("../dxil/matmul_fp16_64x64x32.dxil");')
     lines.append("")
 
     # KokoroD3D12Kernels struct
@@ -431,7 +431,7 @@ def gen_kokoro_d3d12(metadata, kokoro_kernels):
         if not (dxil_dir / f"{name}.dxil").exists():
             continue
         lines.append(f"    pub(crate) {meta['alias']}: ID3D12PipelineState,")
-    lines.append("    pub(crate) matmul_bias: ID3D12PipelineState,")
+    lines.append("    pub(crate) matmul: ID3D12PipelineState,")
     lines.append("}")
     lines.append("")
 
@@ -453,7 +453,7 @@ def gen_kokoro_d3d12(metadata, kokoro_kernels):
             continue
         const_name = f"DXIL_KOKORO_{meta['alias'].upper()}"
         lines.append(f'            {meta["alias"]}: load_pso("{name}", {const_name})?,')
-    lines.append(f'            matmul_bias: load_pso("matmul_bias_fp16_32x32x32", DXIL_MATMUL_BIAS_32X32)?,')
+    lines.append(f'            matmul: load_pso("matmul_fp16_64x64x32", DXIL_MATMUL_64X64)?,')
     lines.append("        })")
     lines.append("    }")
     lines.append("}")

@@ -402,6 +402,7 @@ impl Generator {
         let (h_buf, h_c, h_t) = buf_conv1d_lrelu001(gpu, &h_buf, &self.conv_post_weight, &self.conv_post_bias, h_c, h_t, 3, 1, 1)?;
 
         // Download and do iSTFT on CPU
+        #[cfg(feature = "triton-metal")]
         let _ = self.conv_post_weight.device().as_metal_device().map(|md| md.wait_until_completed());
         let out_data = gpu.download_f16(&h_buf, h_c * h_t)?;
         let h = Tensor::from_vec(out_data, &[1, h_c, h_t][..], &device)?.to_dtype(DType::F32)?;
