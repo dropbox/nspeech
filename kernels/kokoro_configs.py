@@ -23,6 +23,7 @@ KOKORO_KERNELS = [
      "*fp16, *fp16, *fp16, *fp16, *fp16, i32, i32, 1024",
      4, ["n_channels", "1", "1"]),
 
+
     # ── LeakyReLU ──
     ("kokoro_leaky_relu_01", "leaky_relu_fp16",
      "*fp16, *fp16, i32, 0.1, 1024",
@@ -92,6 +93,11 @@ KOKORO_KERNELS = [
     # ── Element-wise scale by 1/3 (for resblock averaging) ──
     ("kokoro_scale_third", "elementwise_scale_third",
      "*fp16, *fp16, i32, 1024",
+     4, ["cdiv(n_elements, 1024)", "1", "1"]),
+
+    # ── Row-broadcast bias add: out[i] = x[i] + bias[i / n_cols] ──
+    ("kokoro_row_bias_add", "row_bias_add",
+     "*fp16, *fp16, *fp16, i32, i32, 1024",
      4, ["cdiv(n_elements, 1024)", "1", "1"]),
 
 ]

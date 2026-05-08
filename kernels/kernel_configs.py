@@ -409,6 +409,9 @@ KERNEL_METADATA = {
     "kokoro_scale_third": {
         "alias": "scale_third", "group": "kokoro", "d3d12": True,
     },
+    "kokoro_row_bias_add": {
+        "alias": "row_bias_add", "group": "kokoro", "d3d12": True,
+    },
 }
 
 

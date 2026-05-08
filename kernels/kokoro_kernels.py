@@ -559,3 +559,21 @@ def conv_transpose1d_simple(
 
     out_idx = c_out_idx * T_out + t_offs
     tl.store(out_ptr + out_idx, acc.to(tl.float16), mask=t_mask)
+
+
+# ─── Row-broadcast bias add: out[i] = x[i] + bias[i / n_cols] ──────────────
+
+@triton.jit
+def row_bias_add(
+    x_ptr, bias_ptr, out_ptr,
+    n_elements, n_cols,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """out[i] = x[i] + bias[i // n_cols]. Broadcasts bias along rows (M dim)."""
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_ptr + offsets, mask=mask)
+    row_idx = offsets // n_cols
+    b = tl.load(bias_ptr + row_idx, mask=mask)
+    tl.store(out_ptr + offsets, x + b, mask=mask)

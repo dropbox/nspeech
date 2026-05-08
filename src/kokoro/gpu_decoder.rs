@@ -2,7 +2,6 @@
 //!
 //! Implements KokoroGpuBackend using Triton-compiled Metal kernels.
 //! Weights are cached on first upload; activations upload each call.
-//! Shares matmul dispatch with moonshine encoder via `enc_matmul_bias`.
 
 use anyhow::Result;
 use candle_core::{Device, GpuBuffer, MetalDevice};
@@ -12,7 +11,6 @@ use std::collections::HashMap;
 use std::cell::RefCell;
 
 use super::gpu_backend::KokoroGpuBackend;
-use crate::triton_kernels::enc_matmul_bias;
 
 include!("../../kernels/out/generated/kokoro_metal_gen.rs");
 
@@ -251,8 +249,11 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
     fn conv1d_k(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
                 c_in: usize, c_out: usize, t_in: usize, t_out: usize,
                 k: usize, stride: usize, padding: usize, dilation: usize) -> Result<()> {
-        if (c_in * k) % 32 == 0 && t_out % 32 == 0 {
+        let kk = c_in * k;
+        if kk % 32 == 0 && c_out % 64 == 0 && t_out % 64 == 0 {
             self.conv1d_matmul(x, w, bias, out, c_in, c_out, t_in, t_out, k, stride, padding, dilation)
+        } else if kk % 32 == 0 && c_out % 64 == 0 {
+            self.conv1d_matmul_npad(x, w, bias, out, c_in, c_out, t_in, t_out, k, stride, padding, dilation)
         } else {
             self.conv1d(x, w, bias, out, c_in, c_out, t_in, t_out, k, stride, padding, dilation)
         }
@@ -293,12 +294,15 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
                        c_in: usize, c_out: usize, t_in: usize, t_out: usize,
                        k: usize, stride: usize, padding: usize, dilation: usize) -> Result<()> {
         let n = c_in * t_in;
-        let tmp = self.alloc(n)?;
-        self.leaky_relu(x, &tmp, n, 0.01)?;
-        if (c_in * k) % 32 == 0 && t_out % 32 == 0 {
-            self.conv1d_matmul(&tmp, w, bias, out, c_in, c_out, t_in, t_out, k, stride, padding, dilation)
+        let lrelu_tmp = self.alloc(n)?;
+        self.leaky_relu(x, &lrelu_tmp, n, 0.01)?;
+        let kk = c_in * k;
+        if kk % 32 == 0 && c_out % 64 == 0 && t_out % 64 == 0 {
+            self.conv1d_matmul(&lrelu_tmp, w, bias, out, c_in, c_out, t_in, t_out, k, stride, padding, dilation)
+        } else if kk % 32 == 0 && c_out % 64 == 0 {
+            self.conv1d_matmul_npad(&lrelu_tmp, w, bias, out, c_in, c_out, t_in, t_out, k, stride, padding, dilation)
         } else {
-            self.conv1d(&tmp, w, bias, out, c_in, c_out, t_in, t_out, k, stride, padding, dilation)
+            self.conv1d(&lrelu_tmp, w, bias, out, c_in, c_out, t_in, t_out, k, stride, padding, dilation)
         }
     }
 
@@ -364,10 +368,64 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         Ok(())
     }
 
-    fn matmul_bias(&self, a: &GpuBuffer, b: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
-                   m: usize, n: usize, k: usize) -> Result<()> {
+    fn matmul_bias(&self, w: &GpuBuffer, col: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
+                   c_out: usize, t_out: usize, kk: usize) -> Result<()> {
+        let pipeline = &self.kernels.matmul;
+
         let encoder = self.device.command_encoder()?;
-        enc_matmul_bias(&encoder, &self.kernels.matmul_bias, a, b, bias, out, m, n, k, 32, 32);
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(w.buf()), w.offset);       // A
+        encoder.set_buffer(1, Some(col.buf()), col.offset);   // B
+        encoder.set_buffer(2, Some(out.buf()), out.offset);   // C
+        encoder.set_bytes(3, &(c_out as i32));    // M
+        encoder.set_bytes(4, &(t_out as i32));    // N
+        encoder.set_bytes(5, &(kk as i32));       // K
+        encoder.set_bytes(6, &(kk as i32));       // stride_am = K
+        encoder.set_bytes(7, &1i32);              // stride_ak = 1
+        encoder.set_bytes(8, &(t_out as i32));    // stride_bk = N
+        encoder.set_bytes(9, &1i32);              // stride_bn = 1
+        encoder.set_bytes(10, &(t_out as i32));   // stride_cm = N
+        encoder.set_bytes(11, &1i32);             // stride_cn = 1
+        let grid = MTLSize { width: cdiv(c_out, 64), height: cdiv(t_out, 64), depth: 1 };
+        let max_tg = pipeline.max_total_threads_per_threadgroup() as usize;
+        let tg = MTLSize { width: 1024.min(max_tg), height: 1, depth: 1 };
+        encoder.dispatch_thread_groups(grid, tg);
+
+        // Row-broadcast bias add on GPU: out[i] += bias[i / t_out]
+        let n = c_out * t_out;
+        let encoder = self.device.command_encoder()?;
+        encoder.set_compute_pipeline_state(&self.kernels.row_bias_add);
+        encoder.set_buffer(0, Some(out.buf()), out.offset);
+        encoder.set_buffer(1, Some(bias.buf()), bias.offset);
+        encoder.set_buffer(2, Some(out.buf()), out.offset);
+        encoder.set_bytes(3, &(n as i32));
+        encoder.set_bytes(4, &(t_out as i32));
+        let max_tg = self.kernels.row_bias_add.max_total_threads_per_threadgroup() as usize;
+        let tg_width = 1024.min(max_tg);
+        let grid = MTLSize { width: cdiv(n, tg_width), height: 1, depth: 1 };
+        let tg = MTLSize { width: tg_width, height: 1, depth: 1 };
+        encoder.dispatch_thread_groups(grid, tg);
+        Ok(())
+    }
+}
+
+impl KokoroGpuDecoder {
+    /// Conv1d via im2col + matmul with N-padding for alignment.
+    /// Used when K is 32-aligned but t_out is not.
+    fn conv1d_matmul_npad(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
+                          c_in: usize, c_out: usize, t_in: usize, t_out: usize,
+                          k: usize, stride: usize, padding: usize, dilation: usize) -> Result<()> {
+        let kk = c_in * k;
+        let m_pad = cdiv(t_out, 64) * 64;
+
+        let col_buf = self.alloc(kk * m_pad)?;
+        self.im2col(x, &col_buf, c_in, t_in, m_pad, k, stride, padding, dilation)?;
+
+        let tmp = self.alloc(c_out * m_pad)?;
+        self.matmul_bias(w, &col_buf, bias, &tmp, c_out, m_pad, kk)?;
+
+        // Copy valid columns: tmp[c, 0..t_out] → out[c, 0..t_out]
+        self.im2col(&tmp, out, c_out, m_pad, t_out, 1, 1, 0, 1)?;
         Ok(())
     }
 }

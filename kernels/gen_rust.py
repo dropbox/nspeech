@@ -320,8 +320,8 @@ def gen_kokoro_metal(metadata, kokoro_kernels):
     lines.append("")
 
     kokoro_names = [cfg[0] for cfg in kokoro_kernels]
-    # Include shared matmul kernel needed by kokoro
-    shared_kernels = ["matmul_bias_fp16_32x32x32"]
+    # Include shared matmul kernel needed by kokoro (plain matmul, no bias)
+    shared_kernels = ["matmul_fp16_64x64x32"]
 
     # kernel_data — aarch64
     lines.append('#[cfg(target_arch = "aarch64")]')
@@ -360,7 +360,7 @@ def gen_kokoro_metal(metadata, kokoro_kernels):
         meta = metadata.get(name)
         if meta:
             lines.append(f"    pub {meta['alias']}: ComputePipeline,")
-    lines.append("    pub matmul_bias: ComputePipeline,")
+    lines.append("    pub matmul: ComputePipeline,")
     lines.append("}")
     lines.append("")
 
@@ -390,7 +390,7 @@ def gen_kokoro_metal(metadata, kokoro_kernels):
         meta = metadata.get(name)
         if meta:
             lines.append(f'            {meta["alias"]}: load("{name}", "{func_name}")?,')
-    lines.append(f'            matmul_bias: load("matmul_bias_fp16_32x32x32", "matmul_bias_fp16")?,')
+    lines.append(f'            matmul: load("matmul_fp16_64x64x32", "matmul_fp16")?,')
     lines.append("        })")
     lines.append("    }")
     lines.append("}")
