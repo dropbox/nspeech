@@ -74,6 +74,16 @@ KOKORO_KERNELS = [
      "*fp16, *fp16, i32, i32, 1024",
      4, ["cdiv(n_channels * (seq_len + 1), 1024)", "1", "1"]),
 
+    # ── Im2col for conv1d (enables matmul-based convolution) ──
+    ("kokoro_im2col", "im2col_conv1d",
+     "*fp16, *fp16, i32, i32, i32, i32, i32, i32, i32, 1024",
+     4, ["cdiv(C_in * K * T_out, 1024)", "1", "1"]),
+
+    # ── Im2col with fused LeakyReLU(0.1) on input ──
+    ("kokoro_im2col_lrelu", "im2col_conv1d_act",
+     "*fp16, *fp16, i32, i32, i32, i32, i32, i32, i32, 1024, leaky_relu_01_act",
+     4, ["cdiv(C_in * K * T_out, 1024)", "1", "1"]),
+
     # ── Element-wise add: out = a + b ──
     ("kokoro_add", "elementwise_add",
      "*fp16, *fp16, *fp16, i32, 1024",

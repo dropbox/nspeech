@@ -15,15 +15,15 @@
 
 use anyhow::Result;
 use candle_core::Tensor;
-#[cfg(any(all(feature = "triton-metal", target_arch = "aarch64"), feature = "triton-d3d12"))]
+#[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
 use candle_core::DType;
 use candle_nn::{Linear, Module, VarBuilder};
 
 use super::config::KokoroConfig;
 
-#[cfg(any(all(feature = "triton-metal", target_arch = "aarch64"), feature = "triton-d3d12"))]
+#[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
 use super::gpu_backend::KokoroGpuBackend;
-#[cfg(all(feature = "triton-metal", target_arch = "aarch64"))]
+#[cfg(feature = "triton-metal")]
 use super::gpu_decoder::KokoroGpuDecoder;
 #[cfg(feature = "triton-d3d12")]
 use super::gpu_decoder_d3d12::KokoroGpuDecoderD3D12;
@@ -124,7 +124,7 @@ impl ISTFTNetDecoder {
     }
 
     pub fn forward(&self, asr: &Tensor, f0: &Tensor, n: &Tensor, style: &Tensor) -> Result<Tensor> {
-        #[cfg(all(feature = "triton-metal", target_arch = "aarch64"))]
+        #[cfg(feature = "triton-metal")]
         {
             if let Ok(Some(gpu)) = KokoroGpuDecoder::try_new(asr.device()) {
                 return self.forward_gpu(asr, f0, n, style, &gpu);
@@ -139,7 +139,7 @@ impl ISTFTNetDecoder {
         self.forward_inner(asr, f0, n, style)
     }
 
-    #[cfg(any(all(feature = "triton-metal", target_arch = "aarch64"), feature = "triton-d3d12"))]
+    #[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
     fn forward_gpu<G: KokoroGpuBackend>(&self, asr: &Tensor, f0: &Tensor, n: &Tensor, style: &Tensor, gpu: &G) -> Result<Tensor> {
         let f0_feat = f0.unsqueeze(1)?.conv1d(&self.f0_conv_weight, 1, 2, 1, 1)?;
         let f0_feat = f0_feat.broadcast_add(&self.f0_conv_bias.unsqueeze(0)?.unsqueeze(2)?)?;
@@ -336,7 +336,7 @@ impl Generator {
         })
     }
 
-    #[cfg(any(all(feature = "triton-metal", target_arch = "aarch64"), feature = "triton-d3d12"))]
+    #[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
     fn forward_gpu<G: KokoroGpuBackend>(&self, x: &Tensor, f0: &Tensor, style: &Tensor, gpu: &G) -> Result<Tensor> {
         let dtype = x.dtype();
         let (_batch, c_in, t_frames) = x.dims3()?;
@@ -528,26 +528,26 @@ impl Generator {
 
 // ── Tensor↔Buffer bridge: all GPU work stays in buffer space ──
 
-#[cfg(any(all(feature = "triton-metal", target_arch = "aarch64"), feature = "triton-d3d12"))]
+#[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
 fn tensor_id_usize(t: &Tensor) -> usize {
     let id = t.id();
     unsafe { std::mem::transmute::<candle_core::TensorId, usize>(id) }
 }
 
-#[cfg(any(all(feature = "triton-metal", target_arch = "aarch64"), feature = "triton-d3d12"))]
+#[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
 fn tensor_to_f16_vec(t: &Tensor) -> Result<Vec<half::f16>> {
     t.to_dtype(DType::F16)?.flatten_all()?.to_vec1::<half::f16>().map_err(Into::into)
 }
 
 /// Upload a weight tensor (cached by TensorId).
-#[cfg(any(all(feature = "triton-metal", target_arch = "aarch64"), feature = "triton-d3d12"))]
+#[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
 fn upload_weight<G: KokoroGpuBackend>(gpu: &G, t: &Tensor) -> Result<G::Buf> {
     let data = tensor_to_f16_vec(t)?;
     gpu.upload_weight(tensor_id_usize(t), &data)
 }
 
 /// Upload an activation tensor (not cached).
-#[cfg(any(all(feature = "triton-metal", target_arch = "aarch64"), feature = "triton-d3d12"))]
+#[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
 fn upload_activation<G: KokoroGpuBackend>(gpu: &G, t: &Tensor) -> Result<G::Buf> {
     let data = tensor_to_f16_vec(t)?;
     gpu.upload_f16(&data)
@@ -555,7 +555,7 @@ fn upload_activation<G: KokoroGpuBackend>(gpu: &G, t: &Tensor) -> Result<G::Buf>
 
 /// GPU conv1d operating entirely in buffer space.
 /// Uses specialized unrolled kernel when K is 3, 7, or 11.
-#[cfg(any(all(feature = "triton-metal", target_arch = "aarch64"), feature = "triton-d3d12"))]
+#[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
 fn buf_conv1d<G: KokoroGpuBackend>(
     gpu: &G, x: &G::Buf, w: &Tensor, b: &Tensor,
     c_in: usize, t_in: usize, padding: usize, stride: usize, dilation: usize,
@@ -570,7 +570,7 @@ fn buf_conv1d<G: KokoroGpuBackend>(
 }
 
 /// Fused leaky_relu(0.1) + conv_transpose1d (activation applied to input on load).
-#[cfg(any(all(feature = "triton-metal", target_arch = "aarch64"), feature = "triton-d3d12"))]
+#[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
 fn buf_conv_transpose1d_lrelu<G: KokoroGpuBackend>(
     gpu: &G, x: &G::Buf, w: &Tensor, b: &Tensor,
     c_in: usize, t_in: usize, padding: usize, stride: usize,
@@ -585,7 +585,7 @@ fn buf_conv_transpose1d_lrelu<G: KokoroGpuBackend>(
 }
 
 /// Fused leaky_relu(0.01) + conv1d (activation applied to input on load).
-#[cfg(any(all(feature = "triton-metal", target_arch = "aarch64"), feature = "triton-d3d12"))]
+#[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
 fn buf_conv1d_lrelu001<G: KokoroGpuBackend>(
     gpu: &G, x: &G::Buf, w: &Tensor, b: &Tensor,
     c_in: usize, t_in: usize, padding: usize, stride: usize, dilation: usize,
@@ -600,7 +600,7 @@ fn buf_conv1d_lrelu001<G: KokoroGpuBackend>(
 }
 
 /// Reflection pad1d (pad_left=1, pad_right=0) entirely on GPU.
-#[cfg(any(all(feature = "triton-metal", target_arch = "aarch64"), feature = "triton-d3d12"))]
+#[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
 fn buf_reflection_pad1d<G: KokoroGpuBackend>(
     gpu: &G, x: &G::Buf, channels: usize, seq_len: usize, _pad_left: usize, _pad_right: usize,
 ) -> Result<(G::Buf, usize)> {
@@ -610,7 +610,7 @@ fn buf_reflection_pad1d<G: KokoroGpuBackend>(
     Ok((out, new_len))
 }
 
-#[cfg(any(all(feature = "triton-metal", target_arch = "aarch64"), feature = "triton-d3d12"))]
+#[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
 impl ResBlock {
     /// Precompute all adain gamma/beta pairs on CPU and upload to GPU.
     /// Returns 6 pairs: (gamma_buf, beta_buf) for adain1[0..3] then adain2[0..3].

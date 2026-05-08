@@ -397,6 +397,12 @@ KERNEL_METADATA = {
     "kokoro_reflection_pad1d": {
         "alias": "reflection_pad1d", "group": "kokoro", "d3d12": True,
     },
+    "kokoro_im2col": {
+        "alias": "im2col", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_im2col_lrelu": {
+        "alias": "im2col_lrelu", "group": "kokoro", "d3d12": True,
+    },
     "kokoro_add": {
         "alias": "add", "group": "kokoro", "d3d12": True,
     },

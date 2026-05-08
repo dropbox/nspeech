@@ -176,27 +176,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
     fn conv1d_k(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
                 c_in: usize, c_out: usize, t_in: usize, t_out: usize,
                 k: usize, stride: usize, padding: usize, dilation: usize) -> Result<()> {
-        let pso = match k {
-            3 => &self.kernels.conv1d_k3,
-            7 => &self.kernels.conv1d_k7,
-            11 => &self.kernels.conv1d_k11,
-            _ => return self.conv1d(x, w, bias, out, c_in, c_out, t_in, t_out, k, stride, padding, dilation),
-        };
-        let grid_x = c_out as u32;
-        let grid_y = cdiv(t_out, 256) as u32;
-        let rc: Vec<u32> = vec![
-            c_in as u32, c_out as u32, t_in as u32, t_out as u32,
-            stride as u32, padding as u32, dilation as u32,
-            grid_x, grid_y, 1,
-        ];
-        let uavs = [
-            uav_f16(x, (c_in * t_in) as u32),
-            uav_f16(w, (c_out * c_in * k) as u32),
-            uav_f16(bias, c_out as u32),
-            uav_f16(out, (c_out * t_out) as u32),
-        ];
-        self.gpu.record_dispatch(pso, &rc, &uavs, [grid_x, grid_y, 1])
-            .map_err(|e| anyhow::anyhow!("conv1d_k: {e}"))
+        self.conv1d_matmul(x, w, bias, out, c_in, c_out, t_in, t_out, k, stride, padding, dilation)
     }
 
     fn conv_transpose1d(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
@@ -269,5 +249,62 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
         ];
         self.gpu.record_dispatch(&self.kernels.reflection_pad1d, &rc, &uavs, [grid_x, 1, 1])
             .map_err(|e| anyhow::anyhow!("reflection_pad1d: {e}"))
+    }
+
+    fn im2col(&self, x: &GpuBuffer, out: &GpuBuffer,
+              c_in: usize, t_in: usize, t_out: usize, k: usize,
+              stride: usize, padding: usize, dilation: usize) -> Result<()> {
+        let n_elements = c_in * k * t_out;
+        let grid_x = cdiv(n_elements, 1024) as u32;
+        let rc: Vec<u32> = vec![
+            c_in as u32, t_in as u32, t_out as u32, k as u32,
+            stride as u32, padding as u32, dilation as u32,
+            grid_x, 1, 1,
+        ];
+        let uavs = [
+            uav_f16(x, (c_in * t_in) as u32),
+            uav_f16(out, n_elements as u32),
+        ];
+        self.gpu.record_dispatch(&self.kernels.im2col, &rc, &uavs, [grid_x, 1, 1])
+            .map_err(|e| anyhow::anyhow!("im2col: {e}"))
+    }
+
+    fn im2col_lrelu(&self, x: &GpuBuffer, out: &GpuBuffer,
+                    c_in: usize, t_in: usize, t_out: usize, k: usize,
+                    stride: usize, padding: usize, dilation: usize) -> Result<()> {
+        let n_elements = c_in * k * t_out;
+        let grid_x = cdiv(n_elements, 1024) as u32;
+        let rc: Vec<u32> = vec![
+            c_in as u32, t_in as u32, t_out as u32, k as u32,
+            stride as u32, padding as u32, dilation as u32,
+            grid_x, 1, 1,
+        ];
+        let uavs = [
+            uav_f16(x, (c_in * t_in) as u32),
+            uav_f16(out, n_elements as u32),
+        ];
+        self.gpu.record_dispatch(&self.kernels.im2col_lrelu, &rc, &uavs, [grid_x, 1, 1])
+            .map_err(|e| anyhow::anyhow!("im2col_lrelu: {e}"))
+    }
+
+    fn matmul_bias(&self, a: &GpuBuffer, b: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
+                   m: usize, n: usize, k: usize) -> Result<()> {
+        let grid_x = cdiv(m, 32) as u32;
+        let grid_y = cdiv(n, 32) as u32;
+        let rc: Vec<u32> = vec![
+            m as u32, n as u32, k as u32,
+            k as u32, 1,    // stride_am, stride_ak
+            n as u32, 1,    // stride_bk, stride_bn
+            n as u32, 1,    // stride_cm, stride_cn
+            grid_x, grid_y, 1,
+        ];
+        let uavs = [
+            uav_f16(a, (m * k) as u32),
+            uav_f16(b, (k * n) as u32),
+            uav_f16(bias, m as u32),
+            uav_f16(out, (m * n) as u32),
+        ];
+        self.gpu.record_dispatch(&self.kernels.matmul_bias, &rc, &uavs, [grid_x, grid_y, 1])
+            .map_err(|e| anyhow::anyhow!("matmul_bias: {e}"))
     }
 }

@@ -267,6 +267,76 @@ def adain_snake_fused(
     tl.store(out_ptr + base + t_offsets, out.to(tl.float16), mask=mask)
 
 
+# ─── Im2col for conv1d: rearrange input for matmul-based convolution ──────────
+
+@triton.jit
+def im2col_conv1d(
+    x_ptr, out_ptr,
+    C_in, T_in, T_out, K,
+    stride, padding, dilation,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Im2col for conv1d: reshape [C_in, T_in] → [C_in*K, T_out].
+
+    For each output column t_out, gather K values from each input channel:
+      out[c*K + ki, t_out] = x[c, t_out*stride - padding + ki*dilation]
+
+    Grid: [cdiv(C_in * K * T_out, BLOCK_SIZE), 1, 1]
+    """
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    n_elements = C_in * K * T_out
+    mask = offsets < n_elements
+
+    # Map flat index → (row, col) in output [C_in*K, T_out]
+    t_out_idx = offsets % T_out
+    row = offsets // T_out  # row in [0, C_in*K)
+    c = row // K
+    ki = row % K
+
+    # Input position
+    t_in_pos = t_out_idx * stride - padding + ki * dilation
+    valid = mask & (t_in_pos >= 0) & (t_in_pos < T_in)
+
+    x_idx = c * T_in + t_in_pos
+    val = tl.load(x_ptr + x_idx, mask=valid, other=0.0)
+    tl.store(out_ptr + offsets, val, mask=mask)
+
+
+# ─── Im2col with fused leaky_relu on input ────────────────────────────────────
+
+@triton.jit
+def im2col_conv1d_act(
+    x_ptr, out_ptr,
+    C_in, T_in, T_out, K,
+    stride, padding, dilation,
+    BLOCK_SIZE: tl.constexpr,
+    ACTIVATION: tl.constexpr = None,
+):
+    """Im2col for conv1d with optional activation on input values.
+
+    Grid: [cdiv(C_in * K * T_out, BLOCK_SIZE), 1, 1]
+    """
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    n_elements = C_in * K * T_out
+    mask = offsets < n_elements
+
+    t_out_idx = offsets % T_out
+    row = offsets // T_out
+    c = row // K
+    ki = row % K
+
+    t_in_pos = t_out_idx * stride - padding + ki * dilation
+    valid = mask & (t_in_pos >= 0) & (t_in_pos < T_in)
+
+    x_idx = c * T_in + t_in_pos
+    val = tl.load(x_ptr + x_idx, mask=valid, other=0.0).to(tl.float32)
+    if ACTIVATION:
+        val = ACTIVATION(val)
+    tl.store(out_ptr + offsets, val.to(tl.float16), mask=mask)
+
+
 # ─── Element-wise add: out = a + b ────────────────────────────────────────────
 
 @triton.jit

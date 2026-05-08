@@ -320,6 +320,8 @@ def gen_kokoro_metal(metadata, kokoro_kernels):
     lines.append("")
 
     kokoro_names = [cfg[0] for cfg in kokoro_kernels]
+    # Include shared matmul kernel needed by kokoro
+    shared_kernels = ["matmul_bias_fp16_32x32x32"]
 
     # kernel_data — aarch64
     lines.append('#[cfg(target_arch = "aarch64")]')
@@ -327,6 +329,8 @@ def gen_kokoro_metal(metadata, kokoro_kernels):
     lines.append("    pub fn load_kernel(name: &str) -> Option<&'static [u8]> {")
     lines.append("        match name {")
     for name in kokoro_names:
+        lines.append(f'            "{name}" => Some(include_bytes!("../metal/{name}.metallib")),')
+    for name in shared_kernels:
         lines.append(f'            "{name}" => Some(include_bytes!("../metal/{name}.metallib")),')
     lines.append("            _ => None,")
     lines.append("        }")
@@ -341,6 +345,8 @@ def gen_kokoro_metal(metadata, kokoro_kernels):
     lines.append("        match name {")
     for name in kokoro_names:
         lines.append(f'            "{name}" => Some(include_bytes!("../metal_nosimd/{name}.metallib")),')
+    for name in shared_kernels:
+        lines.append(f'            "{name}" => Some(include_bytes!("../metal_nosimd/{name}.metallib")),')
     lines.append("            _ => None,")
     lines.append("        }")
     lines.append("    }")
@@ -354,6 +360,7 @@ def gen_kokoro_metal(metadata, kokoro_kernels):
         meta = metadata.get(name)
         if meta:
             lines.append(f"    pub {meta['alias']}: ComputePipeline,")
+    lines.append("    pub matmul_bias: ComputePipeline,")
     lines.append("}")
     lines.append("")
 
@@ -383,6 +390,7 @@ def gen_kokoro_metal(metadata, kokoro_kernels):
         meta = metadata.get(name)
         if meta:
             lines.append(f'            {meta["alias"]}: load("{name}", "{func_name}")?,')
+    lines.append(f'            matmul_bias: load("matmul_bias_fp16_32x32x32", "matmul_bias_fp16")?,')
     lines.append("        })")
     lines.append("    }")
     lines.append("}")
@@ -408,6 +416,9 @@ def gen_kokoro_d3d12(metadata, kokoro_kernels):
             continue
         const_name = f"DXIL_KOKORO_{meta['alias'].upper()}"
         lines.append(f'const {const_name}: &[u8] = include_bytes!("../dxil/{name}.dxil");')
+    # Shared matmul kernel (from moonshine, used for im2col-based conv1d)
+    if (dxil_dir / "matmul_bias_fp16_32x32x32.dxil").exists():
+        lines.append(f'const DXIL_MATMUL_BIAS_32X32: &[u8] = include_bytes!("../dxil/matmul_bias_fp16_32x32x32.dxil");')
     lines.append("")
 
     # KokoroD3D12Kernels struct
@@ -420,6 +431,7 @@ def gen_kokoro_d3d12(metadata, kokoro_kernels):
         if not (dxil_dir / f"{name}.dxil").exists():
             continue
         lines.append(f"    pub(crate) {meta['alias']}: ID3D12PipelineState,")
+    lines.append("    pub(crate) matmul_bias: ID3D12PipelineState,")
     lines.append("}")
     lines.append("")
 
@@ -441,6 +453,7 @@ def gen_kokoro_d3d12(metadata, kokoro_kernels):
             continue
         const_name = f"DXIL_KOKORO_{meta['alias'].upper()}"
         lines.append(f'            {meta["alias"]}: load_pso("{name}", {const_name})?,')
+    lines.append(f'            matmul_bias: load_pso("matmul_bias_fp16_32x32x32", DXIL_MATMUL_BIAS_32X32)?,')
     lines.append("        })")
     lines.append("    }")
     lines.append("}")

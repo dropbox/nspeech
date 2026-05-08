@@ -85,4 +85,40 @@ pub trait KokoroGpuBackend {
 
     /// Reflection pad1d (pad_left=1, pad_right=0): out is [C, T+1].
     fn reflection_pad1d(&self, x: &Self::Buf, out: &Self::Buf, channels: usize, seq_len: usize) -> Result<()>;
+
+    /// Im2col: rearrange [C_in, T_in] → [C_in*K, T_out] for matmul-based conv1d.
+    fn im2col(&self, x: &Self::Buf, out: &Self::Buf,
+              c_in: usize, t_in: usize, t_out: usize, k: usize,
+              stride: usize, padding: usize, dilation: usize) -> Result<()>;
+
+    /// Im2col with fused leaky_relu(0.1) on input values.
+    fn im2col_lrelu(&self, x: &Self::Buf, out: &Self::Buf,
+                    c_in: usize, t_in: usize, t_out: usize, k: usize,
+                    stride: usize, padding: usize, dilation: usize) -> Result<()> {
+        self.im2col(x, out, c_in, t_in, t_out, k, stride, padding, dilation)
+    }
+
+    /// Matmul with bias: out[M,N] = A[M,K] @ B[K,N] + bias[M].
+    /// Used for im2col-based conv1d: W[C_out, C_in*K] @ im2col[C_in*K, T_out] + bias[C_out].
+    fn matmul_bias(&self, a: &Self::Buf, b: &Self::Buf, bias: &Self::Buf, out: &Self::Buf,
+                   m: usize, n: usize, k: usize) -> Result<()>;
+
+    /// Conv1d via im2col + matmul. Default impl chains im2col → matmul_bias.
+    /// Faster than naive conv1d on GPUs with weak scalar ALUs (Intel UHD).
+    fn conv1d_matmul(&self, x: &Self::Buf, w: &Self::Buf, bias: &Self::Buf, out: &Self::Buf,
+                     c_in: usize, c_out: usize, t_in: usize, t_out: usize,
+                     k: usize, stride: usize, padding: usize, dilation: usize) -> Result<()> {
+        let col_buf = self.alloc(c_in * k * t_out)?;
+        self.im2col(x, &col_buf, c_in, t_in, t_out, k, stride, padding, dilation)?;
+        self.matmul_bias(w, &col_buf, bias, out, c_out, t_out, c_in * k)
+    }
+
+    /// Conv1d via im2col(with fused lrelu 0.1) + matmul.
+    fn conv1d_matmul_lrelu(&self, x: &Self::Buf, w: &Self::Buf, bias: &Self::Buf, out: &Self::Buf,
+                           c_in: usize, c_out: usize, t_in: usize, t_out: usize,
+                           k: usize, stride: usize, padding: usize, dilation: usize) -> Result<()> {
+        let col_buf = self.alloc(c_in * k * t_out)?;
+        self.im2col_lrelu(x, &col_buf, c_in, t_in, t_out, k, stride, padding, dilation)?;
+        self.matmul_bias(w, &col_buf, bias, out, c_out, t_out, c_in * k)
+    }
 }
