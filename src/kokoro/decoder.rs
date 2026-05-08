@@ -344,7 +344,7 @@ impl Generator {
 
         let har_source = self.generate_harmonic_source(f0, 1, t_frames, self.m_source_weight.device(), dtype)?;
         let har_buf = upload_activation(gpu, &har_source.to_dtype(DType::F16)?)?;
-        let har_c = har_source.dim(1)?; // 22
+        let har_c = har_source.dim(1)?;
 
         // Precompute all adain gamma/beta for resblocks + noise_res and upload to GPU
         let all_resblock_params: Vec<Vec<(G::Buf, G::Buf)>> = self.resblocks.iter()
@@ -369,7 +369,7 @@ impl Generator {
             let (src_buf, src_c, src_t) = buf_conv1d(gpu, &har_buf, nc_w, nc_b, har_c, har_t, nc_padding, nc_stride, 1)?;
             let src_buf = self.noise_res[stage].forward_gpu_precomputed(&src_buf, &all_noise_params[stage], gpu, src_c, src_t)?;
 
-            // Fused leaky_relu(0.1) + ConvTranspose1d upsample
+            // Leaky_relu(0.1) + ConvTranspose1d upsample
             let up_stride = if stage == 0 { 10 } else { 6 };
             let up_padding = (up_w.dim(2)? - up_stride) / 2;
             let (h_new, new_c, new_t) = buf_conv_transpose1d_lrelu(gpu, &h_buf, up_w, up_b, h_c, h_t, up_padding, up_stride)?;
@@ -398,10 +398,11 @@ impl Generator {
             h_buf = gpu.scale(&sum, n, 1.0 / 3.0)?;
         }
 
-        // Fused leaky_relu(0.01) + conv_post
+        // Leaky_relu(0.01) + conv_post
         let (h_buf, h_c, h_t) = buf_conv1d_lrelu001(gpu, &h_buf, &self.conv_post_weight, &self.conv_post_bias, h_c, h_t, 3, 1, 1)?;
 
         // Download and do iSTFT on CPU
+        let _ = self.conv_post_weight.device().as_metal_device().map(|md| md.wait_until_completed());
         let out_data = gpu.download_f16(&h_buf, h_c * h_t)?;
         let h = Tensor::from_vec(out_data, &[1, h_c, h_t][..], &device)?.to_dtype(DType::F32)?;
         let n_fft = self.istft_n_fft;
@@ -463,7 +464,7 @@ impl Generator {
 
         // Split into magnitude + phase
         let n_fft = self.istft_n_fft;
-        let n_bins = n_fft / 2 + 1; // 11
+        let n_bins = n_fft / 2 + 1;
         let mag = h.narrow(1, 0, n_bins)?.exp()?;
         let phase = h.narrow(1, n_bins, n_bins)?.sin()?;
 
@@ -643,7 +644,6 @@ impl ResBlock {
         for i in 0..3 {
             let residual = h.clone();
 
-            // adain1[i] params are at index i
             let alpha1_buf = upload_weight(gpu, &self.alpha1[i].reshape(channels)?)?;
             let out = gpu.alloc(n)?;
             gpu.adain_snake(&h, &adain_params[i].0, &adain_params[i].1, &alpha1_buf, &out, channels, seq_len)?;
@@ -655,7 +655,6 @@ impl ResBlock {
             let (h_new, _, _) = buf_conv1d(gpu, &h, w1, b1, channels, seq_len, padding1, 1, dilation)?;
             h = h_new;
 
-            // adain2[i] params are at index 3+i
             let alpha2_buf = upload_weight(gpu, &self.alpha2[i].reshape(channels)?)?;
             let out = gpu.alloc(n)?;
             gpu.adain_snake(&h, &adain_params[3 + i].0, &adain_params[3 + i].1, &alpha2_buf, &out, channels, seq_len)?;
