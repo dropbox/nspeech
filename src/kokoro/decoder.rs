@@ -15,12 +15,18 @@
 
 use anyhow::Result;
 use candle_core::Tensor;
+#[cfg(any(all(feature = "triton-metal", target_arch = "aarch64"), feature = "triton-d3d12"))]
+use candle_core::DType;
 use candle_nn::{Linear, Module, VarBuilder};
 
 use super::config::KokoroConfig;
 
-#[cfg(feature = "triton-metal")]
+#[cfg(any(all(feature = "triton-metal", target_arch = "aarch64"), feature = "triton-d3d12"))]
+use super::gpu_backend::KokoroGpuBackend;
+#[cfg(all(feature = "triton-metal", target_arch = "aarch64"))]
 use super::gpu_decoder::KokoroGpuDecoder;
+#[cfg(feature = "triton-d3d12")]
+use super::gpu_decoder_d3d12::KokoroGpuDecoderD3D12;
 
 
 pub struct ISTFTNetDecoder {
@@ -118,24 +124,29 @@ impl ISTFTNetDecoder {
     }
 
     pub fn forward(&self, asr: &Tensor, f0: &Tensor, n: &Tensor, style: &Tensor) -> Result<Tensor> {
-        #[cfg(feature = "triton-metal")]
+        #[cfg(all(feature = "triton-metal", target_arch = "aarch64"))]
         {
-            if let Ok(Some(gpu)) = KokoroGpuDecoder::new(asr.device()) {
+            if let Ok(Some(gpu)) = KokoroGpuDecoder::try_new(asr.device()) {
+                return self.forward_gpu(asr, f0, n, style, &gpu);
+            }
+        }
+        #[cfg(feature = "triton-d3d12")]
+        {
+            if let Ok(Some(gpu)) = KokoroGpuDecoderD3D12::try_new() {
                 return self.forward_gpu(asr, f0, n, style, &gpu);
             }
         }
         self.forward_inner(asr, f0, n, style)
     }
 
-    #[cfg(feature = "triton-metal")]
-    fn forward_gpu(&self, asr: &Tensor, f0: &Tensor, n: &Tensor, style: &Tensor, gpu: &KokoroGpuDecoder) -> Result<Tensor> {
+    #[cfg(any(all(feature = "triton-metal", target_arch = "aarch64"), feature = "triton-d3d12"))]
+    fn forward_gpu<G: KokoroGpuBackend>(&self, asr: &Tensor, f0: &Tensor, n: &Tensor, style: &Tensor, gpu: &G) -> Result<Tensor> {
         let f0_feat = f0.unsqueeze(1)?.conv1d(&self.f0_conv_weight, 1, 2, 1, 1)?;
         let f0_feat = f0_feat.broadcast_add(&self.f0_conv_bias.unsqueeze(0)?.unsqueeze(2)?)?;
         let n_feat = n.unsqueeze(1)?.conv1d(&self.n_conv_weight, 1, 2, 1, 1)?;
         let n_feat = n_feat.broadcast_add(&self.n_conv_bias.unsqueeze(0)?.unsqueeze(2)?)?;
 
         let x = Tensor::cat(&[asr, &f0_feat, &n_feat], 1)?;
-
         let encoded = self.encode.forward(&x, style)?;
 
         let asr_res = asr.conv1d(&self.asr_res_weight, 0, 1, 1, 1)?;
@@ -325,56 +336,74 @@ impl Generator {
         })
     }
 
-    #[cfg(feature = "triton-metal")]
-    fn forward_gpu(&self, x: &Tensor, f0: &Tensor, style: &Tensor, gpu: &KokoroGpuDecoder) -> Result<Tensor> {
-        let device = x.device();
+    #[cfg(any(all(feature = "triton-metal", target_arch = "aarch64"), feature = "triton-d3d12"))]
+    fn forward_gpu<G: KokoroGpuBackend>(&self, x: &Tensor, f0: &Tensor, style: &Tensor, gpu: &G) -> Result<Tensor> {
         let dtype = x.dtype();
-        let (_batch, _, t_frames) = x.dims3()?;
+        let (_batch, c_in, t_frames) = x.dims3()?;
+        let device = x.device().clone();
 
-        let har_source = self.generate_harmonic_source(f0, 1, t_frames, device, dtype)?;
+        let har_source = self.generate_harmonic_source(f0, 1, t_frames, self.m_source_weight.device(), dtype)?;
+        let har_buf = upload_activation(gpu, &har_source.to_dtype(DType::F16)?)?;
+        let har_c = har_source.dim(1)?; // 22
 
-        let mut h = x.clone();
+        // Precompute all adain gamma/beta for resblocks + noise_res and upload to GPU
+        let all_resblock_params: Vec<Vec<(G::Buf, G::Buf)>> = self.resblocks.iter()
+            .map(|rb| rb.precompute_adain_params(style, gpu))
+            .collect::<Result<_>>()?;
+        let all_noise_params: Vec<Vec<(G::Buf, G::Buf)>> = self.noise_res.iter()
+            .map(|rb| rb.precompute_adain_params(style, gpu))
+            .collect::<Result<_>>()?;
+
+        let mut h_buf = upload_activation(gpu, &x.to_dtype(DType::F16)?)?;
+        let mut h_c = c_in;
+        let mut h_t = t_frames;
         let num_ups = self.ups.len();
 
         for (stage, (up_w, up_b)) in self.ups.iter().enumerate() {
-            h = gpu.leaky_relu(&h, 0.1)?;
-            h = h.to_dtype(candle_core::DType::F32)?;
-
-            // Noise source injection
+            // Noise source: conv1d(har_source) → noise_res
             let (nc_w, nc_b) = &self.noise_convs[stage];
             let nc_stride = self.noise_conv_strides[stage];
-            let nc_padding = if nc_w.dim(2)? > 1 { (nc_stride + 1) / 2 } else { 0 };
-            let x_source = har_source.conv1d(nc_w, nc_padding, nc_stride, 1, 1)?;
-            let x_source = x_source.broadcast_add(&nc_b.unsqueeze(0)?.unsqueeze(2)?)?;
-            let x_source = self.noise_res[stage].forward_gpu(&x_source, style, gpu)?;
+            let nc_k = nc_w.dim(2)?;
+            let nc_padding = if nc_k > 1 { (nc_stride + 1) / 2 } else { 0 };
+            let har_t = har_source.dim(2)?;
+            let (src_buf, src_c, src_t) = buf_conv1d(gpu, &har_buf, nc_w, nc_b, har_c, har_t, nc_padding, nc_stride, 1)?;
+            let src_buf = self.noise_res[stage].forward_gpu_precomputed(&src_buf, &all_noise_params[stage], gpu, src_c, src_t)?;
 
-            // Upsample via conv_transpose1d
+            // Fused leaky_relu(0.1) + ConvTranspose1d upsample
             let up_stride = if stage == 0 { 10 } else { 6 };
             let up_padding = (up_w.dim(2)? - up_stride) / 2;
-            h = h.conv_transpose1d(up_w, up_padding, 0, up_stride, 1, 1)?;
-            h = h.broadcast_add(&up_b.unsqueeze(0)?.unsqueeze(2)?)?.contiguous()?;
+            let (h_new, new_c, new_t) = buf_conv_transpose1d_lrelu(gpu, &h_buf, up_w, up_b, h_c, h_t, up_padding, up_stride)?;
+            h_buf = h_new;
+            h_c = new_c;
+            h_t = new_t;
 
+            // Reflection pad on last stage
             if stage == num_ups - 1 {
-                h = reflection_pad1d(&h, 1, 0)?;
+                let (padded, new_t) = buf_reflection_pad1d(gpu, &h_buf, h_c, h_t, 1, 0)?;
+                h_buf = padded;
+                h_t = new_t;
             }
 
-            // x_source is F32 (from resblock forward_gpu which outputs F32)
-            h = (h + x_source)?;
+            // h = h + x_source
+            let n = h_c * h_t;
+            h_buf = gpu.add(&h_buf, &src_buf, n)?;
 
-            // Resblocks with GPU-fused AdaIN+Snake
+            // 3 resblocks averaged (using precomputed gamma/beta)
             let base = stage * 3;
-            let mut sum = self.resblocks[base].forward_gpu(&h, style, gpu)?;
-            sum = (sum + self.resblocks[base + 1].forward_gpu(&h, style, gpu)?)?;
-            sum = (sum + self.resblocks[base + 2].forward_gpu(&h, style, gpu)?)?;
-            h = (sum / 3.0)?;
+            let r0 = self.resblocks[base].forward_gpu_precomputed(&h_buf, &all_resblock_params[base], gpu, h_c, h_t)?;
+            let r1 = self.resblocks[base + 1].forward_gpu_precomputed(&h_buf, &all_resblock_params[base + 1], gpu, h_c, h_t)?;
+            let r2 = self.resblocks[base + 2].forward_gpu_precomputed(&h_buf, &all_resblock_params[base + 2], gpu, h_c, h_t)?;
+            let sum = gpu.add(&r0, &r1, n)?;
+            let sum = gpu.add(&sum, &r2, n)?;
+            h_buf = gpu.scale(&sum, n, 1.0 / 3.0)?;
         }
 
-        // Final: leaky_relu + conv_post
-        h = gpu.leaky_relu(&h, 0.01)?;
-        h = h.to_dtype(candle_core::DType::F32)?;
-        let h = h.conv1d(&self.conv_post_weight, 3, 1, 1, 1)?;
-        let h = h.broadcast_add(&self.conv_post_bias.unsqueeze(0)?.unsqueeze(2)?)?;
+        // Fused leaky_relu(0.01) + conv_post
+        let (h_buf, h_c, h_t) = buf_conv1d_lrelu001(gpu, &h_buf, &self.conv_post_weight, &self.conv_post_bias, h_c, h_t, 3, 1, 1)?;
 
+        // Download and do iSTFT on CPU
+        let out_data = gpu.download_f16(&h_buf, h_c * h_t)?;
+        let h = Tensor::from_vec(out_data, &[1, h_c, h_t][..], &device)?.to_dtype(DType::F32)?;
         let n_fft = self.istft_n_fft;
         let n_bins = n_fft / 2 + 1;
         let mag = h.narrow(1, 0, n_bins)?.exp()?;
@@ -497,39 +526,147 @@ impl Generator {
     }
 }
 
-#[cfg(feature = "triton-metal")]
+// ── Tensor↔Buffer bridge: all GPU work stays in buffer space ──
+
+#[cfg(any(all(feature = "triton-metal", target_arch = "aarch64"), feature = "triton-d3d12"))]
+fn tensor_id_usize(t: &Tensor) -> usize {
+    let id = t.id();
+    unsafe { std::mem::transmute::<candle_core::TensorId, usize>(id) }
+}
+
+#[cfg(any(all(feature = "triton-metal", target_arch = "aarch64"), feature = "triton-d3d12"))]
+fn tensor_to_f16_vec(t: &Tensor) -> Result<Vec<half::f16>> {
+    t.to_dtype(DType::F16)?.flatten_all()?.to_vec1::<half::f16>().map_err(Into::into)
+}
+
+/// Upload a weight tensor (cached by TensorId).
+#[cfg(any(all(feature = "triton-metal", target_arch = "aarch64"), feature = "triton-d3d12"))]
+fn upload_weight<G: KokoroGpuBackend>(gpu: &G, t: &Tensor) -> Result<G::Buf> {
+    let data = tensor_to_f16_vec(t)?;
+    gpu.upload_weight(tensor_id_usize(t), &data)
+}
+
+/// Upload an activation tensor (not cached).
+#[cfg(any(all(feature = "triton-metal", target_arch = "aarch64"), feature = "triton-d3d12"))]
+fn upload_activation<G: KokoroGpuBackend>(gpu: &G, t: &Tensor) -> Result<G::Buf> {
+    let data = tensor_to_f16_vec(t)?;
+    gpu.upload_f16(&data)
+}
+
+/// GPU conv1d operating entirely in buffer space.
+/// Uses specialized unrolled kernel when K is 3, 7, or 11.
+#[cfg(any(all(feature = "triton-metal", target_arch = "aarch64"), feature = "triton-d3d12"))]
+fn buf_conv1d<G: KokoroGpuBackend>(
+    gpu: &G, x: &G::Buf, w: &Tensor, b: &Tensor,
+    c_in: usize, t_in: usize, padding: usize, stride: usize, dilation: usize,
+) -> Result<(G::Buf, usize, usize)> {
+    let (c_out, _, k) = w.dims3()?;
+    let t_out = (t_in + 2 * padding - dilation * (k - 1) - 1) / stride + 1;
+    let w_buf = upload_weight(gpu, w)?;
+    let b_buf = upload_weight(gpu, b)?;
+    let out = gpu.alloc(c_out * t_out)?;
+    gpu.conv1d_k(x, &w_buf, &b_buf, &out, c_in, c_out, t_in, t_out, k, stride, padding, dilation)?;
+    Ok((out, c_out, t_out))
+}
+
+/// Fused leaky_relu(0.1) + conv_transpose1d (activation applied to input on load).
+#[cfg(any(all(feature = "triton-metal", target_arch = "aarch64"), feature = "triton-d3d12"))]
+fn buf_conv_transpose1d_lrelu<G: KokoroGpuBackend>(
+    gpu: &G, x: &G::Buf, w: &Tensor, b: &Tensor,
+    c_in: usize, t_in: usize, padding: usize, stride: usize,
+) -> Result<(G::Buf, usize, usize)> {
+    let (_, c_out, k) = w.dims3()?;
+    let t_out = (t_in - 1) * stride - 2 * padding + k;
+    let w_buf = upload_weight(gpu, w)?;
+    let b_buf = upload_weight(gpu, b)?;
+    let out = gpu.alloc(c_out * t_out)?;
+    gpu.conv_transpose1d_lrelu(x, &w_buf, &b_buf, &out, c_in, c_out, t_in, t_out, k, stride, padding)?;
+    Ok((out, c_out, t_out))
+}
+
+/// Fused leaky_relu(0.01) + conv1d (activation applied to input on load).
+#[cfg(any(all(feature = "triton-metal", target_arch = "aarch64"), feature = "triton-d3d12"))]
+fn buf_conv1d_lrelu001<G: KokoroGpuBackend>(
+    gpu: &G, x: &G::Buf, w: &Tensor, b: &Tensor,
+    c_in: usize, t_in: usize, padding: usize, stride: usize, dilation: usize,
+) -> Result<(G::Buf, usize, usize)> {
+    let (c_out, _, k) = w.dims3()?;
+    let t_out = (t_in + 2 * padding - dilation * (k - 1) - 1) / stride + 1;
+    let w_buf = upload_weight(gpu, w)?;
+    let b_buf = upload_weight(gpu, b)?;
+    let out = gpu.alloc(c_out * t_out)?;
+    gpu.conv1d_lrelu001(x, &w_buf, &b_buf, &out, c_in, c_out, t_in, t_out, k, stride, padding, dilation)?;
+    Ok((out, c_out, t_out))
+}
+
+/// Reflection pad1d (pad_left=1, pad_right=0) entirely on GPU.
+#[cfg(any(all(feature = "triton-metal", target_arch = "aarch64"), feature = "triton-d3d12"))]
+fn buf_reflection_pad1d<G: KokoroGpuBackend>(
+    gpu: &G, x: &G::Buf, channels: usize, seq_len: usize, _pad_left: usize, _pad_right: usize,
+) -> Result<(G::Buf, usize)> {
+    let new_len = seq_len + 1;
+    let out = gpu.alloc(channels * new_len)?;
+    gpu.reflection_pad1d(x, &out, channels, seq_len)?;
+    Ok((out, new_len))
+}
+
+#[cfg(any(all(feature = "triton-metal", target_arch = "aarch64"), feature = "triton-d3d12"))]
 impl ResBlock {
-    fn forward_gpu(&self, x: &Tensor, style: &Tensor, gpu: &KokoroGpuDecoder) -> Result<Tensor> {
+    /// Precompute all adain gamma/beta pairs on CPU and upload to GPU.
+    /// Returns 6 pairs: (gamma_buf, beta_buf) for adain1[0..3] then adain2[0..3].
+    fn precompute_adain_params<G: KokoroGpuBackend>(&self, style: &Tensor, gpu: &G) -> Result<Vec<(G::Buf, G::Buf)>> {
+        let mut params = Vec::with_capacity(6);
+        for i in 0..3 {
+            let p = self.adain1[i].forward(style)?;
+            let gamma = tensor_to_f16_vec(&p.narrow(1, 0, self.channels)?.reshape(self.channels)?.to_dtype(DType::F16)?)?;
+            let beta = tensor_to_f16_vec(&p.narrow(1, self.channels, self.channels)?.reshape(self.channels)?.to_dtype(DType::F16)?)?;
+            params.push((gpu.upload_f16(&gamma)?, gpu.upload_f16(&beta)?));
+        }
+        for i in 0..3 {
+            let p = self.adain2[i].forward(style)?;
+            let gamma = tensor_to_f16_vec(&p.narrow(1, 0, self.channels)?.reshape(self.channels)?.to_dtype(DType::F16)?)?;
+            let beta = tensor_to_f16_vec(&p.narrow(1, self.channels, self.channels)?.reshape(self.channels)?.to_dtype(DType::F16)?)?;
+            params.push((gpu.upload_f16(&gamma)?, gpu.upload_f16(&beta)?));
+        }
+        Ok(params)
+    }
+
+    /// Forward with precomputed adain params (no CPU work in the hot loop).
+    fn forward_gpu_precomputed<G: KokoroGpuBackend>(
+        &self, x: &G::Buf, adain_params: &[(G::Buf, G::Buf)], gpu: &G,
+        channels: usize, seq_len: usize,
+    ) -> Result<G::Buf> {
         let dilations = [1usize, 3, 5];
+        let n = channels * seq_len;
         let mut h = x.clone();
 
         for i in 0..3 {
             let residual = h.clone();
+
+            // adain1[i] params are at index i
+            let alpha1_buf = upload_weight(gpu, &self.alpha1[i].reshape(channels)?)?;
+            let out = gpu.alloc(n)?;
+            gpu.adain_snake(&h, &adain_params[i].0, &adain_params[i].1, &alpha1_buf, &out, channels, seq_len)?;
+            h = out;
+
             let dilation = dilations[i];
             let padding1 = (self.kernel_size - 1) * dilation / 2;
-            let padding2 = (self.kernel_size - 1) / 2;
-
-            let params = self.adain1[i].forward(style)?;
-            let gamma = params.narrow(1, 0, self.channels)?.contiguous()?;
-            let beta = params.narrow(1, self.channels, self.channels)?.contiguous()?;
-            h = gpu.adain_snake(&h, &gamma, &beta, &self.alpha1[i])?;
-            h = h.to_dtype(candle_core::DType::F32)?;
-
             let (w1, b1) = &self.convs1[i];
-            h = h.conv1d(w1, padding1, 1, dilation, 1)?;
-            h = h.broadcast_add(&b1.unsqueeze(0)?.unsqueeze(2)?)?;
+            let (h_new, _, _) = buf_conv1d(gpu, &h, w1, b1, channels, seq_len, padding1, 1, dilation)?;
+            h = h_new;
 
-            let params = self.adain2[i].forward(style)?;
-            let gamma = params.narrow(1, 0, self.channels)?.contiguous()?;
-            let beta = params.narrow(1, self.channels, self.channels)?.contiguous()?;
-            h = gpu.adain_snake(&h, &gamma, &beta, &self.alpha2[i])?;
-            h = h.to_dtype(candle_core::DType::F32)?;
+            // adain2[i] params are at index 3+i
+            let alpha2_buf = upload_weight(gpu, &self.alpha2[i].reshape(channels)?)?;
+            let out = gpu.alloc(n)?;
+            gpu.adain_snake(&h, &adain_params[3 + i].0, &adain_params[3 + i].1, &alpha2_buf, &out, channels, seq_len)?;
+            h = out;
 
+            let padding2 = (self.kernel_size - 1) / 2;
             let (w2, b2) = &self.convs2[i];
-            h = h.conv1d(w2, padding2, 1, 1, 1)?;
-            h = h.broadcast_add(&b2.unsqueeze(0)?.unsqueeze(2)?)?;
+            let (h_new, _, _) = buf_conv1d(gpu, &h, w2, b2, channels, seq_len, padding2, 1, 1)?;
+            h = h_new;
 
-            h = (h + residual)?;
+            h = gpu.add(&h, &residual, n)?;
         }
 
         Ok(h)
@@ -630,6 +767,8 @@ fn leaky_relu(x: &Tensor, negative_slope: f64) -> Result<Tensor> {
 }
 
 fn reflection_pad1d(x: &Tensor, pad_left: usize, pad_right: usize) -> Result<Tensor> {
+    let orig_dtype = x.dtype();
+    let orig_device = x.device().clone();
     let x = x.to_dtype(candle_core::DType::F32)?;
     let (batch, channels, len) = x.dims3()?;
     let new_len = len + pad_left + pad_right;
@@ -650,7 +789,8 @@ fn reflection_pad1d(x: &Tensor, pad_left: usize, pad_right: usize) -> Result<Ten
             }
         }
     }
-    Tensor::from_vec(out, (batch, channels, new_len), x.device()).map_err(Into::into)
+    let result = Tensor::from_vec(out, (batch, channels, new_len), &orig_device)?;
+    result.to_dtype(orig_dtype).map_err(Into::into)
 }
 
 fn snake_activation_tensor(x: &Tensor, alpha: &Tensor) -> Result<Tensor> {

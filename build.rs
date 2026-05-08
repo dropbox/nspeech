@@ -40,7 +40,9 @@ fn main() {
     // Sources that affect kernel output — rerun build.rs when these change
     let kernel_sources = &[
         "kernels/moonshine_kernels.py",
+        "kernels/kokoro_kernels.py",
         "kernels/kernel_configs.py",
+        "kernels/kokoro_configs.py",
         "kernels/build.py",
         "kernels/compile_step.py",
         "kernels/gen_rust.py",

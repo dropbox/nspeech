@@ -52,26 +52,30 @@ def gen_ttir():
 
     from aot_compile import compile_kernel
     import moonshine_kernels as K
+    import kokoro_kernels as KK
     from kernel_configs import METAL_KERNELS, HLSL_EXTRA_KERNELS
+    from kokoro_configs import KOKORO_KERNELS
 
     ttir_dir = OUT / "ttir"
     ttir_dir.mkdir(parents=True, exist_ok=True)
 
-    # Collect all unique configs by name
+    # Collect all unique configs by name, with their source module
     configs = {}
     for cfg in METAL_KERNELS:
-        configs[cfg[0]] = cfg
+        configs[cfg[0]] = (cfg, K)
     for cfg in HLSL_EXTRA_KERNELS:
-        configs.setdefault(cfg[0], cfg)
+        configs.setdefault(cfg[0], (cfg, K))
+    for cfg in KOKORO_KERNELS:
+        configs.setdefault(cfg[0], (cfg, KK))
 
     print(f"Generating TTIR for {len(configs)} kernels...")
     t0 = time.time()
     ok = 0
 
-    for name, cfg in sorted(configs.items()):
+    for name, (cfg, module) in sorted(configs.items()):
         func_name, sig, nw, grid = cfg[1], cfg[2], cfg[3], cfg[4]
         opts = cfg[5] if len(cfg) > 5 else {}
-        fn = getattr(K, func_name, None)
+        fn = getattr(module, func_name, None)
         if fn is None:
             print(f"  {name}: SKIP (no {func_name})")
             continue
@@ -79,8 +83,6 @@ def gen_ttir():
             r = compile_kernel(fn=fn, signature=sig, num_warps=nw, grid=grid)
             ir = r.ttgir_text or r.ttir_text
             write_if_changed(ttir_dir / f"{name}.ttir", ir)
-            # Serialize constants — replace non-JSON-serializable objects (e.g.
-            # @triton.jit functions used as constexpr meta-parameters) with their name.
             serializable_constants = {}
             for k, v in r.constants.items():
                 if hasattr(v, '__name__'):
@@ -122,6 +124,7 @@ def gen_ninja_metal():
     """Write build_metal.ninja for TTIR → Apple Silicon metallib (simdgroup_matrix)."""
     sys.path.insert(0, str(SCRIPT_DIR))
     from kernel_configs import METAL_KERNELS
+    from kokoro_configs import KOKORO_KERNELS
 
     ttir = OUT / "ttir"
     metal = OUT / "metal"
@@ -133,7 +136,7 @@ def gen_ninja_metal():
     w.append("")
 
     libs = []
-    for cfg in METAL_KERNELS:
+    for cfg in list(METAL_KERNELS) + list(KOKORO_KERNELS):
         name = cfg[0]
         t = ttir / f"{name}.ttir"
         if not t.exists():
@@ -157,6 +160,7 @@ def gen_ninja_metal_nosimd():
     """Write build_metal_nosimd.ninja for TTIR → Metal metallib (no simdgroup_matrix)."""
     sys.path.insert(0, str(SCRIPT_DIR))
     from kernel_configs import METAL_KERNELS
+    from kokoro_configs import KOKORO_KERNELS
 
     ttir = OUT / "ttir"
     metal_nosimd = OUT / "metal_nosimd"
@@ -168,7 +172,7 @@ def gen_ninja_metal_nosimd():
     w.append("")
 
     libs = []
-    for cfg in METAL_KERNELS:
+    for cfg in list(METAL_KERNELS) + list(KOKORO_KERNELS):
         name = cfg[0]
         t = ttir / f"{name}.ttir"
         if not t.exists():
@@ -191,7 +195,8 @@ def gen_ninja_metal_nosimd():
 def gen_ninja_hlsl():
     """Write build_hlsl.ninja for TTIR → HLSL."""
     sys.path.insert(0, str(SCRIPT_DIR))
-    from kernel_configs import get_hlsl_kernels
+    from kernel_configs import get_hlsl_kernels, KERNEL_METADATA
+    from kokoro_configs import KOKORO_KERNELS
 
     ttir = OUT / "ttir"
     hlsl = OUT / "hlsl"
@@ -205,6 +210,21 @@ def gen_ninja_hlsl():
     hlsl_seen = set()
     for cfg in get_hlsl_kernels():
         name = cfg[0]
+        if name in hlsl_seen:
+            continue
+        hlsl_seen.add(name)
+        t = ttir / f"{name}.ttir"
+        if not t.exists():
+            continue
+        h = hlsl / f"{name}.hlsl"
+        w.append(f"build {h}: hlsl {t} {implicit}")
+        hlsl_files.append(str(h))
+    # Kokoro D3D12 kernels
+    for cfg in KOKORO_KERNELS:
+        name = cfg[0]
+        meta = KERNEL_METADATA.get(name)
+        if not meta or not meta.get("d3d12"):
+            continue
         if name in hlsl_seen:
             continue
         hlsl_seen.add(name)

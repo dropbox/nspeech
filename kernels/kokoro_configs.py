@@ -36,25 +36,55 @@ KOKORO_KERNELS = [
      "*fp16, *fp16, i32, 0.01, 1024",
      4, ["cdiv(n_elements, 1024)", "1", "1"]),
 
+    # ── Conv1d (simple, runtime K): one threadgroup per (C_out, t_block) ──
+    ("kokoro_conv1d", "conv1d_simple",
+     "*fp16, *fp16, *fp16, *fp16, i32, i32, i32, i32, i32, i32, i32, i32, 256",
+     4, ["C_out", "cdiv(T_out, 256)", "1"]),
+
+    # ── Conv1d with constexpr K (unrolled inner loop) ──
+    ("kokoro_conv1d_k3", "conv1d_k",
+     "*fp16, *fp16, *fp16, *fp16, i32, i32, i32, i32, i32, i32, i32, 256, 3",
+     4, ["C_out", "cdiv(T_out, 256)", "1"]),
+
+    ("kokoro_conv1d_k7", "conv1d_k",
+     "*fp16, *fp16, *fp16, *fp16, i32, i32, i32, i32, i32, i32, i32, 256, 7",
+     4, ["C_out", "cdiv(T_out, 256)", "1"]),
+
+    ("kokoro_conv1d_k11", "conv1d_k",
+     "*fp16, *fp16, *fp16, *fp16, i32, i32, i32, i32, i32, i32, i32, 256, 11",
+     4, ["C_out", "cdiv(T_out, 256)", "1"]),
+
+    # ── ConvTranspose1d (simple): one threadgroup per (C_out, t_block) ──
+    ("kokoro_conv_transpose1d", "conv_transpose1d_simple",
+     "*fp16, *fp16, *fp16, *fp16, i32, i32, i32, i32, i32, i32, i32, 256",
+     4, ["C_out", "cdiv(T_out, 256)", "1"]),
+
+    # ── Fused LeakyReLU(0.1) + ConvTranspose1d (saves a full buffer pass) ──
+    ("kokoro_conv_transpose1d_lrelu", "conv_transpose1d_act",
+     "*fp16, *fp16, *fp16, *fp16, i32, i32, i32, i32, i32, i32, i32, 256, leaky_relu_01_act",
+     4, ["C_out", "cdiv(T_out, 256)", "1"]),
+
+    # ── Fused LeakyReLU(0.01) + Conv1d (for final conv_post) ──
+    ("kokoro_conv1d_lrelu001", "conv1d_act",
+     "*fp16, *fp16, *fp16, *fp16, i32, i32, i32, i32, i32, i32, i32, i32, 256, leaky_relu_001_act",
+     4, ["C_out", "cdiv(T_out, 256)", "1"]),
+
+    # ── Reflection pad1d (pad_left=1, pad_right=0) ──
+    ("kokoro_reflection_pad1d", "reflection_pad1d_left1",
+     "*fp16, *fp16, i32, i32, 1024",
+     4, ["cdiv(n_channels * (seq_len + 1), 1024)", "1", "1"]),
+
+    # ── Element-wise add: out = a + b ──
+    ("kokoro_add", "elementwise_add",
+     "*fp16, *fp16, *fp16, i32, 1024",
+     4, ["cdiv(n_elements, 1024)", "1", "1"]),
+
+    # ── Element-wise scale by 1/3 (for resblock averaging) ──
+    ("kokoro_scale_third", "elementwise_scale_third",
+     "*fp16, *fp16, i32, 1024",
+     4, ["cdiv(n_elements, 1024)", "1", "1"]),
+
 ]
 
 
-# ── Kernel metadata for Rust codegen ────────────────────────────────────────
-
-KOKORO_METADATA = {
-    "kokoro_snake_activation": {
-        "alias": "snake", "group": "kokoro",
-    },
-    "kokoro_adain_snake_1024": {
-        "alias": "adain_snake_1k", "group": "kokoro",
-    },
-    "kokoro_leaky_relu_01": {
-        "alias": "leaky_relu_01", "group": "kokoro",
-    },
-    "kokoro_leaky_relu_02": {
-        "alias": "leaky_relu_02", "group": "kokoro",
-    },
-    "kokoro_leaky_relu_001": {
-        "alias": "leaky_relu_001", "group": "kokoro",
-    },
-}
+# Metadata lives in kernel_configs.py KERNEL_METADATA (group="kokoro", d3d12=True)

@@ -122,74 +122,99 @@ def leaky_relu_fp16(
     tl.store(out_ptr + offsets, out.to(tl.float16), mask=mask)
 
 
-# ─── Conv1d as matmul: im2col approach ──────────────────────────────────────
-# Express Conv1d [C_out, C_in, K] on [C_in, T] as a matmul:
-#   W[C_out, C_in*K] × im2col[C_in*K, T_out] → out[C_out, T_out]
-# Each thread block computes a [BLOCK_M, BLOCK_N] tile of the output.
+# ─── Conv1d: one threadgroup per output channel, BLOCK_T time steps ─────────
+# Simple approach: each threadgroup handles one output channel across BLOCK_T outputs.
+# Each thread computes one output element by accumulating over C_in * K.
 
 @triton.jit
-def conv1d_matmul(
+def conv1d_simple(
     x_ptr, w_ptr, bias_ptr, out_ptr,
     C_in, C_out, T_in, T_out, K,
     stride, padding, dilation,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    BLOCK_T: tl.constexpr,
 ):
-    """Conv1d expressed as tiled matmul with implicit im2col.
+    """Conv1d: one threadgroup per (c_out, t_block).
 
     x: [C_in, T_in] (fp16)
-    w: [C_out, C_in*K] (fp16, pre-reshaped for matmul)
+    w: [C_out, C_in, K] (fp16) — standard layout
     bias: [C_out] (fp16)
     out: [C_out, T_out] (fp16)
 
-    Grid: [cdiv(C_out, BLOCK_M) * cdiv(T_out, BLOCK_N), 1, 1]
-    Each program computes a BLOCK_M × BLOCK_N tile of output channels × time steps.
-    The K dimension of the matmul is C_in * kernel_size.
+    Grid: [C_out, cdiv(T_out, BLOCK_T), 1]
     """
-    n_tiles_n = (T_out + BLOCK_N - 1) // BLOCK_N
-    pid_m = tl.program_id(0) // n_tiles_n
-    pid_n = tl.program_id(0) % n_tiles_n
+    c_out_idx = tl.program_id(0)
+    t_block = tl.program_id(1)
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # output channel indices
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # output time indices
+    t_offs = t_block * BLOCK_T + tl.arange(0, BLOCK_T)
+    t_mask = t_offs < T_out
 
-    # Accumulator for the tile
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_T,), dtype=tl.float32)
 
-    # K-dim = C_in * kernel_size
-    total_k = C_in * K
-    for k_start in range(0, total_k, BLOCK_K):
-        k_offs = k_start + tl.arange(0, BLOCK_K)
-        k_mask = k_offs < total_k
+    for c in range(C_in):
+        for ki in range(K):
+            # Input position for this kernel tap
+            t_in_pos = t_offs * stride - padding + ki * dilation
+            valid = t_mask & (t_in_pos >= 0) & (t_in_pos < T_in)
 
-        # Load weight tile: W[offs_m, k_offs] where W is [C_out, C_in*K]
-        w_ptrs = w_ptr + offs_m[:, None] * total_k + k_offs[None, :]
-        w_mask = (offs_m[:, None] < C_out) & k_mask[None, :]
-        w = tl.load(w_ptrs, mask=w_mask, other=0.0)
+            # Load input: x[c, t_in_pos]
+            x_idx = c * T_in + t_in_pos
+            x_val = tl.load(x_ptr + x_idx, mask=valid, other=0.0).to(tl.float32)
 
-        # Load im2col tile: for each (k, t_out), compute which (c_in, t_in) to load
-        # k = c_in * K + kernel_pos → c_in = k // K, kernel_pos = k % K
-        c_in_idx = k_offs // K
-        kernel_pos = k_offs % K
-        # t_in = t_out * stride - padding + kernel_pos * dilation
-        t_in_base = offs_n * stride - padding  # [BLOCK_N]
-        t_in = t_in_base[None, :] + (kernel_pos * dilation)[:, None]  # [BLOCK_K, BLOCK_N]
+            # Load weight: w[c_out_idx, c, ki]
+            w_idx = c_out_idx * C_in * K + c * K + ki
+            w_val = tl.load(w_ptr + w_idx).to(tl.float32)
 
-        # Gather from x: x[c_in_idx, t_in]
-        x_idx = c_in_idx[:, None] * T_in + t_in  # [BLOCK_K, BLOCK_N]
-        valid = k_mask[:, None] & (t_in >= 0) & (t_in < T_in) & (offs_n[None, :] < T_out)
-        x_tile = tl.load(x_ptr + x_idx, mask=valid, other=0.0)  # [BLOCK_K, BLOCK_N]
-
-        # matmul: [BLOCK_M, BLOCK_K] × [BLOCK_K, BLOCK_N]
-        acc += tl.dot(w, x_tile)
+            acc += x_val * w_val
 
     # Add bias
-    bias = tl.load(bias_ptr + offs_m, mask=offs_m < C_out, other=0.0)
-    acc += bias[:, None]
+    b = tl.load(bias_ptr + c_out_idx).to(tl.float32)
+    acc += b
 
-    # Store output tile
-    out_ptrs = out_ptr + offs_m[:, None] * T_out + offs_n[None, :]
-    out_mask = (offs_m[:, None] < C_out) & (offs_n[None, :] < T_out)
-    tl.store(out_ptrs, acc.to(tl.float16), mask=out_mask)
+    # Store
+    out_idx = c_out_idx * T_out + t_offs
+    tl.store(out_ptr + out_idx, acc.to(tl.float16), mask=t_mask)
+
+
+# ─── Conv1d with K as constexpr: tiled over output channels ──────────────────
+# Multiple output channels per threadgroup share input loads.
+
+@triton.jit
+def conv1d_k(
+    x_ptr, w_ptr, bias_ptr, out_ptr,
+    C_in, C_out, T_in, T_out,
+    stride, padding, dilation,
+    BLOCK_T: tl.constexpr,
+    K: tl.constexpr,
+):
+    """Conv1d with compile-time K. Each threadgroup computes BLOCK_T outputs
+    for one output channel, with K unrolled.
+
+    Grid: [C_out, cdiv(T_out, BLOCK_T), 1]
+    """
+    c_out_idx = tl.program_id(0)
+    t_block = tl.program_id(1)
+
+    t_offs = t_block * BLOCK_T + tl.arange(0, BLOCK_T)
+    t_mask = t_offs < T_out
+
+    acc = tl.zeros((BLOCK_T,), dtype=tl.float32)
+
+    for c in range(C_in):
+        w_base = c_out_idx * C_in * K + c * K
+        x_base = c * T_in
+        for ki in tl.static_range(K):
+            t_in_pos = t_offs * stride - padding + ki * dilation
+            valid = t_mask & (t_in_pos >= 0) & (t_in_pos < T_in)
+
+            x_val = tl.load(x_ptr + x_base + t_in_pos, mask=valid, other=0.0).to(tl.float32)
+            w_val = tl.load(w_ptr + w_base + ki).to(tl.float32)
+            acc += x_val * w_val
+
+    b = tl.load(bias_ptr + c_out_idx).to(tl.float32)
+    acc += b
+
+    out_idx = c_out_idx * T_out + t_offs
+    tl.store(out_ptr + out_idx, acc.to(tl.float16), mask=t_mask)
 
 
 # ─── Fused Snake + AdaIN (most common pattern in resblocks) ─────────────────
@@ -242,69 +267,225 @@ def adain_snake_fused(
     tl.store(out_ptr + base + t_offsets, out.to(tl.float16), mask=mask)
 
 
-# ─── ConvTranspose1d as tiled matmul ─────────────────────────────────────────
-# For upsample with stride >> 1 (stride=10, stride=6)
-# Each output position gathers sparse contributions from input.
-# We express it as: for each output tile, gather the valid (c_in, k) contributions.
+# ─── Element-wise add: out = a + b ────────────────────────────────────────────
 
 @triton.jit
-def conv_transpose1d(
+def elementwise_add(
+    a_ptr, b_ptr, out_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Element-wise add: out[i] = a[i] + b[i]"""
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    a = tl.load(a_ptr + offsets, mask=mask).to(tl.float32)
+    b = tl.load(b_ptr + offsets, mask=mask).to(tl.float32)
+    out = a + b
+    tl.store(out_ptr + offsets, out.to(tl.float16), mask=mask)
+
+
+# ─── Element-wise scale: out = x * scalar ─────────────────────────────────────
+
+@triton.jit
+def elementwise_scale_third(
+    x_ptr, out_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Element-wise scale by 1/3: out[i] = x[i] / 3"""
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    x = tl.load(x_ptr + offsets, mask=mask).to(tl.float32)
+    out = x * 0.3333333333333333
+    tl.store(out_ptr + offsets, out.to(tl.float16), mask=mask)
+
+
+# ─── Reflection pad 1D: pad_left=1, pad_right=0 ──────────────────────────────
+
+@triton.jit
+def reflection_pad1d_left1(
+    x_ptr, out_ptr,
+    n_channels, seq_len,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Reflection pad1d with pad_left=1, pad_right=0.
+
+    x: [C, T] flattened
+    out: [C, T+1] flattened
+
+    For each channel c: out[c, 0] = x[c, 1], out[c, 1:T+1] = x[c, 0:T]
+    Grid: one program per output element block.
+    """
+    pid = tl.program_id(0)
+    out_len = seq_len + 1
+    n_elements = n_channels * out_len
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    # Map output flat index to (channel, time)
+    ch = offsets // out_len
+    t_out = offsets % out_len
+
+    # Map output time to input time (reflection: out[0] = x[1], rest = x[t-1])
+    t_in = tl.where(t_out == 0, 1, t_out - 1)
+
+    # Load from input
+    x_idx = ch * seq_len + t_in
+    val = tl.load(x_ptr + x_idx, mask=mask, other=0.0)
+
+    tl.store(out_ptr + offsets, val, mask=mask)
+
+
+# ─── Inline activation helpers (passed as ACTIVATION constexpr) ───────────────
+
+@triton.jit
+def leaky_relu_01_act(x):
+    return tl.where(x > 0.0, x, x * 0.1)
+
+@triton.jit
+def leaky_relu_001_act(x):
+    return tl.where(x > 0.0, x, x * 0.01)
+
+
+# ─── Conv1d with optional fused input activation ─────────────────────────────
+
+@triton.jit
+def conv1d_act(
+    x_ptr, w_ptr, bias_ptr, out_ptr,
+    C_in, C_out, T_in, T_out, K,
+    stride, padding, dilation,
+    BLOCK_T: tl.constexpr,
+    ACTIVATION: tl.constexpr = None,
+):
+    """Conv1d with optional activation applied to input on-the-fly.
+
+    Grid: [C_out, cdiv(T_out, BLOCK_T), 1]
+    """
+    c_out_idx = tl.program_id(0)
+    t_block = tl.program_id(1)
+
+    t_offs = t_block * BLOCK_T + tl.arange(0, BLOCK_T)
+    t_mask = t_offs < T_out
+
+    acc = tl.zeros((BLOCK_T,), dtype=tl.float32)
+
+    for c in range(C_in):
+        for ki in range(K):
+            t_in_pos = t_offs * stride - padding + ki * dilation
+            valid = t_mask & (t_in_pos >= 0) & (t_in_pos < T_in)
+
+            x_idx = c * T_in + t_in_pos
+            x_val = tl.load(x_ptr + x_idx, mask=valid, other=0.0).to(tl.float32)
+            if ACTIVATION:
+                x_val = ACTIVATION(x_val)
+
+            w_idx = c_out_idx * C_in * K + c * K + ki
+            w_val = tl.load(w_ptr + w_idx).to(tl.float32)
+
+            acc += x_val * w_val
+
+    b = tl.load(bias_ptr + c_out_idx).to(tl.float32)
+    acc += b
+
+    out_idx = c_out_idx * T_out + t_offs
+    tl.store(out_ptr + out_idx, acc.to(tl.float16), mask=t_mask)
+
+
+# ─── ConvTranspose1d with optional fused input activation ─────────────────────
+
+@triton.jit
+def conv_transpose1d_act(
     x_ptr, w_ptr, bias_ptr, out_ptr,
     C_in, C_out, T_in, T_out, K,
     stride, padding,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_C: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    ACTIVATION: tl.constexpr = None,
 ):
-    """ConvTranspose1d as tiled output computation.
+    """ConvTranspose1d with optional activation applied to input on-the-fly.
+
+    Grid: [C_out, cdiv(T_out, BLOCK_T), 1]
+    """
+    c_out_idx = tl.program_id(0)
+    t_block = tl.program_id(1)
+
+    t_offs = t_block * BLOCK_T + tl.arange(0, BLOCK_T)
+    t_mask = t_offs < T_out
+
+    acc = tl.zeros((BLOCK_T,), dtype=tl.float32)
+
+    for c in range(C_in):
+        for ki in range(K):
+            numerator = t_offs + padding - ki
+            valid_div = (numerator % stride) == 0
+            t_in_pos = numerator // stride
+            valid = t_mask & valid_div & (t_in_pos >= 0) & (t_in_pos < T_in)
+
+            x_idx = c * T_in + t_in_pos
+            x_val = tl.load(x_ptr + x_idx, mask=valid, other=0.0).to(tl.float32)
+            if ACTIVATION:
+                x_val = ACTIVATION(x_val)
+
+            w_idx = c * C_out * K + c_out_idx * K + ki
+            w_val = tl.load(w_ptr + w_idx).to(tl.float32)
+
+            acc += x_val * w_val
+
+    b = tl.load(bias_ptr + c_out_idx).to(tl.float32)
+    acc += b
+
+    out_idx = c_out_idx * T_out + t_offs
+    tl.store(out_ptr + out_idx, acc.to(tl.float16), mask=t_mask)
+
+
+# ─── ConvTranspose1d: one threadgroup per output channel ─────────────────────
+
+@triton.jit
+def conv_transpose1d_simple(
+    x_ptr, w_ptr, bias_ptr, out_ptr,
+    C_in, C_out, T_in, T_out, K,
+    stride, padding,
+    BLOCK_T: tl.constexpr,
+):
+    """ConvTranspose1d: one threadgroup per (c_out, t_block).
 
     x: [C_in, T_in] (fp16)
     w: [C_in, C_out, K] (fp16)
     bias: [C_out] (fp16)
     out: [C_out, T_out] (fp16)
 
-    Grid: [cdiv(C_out, BLOCK_M) * cdiv(T_out, BLOCK_N), 1, 1]
-    Each program computes a BLOCK_M × BLOCK_N tile of the output.
+    Grid: [C_out, cdiv(T_out, BLOCK_T), 1]
     """
-    n_tiles_n = (T_out + BLOCK_N - 1) // BLOCK_N
-    pid_m = tl.program_id(0) // n_tiles_n
-    pid_n = tl.program_id(0) % n_tiles_n
+    c_out_idx = tl.program_id(0)
+    t_block = tl.program_id(1)
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # output channel indices
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # output time indices
+    t_offs = t_block * BLOCK_T + tl.arange(0, BLOCK_T)
+    t_mask = t_offs < T_out
 
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_T,), dtype=tl.float32)
 
-    # For conv_transpose: out[c_out, t_out] = sum_{c_in, k} x[c_in, t_in] * w[c_in, c_out, k]
-    # where t_in = (t_out + padding - k) / stride, only when divisible
-    for c_start in range(0, C_in, BLOCK_C):
-        c_offs = c_start + tl.arange(0, BLOCK_C)
-        c_mask = c_offs < C_in
-
-        for k in range(K):
-            # t_in = (offs_n + padding - k) / stride, valid only when (offs_n + padding - k) % stride == 0
-            numerator = offs_n + padding - k  # [BLOCK_N]
+    # out[c_out, t_out] = sum_{c_in, k} x[c_in, t_in] * w[c_in, c_out, k]
+    # where t_in = (t_out + padding - k) / stride, valid when divisible
+    for c in range(C_in):
+        for ki in range(K):
+            numerator = t_offs + padding - ki
             valid_div = (numerator % stride) == 0
-            t_in = numerator // stride  # [BLOCK_N]
-            valid_t = valid_div & (t_in >= 0) & (t_in < T_in) & (offs_n < T_out)
+            t_in_pos = numerator // stride
+            valid = t_mask & valid_div & (t_in_pos >= 0) & (t_in_pos < T_in)
 
-            # Load x[c_in, t_in]: [BLOCK_C, BLOCK_N]
-            x_idx = c_offs[:, None] * T_in + t_in[None, :]  # [BLOCK_C, BLOCK_N]
-            x_valid = c_mask[:, None] & valid_t[None, :]
-            x_val = tl.load(x_ptr + x_idx, mask=x_valid, other=0.0)  # [BLOCK_C, BLOCK_N]
+            x_idx = c * T_in + t_in_pos
+            x_val = tl.load(x_ptr + x_idx, mask=valid, other=0.0).to(tl.float32)
 
-            # Load w[c_in, c_out, k]: [BLOCK_C, BLOCK_M]
-            w_idx = c_offs[:, None] * C_out * K + offs_m[None, :] * K + k  # [BLOCK_C, BLOCK_M]
-            w_valid = c_mask[:, None] & (offs_m[None, :] < C_out)
-            w_val = tl.load(w_ptr + w_idx, mask=w_valid, other=0.0)  # [BLOCK_C, BLOCK_M]
+            w_idx = c * C_out * K + c_out_idx * K + ki
+            w_val = tl.load(w_ptr + w_idx).to(tl.float32)
 
-            # Accumulate: [BLOCK_M, BLOCK_N] += [BLOCK_M, BLOCK_C] @ [BLOCK_C, BLOCK_N]
-            # = w_val^T @ x_val
-            acc += tl.dot(tl.trans(w_val), x_val)
+            acc += x_val * w_val
 
-    # Add bias
-    bias = tl.load(bias_ptr + offs_m, mask=offs_m < C_out, other=0.0)
-    acc += bias[:, None]
+    b = tl.load(bias_ptr + c_out_idx).to(tl.float32)
+    acc += b
 
-    # Store
-    out_ptrs = out_ptr + offs_m[:, None] * T_out + offs_n[None, :]
-    out_mask = (offs_m[:, None] < C_out) & (offs_n[None, :] < T_out)
-    tl.store(out_ptrs, acc.to(tl.float16), mask=out_mask)
+    out_idx = c_out_idx * T_out + t_offs
+    tl.store(out_ptr + out_idx, acc.to(tl.float16), mask=t_mask)

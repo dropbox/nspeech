@@ -356,6 +356,53 @@ KERNEL_METADATA = {
         "alias": "matmul_q8_64x64", "group": "encoder",
         "d3d12_only": True,
     },
+
+    # ── Kokoro TTS decoder kernels ──
+    "kokoro_snake_activation": {
+        "alias": "snake", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_adain_snake_1024": {
+        "alias": "adain_snake_1k", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_leaky_relu_01": {
+        "alias": "leaky_relu_01", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_leaky_relu_02": {
+        "alias": "leaky_relu_02", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_leaky_relu_001": {
+        "alias": "leaky_relu_001", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_conv1d": {
+        "alias": "conv1d", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_conv1d_k3": {
+        "alias": "conv1d_k3", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_conv1d_k7": {
+        "alias": "conv1d_k7", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_conv1d_k11": {
+        "alias": "conv1d_k11", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_conv_transpose1d": {
+        "alias": "conv_transpose1d", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_conv_transpose1d_lrelu": {
+        "alias": "conv_transpose1d_lrelu", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_conv1d_lrelu001": {
+        "alias": "conv1d_lrelu001", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_reflection_pad1d": {
+        "alias": "reflection_pad1d", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_add": {
+        "alias": "add", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_scale_third": {
+        "alias": "scale_third", "group": "kokoro", "d3d12": True,
+    },
 }
 
 

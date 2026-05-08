@@ -15,8 +15,12 @@ pub mod text_encoder;
 pub mod prosody;
 pub mod decoder;
 pub mod phonemizer;
+#[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
+pub mod gpu_backend;
 #[cfg(feature = "triton-metal")]
 pub mod gpu_decoder;
+#[cfg(feature = "triton-d3d12")]
+pub mod gpu_decoder_d3d12;
 
 pub use config::KokoroConfig;
 pub use model::KokoroModel;
