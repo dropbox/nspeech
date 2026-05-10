@@ -59,17 +59,26 @@ impl Phonemizer {
     fn text_to_ipa(&self, text: &str) -> String {
         let mut result = String::new();
         let normalized = normalize_text(text);
+        let segments = split_segments(&normalized);
 
-        for segment in split_segments(&normalized) {
+        for (idx, segment) in segments.iter().enumerate() {
             match segment {
                 Segment::Word(w) => {
                     if !result.is_empty() && !result.ends_with(' ') {
                         result.push(' ');
                     }
-                    result.push_str(&self.word_to_ipa(&w));
+                    let (ipa, is_acronym) = self.word_to_ipa_tagged(w);
+                    result.push_str(&ipa);
+                    if is_acronym {
+                        let next_is_punct = segments.get(idx + 1)
+                            .is_some_and(|s| matches!(s, Segment::Punct(_)));
+                        if !next_is_punct {
+                            result.push(',');
+                        }
+                    }
                 }
                 Segment::Punct(ch) => {
-                    result.push(ch);
+                    result.push(*ch);
                 }
                 Segment::Space => {
                     if !result.is_empty() && !result.ends_with(' ') {
@@ -82,24 +91,97 @@ impl Phonemizer {
     }
 
     fn word_to_ipa(&self, word: &str) -> String {
+        self.word_to_ipa_tagged(word).0
+    }
+
+    /// Returns (ipa, is_spelled_acronym).
+    fn word_to_ipa_tagged(&self, word: &str) -> (String, bool) {
         let lower = word.to_lowercase();
+
+        // Mixed case: split at case boundaries (e.g. macOS→"mac"+"OS", DBApp→"DB"+"App")
+        if word.chars().any(|c| c.is_ascii_uppercase()) && word.chars().any(|c| c.is_ascii_lowercase()) {
+            let parts = split_camel_case(word);
+            let mut ipa_parts = Vec::new();
+            let mut any_spelled = false;
+            for part in &parts {
+                if part.chars().all(|c| c.is_ascii_uppercase()) {
+                    ipa_parts.push(spell_out(part));
+                    any_spelled = true;
+                } else {
+                    ipa_parts.push(self.word_to_ipa_simple(&part.to_lowercase()));
+                }
+            }
+            return (ipa_parts.join(" "), any_spelled);
+        }
+
+        // All-uppercase: check dictionary first (NASA), else spell out
+        if word.len() > 1 && word.chars().all(|c| c.is_ascii_uppercase()) {
+            if let Some(ipa) = self.dict.get(&lower) {
+                return (ipa.clone(), false);
+            }
+            return (spell_out(word), true);
+        }
 
         // Direct lookup
         if let Some(ipa) = self.dict.get(&lower) {
-            return ipa.clone();
+            return (ipa.clone(), false);
         }
 
         // Try stripping common suffixes and rebuilding
         if let Some(ipa) = self.try_suffix_rules(&lower) {
-            return ipa;
+            return (ipa, false);
         }
 
-        // Fallback: spell out characters that exist in vocab
-        lower.chars().filter(|c| {
+        // Try compound word split
+        if let Some(ipa) = self.try_compound_split(&lower) {
+            return (ipa, false);
+        }
+
+        // Fallback: emit characters that exist in vocab
+        let fallback: String = lower.chars().filter(|c| {
+            let s = c.to_string();
+            self.vocab.contains_key(&s)
+        }).map(|c| c.to_string()).collect::<Vec<_>>().join("");
+        (fallback, false)
+    }
+
+    /// Simple word→IPA without acronym/compound logic (for sub-parts).
+    fn word_to_ipa_simple(&self, word: &str) -> String {
+        if let Some(ipa) = self.dict.get(word) {
+            return ipa.clone();
+        }
+        if let Some(ipa) = self.try_suffix_rules(word) {
+            return ipa;
+        }
+        if let Some(ipa) = self.try_compound_split(word) {
+            return ipa;
+        }
+        word.chars().filter(|c| {
             let s = c.to_string();
             self.vocab.contains_key(&s)
         }).map(|c| c.to_string()).collect::<Vec<_>>().join("")
     }
+
+    /// Try splitting word into two known dictionary words (prefer longer suffix).
+    fn try_compound_split(&self, word: &str) -> Option<String> {
+        for split in 3..word.len().saturating_sub(2) {
+            let prefix = &word[..split];
+            let suffix = &word[split..];
+            let prefix_ipa = self.dict.get(prefix)
+                .cloned()
+                .or_else(|| self.try_suffix_rules(prefix));
+            if let Some(p) = prefix_ipa {
+                let suffix_ipa = self.dict.get(suffix)
+                    .cloned()
+                    .or_else(|| self.try_suffix_rules(suffix));
+                if let Some(s) = suffix_ipa {
+                    return Some(format!("{} {}", p, s));
+                }
+            }
+        }
+        None
+    }
+
 
     fn try_suffix_rules(&self, word: &str) -> Option<String> {
         // -ing: try base, base+e
@@ -193,6 +275,86 @@ impl Phonemizer {
         }
 
         None
+    }
+}
+
+fn spell_out(word: &str) -> String {
+    let letters: Vec<&'static str> = word.chars()
+        .filter_map(letter_ipa)
+        .collect();
+    let n = letters.len();
+    if n <= 2 {
+        return letters.join("-");
+    }
+    let mut parts = Vec::with_capacity(n);
+    for (i, ipa) in letters.iter().enumerate() {
+        if i < n - 1 {
+            parts.push(ipa.replace('ˈ', "ˌ"));
+        } else {
+            parts.push(ipa.to_string());
+        }
+    }
+    parts.join("-")
+}
+
+/// Split a mixed-case word at case boundaries.
+/// "macOS" → ["mac", "OS"], "DBApp" → ["DB", "App"], "iPhone" → ["i", "Phone"]
+fn split_camel_case(word: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+
+    for ch in word.chars() {
+        if ch.is_ascii_uppercase() {
+            if !current.is_empty() && current.chars().last().is_some_and(|c| c.is_ascii_lowercase()) {
+                parts.push(std::mem::take(&mut current));
+            }
+            current.push(ch);
+        } else {
+            // Lowercase after multiple uppercase: split before last uppercase
+            // e.g. "DB" + "a" → keep "DB" separate if current is all-upper and len>1
+            if current.len() > 1 && current.chars().all(|c| c.is_ascii_uppercase()) {
+                let last = current.pop().unwrap();
+                parts.push(std::mem::take(&mut current));
+                current.push(last);
+            }
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
+fn letter_ipa(ch: char) -> Option<&'static str> {
+    match ch.to_ascii_lowercase() {
+        'a' => Some("ˈA"),
+        'b' => Some("bˈi"),
+        'c' => Some("sˈi"),
+        'd' => Some("dˈi"),
+        'e' => Some("ˈi"),
+        'f' => Some("ˈɛf"),
+        'g' => Some("ʤˈi"),
+        'h' => Some("ˈAʧ"),
+        'i' => Some("ˈI"),
+        'j' => Some("ʤˈA"),
+        'k' => Some("kˈA"),
+        'l' => Some("ˈɛl"),
+        'm' => Some("ˈɛm"),
+        'n' => Some("ˈɛn"),
+        'o' => Some("ˈO"),
+        'p' => Some("pˈi"),
+        'q' => Some("kjˈu"),
+        'r' => Some("ˈɑɹ"),
+        's' => Some("ˈɛs"),
+        't' => Some("tˈi"),
+        'u' => Some("jˈu"),
+        'v' => Some("vˈi"),
+        'w' => Some("dˈʌbəlˌu"),
+        'x' => Some("ˈɛks"),
+        'y' => Some("wˈI"),
+        'z' => Some("zˈi"),
+        _ => None,
     }
 }
 
