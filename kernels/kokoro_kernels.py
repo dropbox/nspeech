@@ -966,3 +966,97 @@ def convert_f16_to_f32_kernel(
 
     x = tl.load(x_ptr + offsets, mask=mask).to(tl.float32)
     tl.store(out_ptr + offsets, x, mask=mask)
+
+
+@triton.jit
+def leaky_relu_f32(
+    x_ptr, out_ptr,
+    n_elements,
+    SLOPE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """LeakyReLU on f32 buffers: out = x >= 0 ? x : x * slope."""
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    x = tl.load(x_ptr + offsets, mask=mask)
+    out = tl.where(x >= 0.0, x, x * SLOPE)
+    tl.store(out_ptr + offsets, out, mask=mask)
+
+
+@triton.jit
+def conv_transpose1d_f32io(
+    x_ptr, w_ptr, bias_ptr, out_ptr,
+    C_in, C_out, T_in, T_out, K,
+    stride, padding,
+    BLOCK_T: tl.constexpr,
+    ACTIVATION: tl.constexpr = None,
+):
+    """ConvTranspose1d with f32 input/output, f16 weights.
+
+    x: [C_in, T_in] (f32)
+    w: [C_in, C_out, K] (fp16)
+    bias: [C_out] (fp16)
+    out: [C_out, T_out] (f32)
+
+    Grid: [C_out, cdiv(T_out, BLOCK_T), 1]
+    """
+    c_out_idx = tl.program_id(0)
+    t_block = tl.program_id(1)
+
+    t_offs = t_block * BLOCK_T + tl.arange(0, BLOCK_T)
+    t_mask = t_offs < T_out
+
+    acc = tl.zeros((BLOCK_T,), dtype=tl.float32)
+
+    for c in range(C_in):
+        for ki in range(K):
+            numerator = t_offs + padding - ki
+            valid_div = (numerator % stride) == 0
+            t_in_pos = numerator // stride
+            valid = t_mask & valid_div & (t_in_pos >= 0) & (t_in_pos < T_in)
+
+            x_idx = c * T_in + t_in_pos
+            x_val = tl.load(x_ptr + x_idx, mask=valid, other=0.0)
+            if ACTIVATION:
+                x_val = ACTIVATION(x_val)
+
+            w_idx = c * C_out * K + c_out_idx * K + ki
+            w_val = tl.load(w_ptr + w_idx).to(tl.float32)
+
+            acc += x_val * w_val
+
+    b = tl.load(bias_ptr + c_out_idx).to(tl.float32)
+    acc += b
+
+    out_idx = c_out_idx * T_out + t_offs
+    tl.store(out_ptr + out_idx, acc, mask=t_mask)
+
+
+@triton.jit
+def reflection_pad1d_f32(
+    x_ptr, out_ptr,
+    n_channels, seq_len,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Reflection pad1d (pad_left=1, pad_right=0) for f32 buffers.
+
+    x: [C, T] flattened (f32)
+    out: [C, T+1] flattened (f32)
+    """
+    pid = tl.program_id(0)
+    out_len = seq_len + 1
+    n_elements = n_channels * out_len
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    ch = offsets // out_len
+    t_out = offsets % out_len
+
+    t_in = tl.where(t_out == 0, 1, t_out - 1)
+
+    x_idx = ch * seq_len + t_in
+    val = tl.load(x_ptr + x_idx, mask=mask, other=0.0)
+
+    tl.store(out_ptr + offsets, val, mask=mask)

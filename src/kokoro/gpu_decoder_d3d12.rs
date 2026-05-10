@@ -541,4 +541,72 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
         self.gpu.record_dispatch(&self.kernels.scale_third_f32, &rc, &uavs, [grid_x, 1, 1])
             .map_err(|e| anyhow::anyhow!("scale_third_f32: {e}"))
     }
+
+    fn leaky_relu_f32(&self, x: &GpuBuffer, out: &GpuBuffer, n: usize, slope: f32) -> Result<()> {
+        let pso = if slope == 0.01 {
+            &self.kernels.leaky_relu_f32_001
+        } else {
+            &self.kernels.leaky_relu_f32_01
+        };
+        let grid_x = cdiv(n, 1024) as u32;
+        let rc: Vec<u32> = vec![n as u32, grid_x, 1, 1];
+        let uavs = [
+            BufferBinding::structured_f32(x, n as u32),
+            BufferBinding::structured_f32(out, n as u32),
+        ];
+        self.gpu.record_dispatch(pso, &rc, &uavs, [grid_x, 1, 1])
+            .map_err(|e| anyhow::anyhow!("leaky_relu_f32: {e}"))
+    }
+
+    fn conv_transpose1d_f32io_lrelu(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
+                                    c_in: usize, c_out: usize, t_in: usize, t_out: usize,
+                                    k: usize, stride: usize, padding: usize) -> Result<()> {
+        let grid_x = c_out as u32;
+        let grid_y = cdiv(t_out, 256) as u32;
+        let rc: Vec<u32> = vec![
+            c_in as u32, c_out as u32, t_in as u32, t_out as u32,
+            k as u32, stride as u32, padding as u32,
+            grid_x, grid_y, 1,
+        ];
+        let uavs = [
+            BufferBinding::structured_f32(x, (c_in * t_in) as u32),
+            uav_f16(w, (c_in * c_out * k) as u32),
+            uav_f16(bias, c_out as u32),
+            BufferBinding::structured_f32(out, (c_out * t_out) as u32),
+        ];
+        self.gpu.record_dispatch(&self.kernels.conv_transpose1d_f32io_lrelu, &rc, &uavs, [grid_x, grid_y, 1])
+            .map_err(|e| anyhow::anyhow!("conv_transpose1d_f32io_lrelu: {e}"))
+    }
+
+    fn conv_transpose1d_f32io(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
+                              c_in: usize, c_out: usize, t_in: usize, t_out: usize,
+                              k: usize, stride: usize, padding: usize) -> Result<()> {
+        let grid_x = c_out as u32;
+        let grid_y = cdiv(t_out, 256) as u32;
+        let rc: Vec<u32> = vec![
+            c_in as u32, c_out as u32, t_in as u32, t_out as u32,
+            k as u32, stride as u32, padding as u32,
+            grid_x, grid_y, 1,
+        ];
+        let uavs = [
+            BufferBinding::structured_f32(x, (c_in * t_in) as u32),
+            uav_f16(w, (c_in * c_out * k) as u32),
+            uav_f16(bias, c_out as u32),
+            BufferBinding::structured_f32(out, (c_out * t_out) as u32),
+        ];
+        self.gpu.record_dispatch(&self.kernels.conv_transpose1d_f32io, &rc, &uavs, [grid_x, grid_y, 1])
+            .map_err(|e| anyhow::anyhow!("conv_transpose1d_f32io: {e}"))
+    }
+
+    fn reflection_pad1d_f32(&self, x: &GpuBuffer, out: &GpuBuffer, channels: usize, seq_len: usize) -> Result<()> {
+        let n_out = channels * (seq_len + 1);
+        let grid_x = cdiv(n_out, 1024) as u32;
+        let rc: Vec<u32> = vec![channels as u32, seq_len as u32, grid_x, 1, 1];
+        let uavs = [
+            BufferBinding::structured_f32(x, (channels * seq_len) as u32),
+            BufferBinding::structured_f32(out, n_out as u32),
+        ];
+        self.gpu.record_dispatch(&self.kernels.reflection_pad1d_f32, &rc, &uavs, [grid_x, 1, 1])
+            .map_err(|e| anyhow::anyhow!("reflection_pad1d_f32: {e}"))
+    }
 }

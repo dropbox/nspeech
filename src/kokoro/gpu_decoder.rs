@@ -921,6 +921,85 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         encoder.dispatch_thread_groups(grid, tg);
         Ok(())
     }
+
+    fn leaky_relu_f32(&self, x: &GpuBuffer, out: &GpuBuffer, n: usize, slope: f32) -> Result<()> {
+        let pipeline = if slope == 0.01 {
+            &self.kernels.leaky_relu_f32_001
+        } else {
+            &self.kernels.leaky_relu_f32_01
+        };
+        let encoder = self.device.command_encoder()?;
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(x.buf()), x.offset);
+        encoder.set_buffer(1, Some(out.buf()), out.offset);
+        encoder.set_bytes(2, &(n as i32));
+        let max_tg = pipeline.max_total_threads_per_threadgroup() as usize;
+        let tg_width = 1024.min(max_tg);
+        let grid = MTLSize { width: cdiv(n, tg_width), height: 1, depth: 1 };
+        let tg = MTLSize { width: tg_width, height: 1, depth: 1 };
+        encoder.dispatch_thread_groups(grid, tg);
+        Ok(())
+    }
+
+    fn conv_transpose1d_f32io_lrelu(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
+                                    c_in: usize, c_out: usize, t_in: usize, t_out: usize,
+                                    k: usize, stride: usize, padding: usize) -> Result<()> {
+        let encoder = self.device.command_encoder()?;
+        encoder.set_compute_pipeline_state(&self.kernels.conv_transpose1d_f32io_lrelu);
+        encoder.set_buffer(0, Some(x.buf()), x.offset);
+        encoder.set_buffer(1, Some(w.buf()), w.offset);
+        encoder.set_buffer(2, Some(bias.buf()), bias.offset);
+        encoder.set_buffer(3, Some(out.buf()), out.offset);
+        encoder.set_bytes(4, &(c_in as i32));
+        encoder.set_bytes(5, &(c_out as i32));
+        encoder.set_bytes(6, &(t_in as i32));
+        encoder.set_bytes(7, &(t_out as i32));
+        encoder.set_bytes(8, &(k as i32));
+        encoder.set_bytes(9, &(stride as i32));
+        encoder.set_bytes(10, &(padding as i32));
+        let grid = MTLSize { width: c_out, height: cdiv(t_out, 256), depth: 1 };
+        let tg = MTLSize { width: 256, height: 1, depth: 1 };
+        encoder.dispatch_thread_groups(grid, tg);
+        Ok(())
+    }
+
+    fn conv_transpose1d_f32io(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
+                              c_in: usize, c_out: usize, t_in: usize, t_out: usize,
+                              k: usize, stride: usize, padding: usize) -> Result<()> {
+        let encoder = self.device.command_encoder()?;
+        encoder.set_compute_pipeline_state(&self.kernels.conv_transpose1d_f32io);
+        encoder.set_buffer(0, Some(x.buf()), x.offset);
+        encoder.set_buffer(1, Some(w.buf()), w.offset);
+        encoder.set_buffer(2, Some(bias.buf()), bias.offset);
+        encoder.set_buffer(3, Some(out.buf()), out.offset);
+        encoder.set_bytes(4, &(c_in as i32));
+        encoder.set_bytes(5, &(c_out as i32));
+        encoder.set_bytes(6, &(t_in as i32));
+        encoder.set_bytes(7, &(t_out as i32));
+        encoder.set_bytes(8, &(k as i32));
+        encoder.set_bytes(9, &(stride as i32));
+        encoder.set_bytes(10, &(padding as i32));
+        let grid = MTLSize { width: c_out, height: cdiv(t_out, 256), depth: 1 };
+        let tg = MTLSize { width: 256, height: 1, depth: 1 };
+        encoder.dispatch_thread_groups(grid, tg);
+        Ok(())
+    }
+
+    fn reflection_pad1d_f32(&self, x: &GpuBuffer, out: &GpuBuffer, channels: usize, seq_len: usize) -> Result<()> {
+        let n_out = channels * (seq_len + 1);
+        let encoder = self.device.command_encoder()?;
+        encoder.set_compute_pipeline_state(&self.kernels.reflection_pad1d_f32);
+        encoder.set_buffer(0, Some(x.buf()), x.offset);
+        encoder.set_buffer(1, Some(out.buf()), out.offset);
+        encoder.set_bytes(2, &(channels as i32));
+        encoder.set_bytes(3, &(seq_len as i32));
+        let max_tg = self.kernels.reflection_pad1d_f32.max_total_threads_per_threadgroup() as usize;
+        let tg_width = 1024.min(max_tg);
+        let grid = MTLSize { width: cdiv(n_out, tg_width), height: 1, depth: 1 };
+        let tg = MTLSize { width: tg_width, height: 1, depth: 1 };
+        encoder.dispatch_thread_groups(grid, tg);
+        Ok(())
+    }
 }
 
 impl KokoroGpuDecoder {

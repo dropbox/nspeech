@@ -182,4 +182,28 @@ pub trait KokoroGpuBackend {
     fn scale_third_f32(&self, _x: &Self::Buf, _out: &Self::Buf, _n: usize) -> Result<()> {
         Err(anyhow::anyhow!("scale_third_f32 not supported"))
     }
+
+    /// LeakyReLU on f32 buffers: out = x >= 0 ? x : x * slope.
+    fn leaky_relu_f32(&self, _x: &Self::Buf, _out: &Self::Buf, _n: usize, _slope: f32) -> Result<()> {
+        Err(anyhow::anyhow!("leaky_relu_f32 not supported"))
+    }
+
+    /// ConvTranspose1d with f32 I/O, f16 weights, fused leaky_relu(0.1) on input.
+    fn conv_transpose1d_f32io_lrelu(&self, _x: &Self::Buf, _w: &Self::Buf, _bias: &Self::Buf, _out: &Self::Buf,
+                                    _c_in: usize, _c_out: usize, _t_in: usize, _t_out: usize,
+                                    _k: usize, _stride: usize, _padding: usize) -> Result<()> {
+        Err(anyhow::anyhow!("conv_transpose1d_f32io_lrelu not supported"))
+    }
+
+    /// ConvTranspose1d with f32 I/O, f16 weights (no activation).
+    fn conv_transpose1d_f32io(&self, _x: &Self::Buf, _w: &Self::Buf, _bias: &Self::Buf, _out: &Self::Buf,
+                              _c_in: usize, _c_out: usize, _t_in: usize, _t_out: usize,
+                              _k: usize, _stride: usize, _padding: usize) -> Result<()> {
+        Err(anyhow::anyhow!("conv_transpose1d_f32io not supported"))
+    }
+
+    /// Reflection pad1d (pad_left=1, pad_right=0) for f32 buffers.
+    fn reflection_pad1d_f32(&self, _x: &Self::Buf, _out: &Self::Buf, _channels: usize, _seq_len: usize) -> Result<()> {
+        Err(anyhow::anyhow!("reflection_pad1d_f32 not supported"))
+    }
 }

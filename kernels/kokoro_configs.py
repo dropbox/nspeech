@@ -187,6 +187,30 @@ KOKORO_KERNELS = [
      "*fp16, *fp32, i32, 1024",
      4, ["cdiv(n_elements, 1024)", "1", "1"]),
 
+    # ── LeakyReLU on f32 buffers ──
+    ("kokoro_leaky_relu_f32_001", "leaky_relu_f32",
+     "*fp32, *fp32, i32, 0.01, 1024",
+     4, ["cdiv(n_elements, 1024)", "1", "1"]),
+
+    ("kokoro_leaky_relu_f32_01", "leaky_relu_f32",
+     "*fp32, *fp32, i32, 0.1, 1024",
+     4, ["cdiv(n_elements, 1024)", "1", "1"]),
+
+    # ── ConvTranspose1d with f32 I/O (fused LeakyReLU(0.1) on input) ──
+    ("kokoro_conv_transpose1d_f32io_lrelu", "conv_transpose1d_f32io",
+     "*fp32, *fp16, *fp16, *fp32, i32, i32, i32, i32, i32, i32, i32, 256, leaky_relu_01_act",
+     4, ["C_out", "cdiv(T_out, 256)", "1"]),
+
+    # ── ConvTranspose1d with f32 I/O (no activation) ──
+    ("kokoro_conv_transpose1d_f32io", "conv_transpose1d_f32io",
+     "*fp32, *fp16, *fp16, *fp32, i32, i32, i32, i32, i32, i32, i32, 256, None",
+     4, ["C_out", "cdiv(T_out, 256)", "1"]),
+
+    # ── Reflection pad1d (pad_left=1, pad_right=0) for f32 buffers ──
+    ("kokoro_reflection_pad1d_f32", "reflection_pad1d_f32",
+     "*fp32, *fp32, i32, i32, 1024",
+     4, ["cdiv(n_channels * (seq_len + 1), 1024)", "1", "1"]),
+
 ]
 
 

@@ -465,6 +465,21 @@ KERNEL_METADATA = {
     "kokoro_f16_to_f32": {
         "alias": "f16_to_f32", "group": "kokoro", "d3d12": True,
     },
+    "kokoro_leaky_relu_f32_001": {
+        "alias": "leaky_relu_f32_001", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_leaky_relu_f32_01": {
+        "alias": "leaky_relu_f32_01", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_conv_transpose1d_f32io_lrelu": {
+        "alias": "conv_transpose1d_f32io_lrelu", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_conv_transpose1d_f32io": {
+        "alias": "conv_transpose1d_f32io", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_reflection_pad1d_f32": {
+        "alias": "reflection_pad1d_f32", "group": "kokoro", "d3d12": True,
+    },
 }
 
 

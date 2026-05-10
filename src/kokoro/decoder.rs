@@ -405,22 +405,28 @@ impl Generator {
             // Track f32 version of h for precision when f32 intermediates available
             let mut h_f32_buf: Option<G::Buf> = None;
             let (h_new, new_c, new_t) = if gpu.has_f32_intermediates() {
-                // Use f32 carry from previous stage when available (avoids f16 quantization)
-                let h_tensor = if let Some(ref carry) = h_f32_carry {
-                    let f32_data = gpu.download_f32(carry, h_c * h_t)?;
-                    Tensor::from_vec(f32_data, &[1, h_c, h_t][..], &device)?
+                let (_, c_out, k) = up_w.dims3()?;
+                let t_out = (h_t - 1) * up_stride - 2 * up_padding + k;
+                let w_buf = upload_weight(gpu, up_w)?;
+                let b_buf = upload_weight(gpu, up_b)?;
+                // Apply leaky_relu(0.1) in f32 on GPU, then conv_transpose1d_f32io
+                let f32_in = if let Some(carry) = h_f32_carry.take() {
+                    carry
                 } else {
-                    let h_data = gpu.download_f16(&h_buf, h_c * h_t)?;
-                    Tensor::from_vec(h_data, &[1, h_c, h_t][..], &device)?.to_dtype(DType::F32)?
+                    let tmp = gpu.alloc_f32(h_c * h_t)?;
+                    gpu.f16_to_f32(&h_buf, &tmp, h_c * h_t)?;
+                    tmp
                 };
-                let h_lrelu = leaky_relu(&h_tensor, 0.1)?;
-                let h_up = h_lrelu.conv_transpose1d(up_w, up_padding, 0, up_stride, 1, 1)?;
-                let h_up = h_up.broadcast_add(&up_b.unsqueeze(0)?.unsqueeze(2)?)?;
-                let (_, c, t) = h_up.dims3()?;
-                let up_buf = upload_activation(gpu, &h_up.to_dtype(DType::F16)?)?;
-                let f32_data: Vec<f32> = h_up.flatten_all()?.to_vec1()?;
-                h_f32_buf = Some(gpu.upload_f32(&f32_data)?);
-                (up_buf, c, t)
+                let lrelu_f32 = gpu.alloc_f32(h_c * h_t)?;
+                gpu.leaky_relu_f32(&f32_in, &lrelu_f32, h_c * h_t, 0.1)?;
+                gpu.flush()?;
+                let out_f32 = gpu.alloc_f32(c_out * t_out)?;
+                gpu.conv_transpose1d_f32io(&lrelu_f32, &w_buf, &b_buf, &out_f32, h_c, c_out, h_t, t_out, k, up_stride, up_padding)?;
+                // Also produce f16 version for h_buf
+                let out_f16 = gpu.alloc(c_out * t_out)?;
+                gpu.f32_to_f16(&out_f32, &out_f16, c_out * t_out)?;
+                h_f32_buf = Some(out_f32);
+                (out_f16, c_out, t_out)
             } else {
                 buf_conv_transpose1d_lrelu(gpu, &h_buf, up_w, up_b, h_c, h_t, up_padding, up_stride)?
             };
@@ -444,15 +450,9 @@ impl Generator {
                 h_buf = padded;
                 // Also pad the f32 version
                 if let Some(ref f32_in) = h_f32_buf {
-                    let f32_data = gpu.download_f32(f32_in, h_c * h_t)?;
-                    let new_len = h_t + 1;
-                    let mut padded_data = vec![0.0f32; h_c * new_len];
-                    for c in 0..h_c {
-                        padded_data[c * new_len] = f32_data[c * h_t + 1]; // reflect
-                        padded_data[c * new_len + 1..c * new_len + 1 + h_t]
-                            .copy_from_slice(&f32_data[c * h_t..c * h_t + h_t]);
-                    }
-                    h_f32_buf = Some(gpu.upload_f32(&padded_data)?);
+                    let padded_f32 = gpu.alloc_f32(h_c * (h_t + 1))?;
+                    gpu.reflection_pad1d_f32(f32_in, &padded_f32, h_c, h_t)?;
+                    h_f32_buf = Some(padded_f32);
                 }
                 h_t = new_t;
                 if compare {
@@ -545,12 +545,8 @@ impl Generator {
                         eprintln!("  [stage{stage} resblocks f32] n={} max_err={max_err:.4} rms={rms:.6}", avg_cmp.len());
                     }
                     // conv_post: leaky_relu(0.01) on f32 → conv1d_f32
-                    // Download f32, apply lrelu on CPU, re-upload as f32
-                    let avg_data = gpu.download_f32(&avg, n)?;
-                    let lrelu_data: Vec<f32> = avg_data.iter()
-                        .map(|&v| if v < 0.0 { v * 0.01 } else { v })
-                        .collect();
-                    let lrelu_buf = gpu.upload_f32(&lrelu_data)?;
+                    let lrelu_buf = gpu.alloc_f32(n)?;
+                    gpu.leaky_relu_f32(&avg, &lrelu_buf, n, 0.01)?;
                     let (c_out, _, k) = self.conv_post_weight.dims3()?;
                     let cp_padding = (k - 1) / 2;
                     let t_out = h_t;
