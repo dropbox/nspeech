@@ -220,6 +220,39 @@ impl KokoroModel {
         audio.to_vec1().map_err(Into::into)
     }
 
+    pub fn synthesize_cpu(&self, input_ids: &[u32], style: &Tensor, speed: f32) -> Result<Vec<f32>> {
+        let mut padded: Vec<u32> = Vec::with_capacity(input_ids.len() + 2);
+        padded.push(0);
+        padded.extend_from_slice(input_ids);
+        padded.push(0);
+
+        let tokens = candle_core::Tensor::new(padded, &self.device)?.unsqueeze(0)?.contiguous()?;
+
+        let acoustic_style = style.narrow(0, 0, self.config.style_dim)?.unsqueeze(0)?;
+        let prosody_style = style.narrow(0, self.config.style_dim, self.config.style_dim)?.unsqueeze(0)?;
+
+        let bert_out = self.albert.forward(&tokens)?;
+        let d_en = self.bert_encoder.forward(&bert_out)?.transpose(1, 2)?;
+        let text_enc = self.text_encoder.forward(&tokens)?;
+
+        let (durations_raw, dur_enc_out) = self.prosody.predict_duration(&d_en, &prosody_style)?;
+        let durations_raw = durations_raw.squeeze(0)?;
+        let dur_vec: Vec<f32> = durations_raw.to_vec1()?;
+        let durations: Vec<usize> = dur_vec.iter()
+            .map(|&d| ((d / speed).round().max(1.0)) as usize)
+            .collect();
+        let total_frames: usize = durations.iter().sum();
+        if total_frames == 0 { return Ok(Vec::new()); }
+
+        let expanded_enc = super::prosody::duration_expand(&dur_enc_out, &durations)?;
+        let expanded_text = super::prosody::duration_expand(&text_enc, &durations)?;
+        let f0 = self.prosody.predict_f0(&expanded_enc, &prosody_style)?;
+        let n = self.prosody.predict_n(&expanded_enc, &prosody_style)?;
+
+        let audio = self.decoder.forward_cpu(&expanded_text, &f0, &n, &acoustic_style)?;
+        audio.squeeze(0)?.to_vec1().map_err(Into::into)
+    }
+
     /// Load a voice pack (.safetensors) and select style for given sequence length.
     pub fn load_voice(voice_path: &Path, seq_len: usize, device: &Device) -> Result<Tensor> {
         let tensors = candle_core::safetensors::load(voice_path, device)?;

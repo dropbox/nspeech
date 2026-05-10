@@ -14,9 +14,7 @@
 //!   decoder.generator.m_source — Sine source generator
 
 use anyhow::Result;
-use candle_core::Tensor;
-#[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
-use candle_core::DType;
+use candle_core::{DType, Tensor};
 use candle_nn::{Linear, Module, VarBuilder};
 
 use super::config::KokoroConfig;
@@ -136,6 +134,10 @@ impl ISTFTNetDecoder {
                 return self.forward_gpu(asr, f0, n, style, &gpu);
             }
         }
+        self.forward_inner(asr, f0, n, style)
+    }
+
+    pub fn forward_cpu(&self, asr: &Tensor, f0: &Tensor, n: &Tensor, style: &Tensor) -> Result<Tensor> {
         self.forward_inner(asr, f0, n, style)
     }
 
@@ -338,6 +340,7 @@ impl Generator {
 
     #[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
     fn forward_gpu<G: KokoroGpuBackend>(&self, x: &Tensor, f0: &Tensor, style: &Tensor, gpu: &G) -> Result<Tensor> {
+        let compare = std::env::var("KOKORO_COMPARE").is_ok();
         let dtype = x.dtype();
         let (_batch, c_in, t_frames) = x.dims3()?;
         let device = x.device().clone();
@@ -354,58 +357,324 @@ impl Generator {
             .map(|rb| rb.precompute_adain_params(style, gpu))
             .collect::<Result<_>>()?;
 
+        // CPU reference (only when comparing)
+        let mut cpu_h = if compare { Some(x.clone()) } else { None };
+
         let mut h_buf = upload_activation(gpu, &x.to_dtype(DType::F16)?)?;
         let mut h_c = c_in;
         let mut h_t = t_frames;
         let num_ups = self.ups.len();
 
+        // f32 carry buffer: when available, used as input to next stage's upsample
+        // to avoid f16 quantization between stages.
+        let mut h_f32_carry: Option<G::Buf> = None;
+
         for (stage, (up_w, up_b)) in self.ups.iter().enumerate() {
+            // Commit prior GPU work so the allocator won't reuse in-flight buffers.
+            gpu.flush()?;
+
             // Noise source: conv1d(har_source) → noise_res
             let (nc_w, nc_b) = &self.noise_convs[stage];
             let nc_stride = self.noise_conv_strides[stage];
             let nc_k = nc_w.dim(2)?;
             let nc_padding = if nc_k > 1 { (nc_stride + 1) / 2 } else { 0 };
             let har_t = har_source.dim(2)?;
-            let (src_buf, src_c, src_t) = buf_conv1d(gpu, &har_buf, nc_w, nc_b, har_c, har_t, nc_padding, nc_stride, 1)?;
-            let src_buf = self.noise_res[stage].forward_gpu_precomputed(&src_buf, &all_noise_params[stage], gpu, src_c, src_t)?;
+            let mut _noise_keep: Vec<G::Buf> = Vec::new();
+            let (src_buf, src_c, src_t) = if gpu.has_f32_intermediates() {
+                let (c_out, _, k) = nc_w.dims3()?;
+                let t_out = (har_t + 2 * nc_padding - 1 * (k - 1) - 1) / nc_stride + 1;
+                let har_f32 = gpu.alloc_f32(har_c * har_t)?;
+                gpu.f16_to_f32(&har_buf, &har_f32, har_c * har_t)?;
+                let w_buf = upload_weight(gpu, nc_w)?;
+                let b_buf = upload_weight(gpu, nc_b)?;
+                let out_f32 = gpu.alloc_f32(c_out * t_out)?;
+                gpu.conv1d_f32(&har_f32, &w_buf, &b_buf, &out_f32, har_c, c_out, har_t, t_out, k, nc_stride, nc_padding, 1)?;
+                _noise_keep.push(har_f32);
+                // noise_res takes f32 input directly (skip f16 round-trip)
+                let src_buf = self.noise_res[stage].forward_gpu_f32_direct(&out_f32, &all_noise_params[stage], gpu, c_out, t_out, &mut _noise_keep)?;
+                (src_buf, c_out, t_out)
+            } else {
+                let (src_buf, src_c, src_t) = buf_conv1d(gpu, &har_buf, nc_w, nc_b, har_c, har_t, nc_padding, nc_stride, 1)?;
+                let src_buf = self.noise_res[stage].forward_gpu_precomputed(&src_buf, &all_noise_params[stage], gpu, src_c, src_t)?;
+                (src_buf, src_c, src_t)
+            };
 
             // Leaky_relu(0.1) + ConvTranspose1d upsample
             let up_stride = if stage == 0 { 10 } else { 6 };
             let up_padding = (up_w.dim(2)? - up_stride) / 2;
-            let (h_new, new_c, new_t) = buf_conv_transpose1d_lrelu(gpu, &h_buf, up_w, up_b, h_c, h_t, up_padding, up_stride)?;
+            // Track f32 version of h for precision when f32 intermediates available
+            let mut h_f32_buf: Option<G::Buf> = None;
+            let (h_new, new_c, new_t) = if gpu.has_f32_intermediates() {
+                // Use f32 carry from previous stage when available (avoids f16 quantization)
+                let h_tensor = if let Some(ref carry) = h_f32_carry {
+                    let f32_data = gpu.download_f32(carry, h_c * h_t)?;
+                    Tensor::from_vec(f32_data, &[1, h_c, h_t][..], &device)?
+                } else {
+                    let h_data = gpu.download_f16(&h_buf, h_c * h_t)?;
+                    Tensor::from_vec(h_data, &[1, h_c, h_t][..], &device)?.to_dtype(DType::F32)?
+                };
+                let h_lrelu = leaky_relu(&h_tensor, 0.1)?;
+                let h_up = h_lrelu.conv_transpose1d(up_w, up_padding, 0, up_stride, 1, 1)?;
+                let h_up = h_up.broadcast_add(&up_b.unsqueeze(0)?.unsqueeze(2)?)?;
+                let (_, c, t) = h_up.dims3()?;
+                let up_buf = upload_activation(gpu, &h_up.to_dtype(DType::F16)?)?;
+                let f32_data: Vec<f32> = h_up.flatten_all()?.to_vec1()?;
+                h_f32_buf = Some(gpu.upload_f32(&f32_data)?);
+                (up_buf, c, t)
+            } else {
+                buf_conv_transpose1d_lrelu(gpu, &h_buf, up_w, up_b, h_c, h_t, up_padding, up_stride)?
+            };
+            h_f32_carry = None;
             h_buf = h_new;
             h_c = new_c;
             h_t = new_t;
+
+            if compare {
+                let ch = cpu_h.as_ref().unwrap();
+                let cpu_up = leaky_relu(ch, 0.1)?;
+                let cpu_up = cpu_up.conv_transpose1d(up_w, up_padding, 0, up_stride, 1, 1)?;
+                let cpu_up = cpu_up.broadcast_add(&up_b.unsqueeze(0)?.unsqueeze(2)?)?;
+                compare_gpu_cpu(gpu, &h_buf, &cpu_up, &format!("stage{stage} upsample"));
+                cpu_h = Some(cpu_up);
+            }
 
             // Reflection pad on last stage
             if stage == num_ups - 1 {
                 let (padded, new_t) = buf_reflection_pad1d(gpu, &h_buf, h_c, h_t, 1, 0)?;
                 h_buf = padded;
+                // Also pad the f32 version
+                if let Some(ref f32_in) = h_f32_buf {
+                    let f32_data = gpu.download_f32(f32_in, h_c * h_t)?;
+                    let new_len = h_t + 1;
+                    let mut padded_data = vec![0.0f32; h_c * new_len];
+                    for c in 0..h_c {
+                        padded_data[c * new_len] = f32_data[c * h_t + 1]; // reflect
+                        padded_data[c * new_len + 1..c * new_len + 1 + h_t]
+                            .copy_from_slice(&f32_data[c * h_t..c * h_t + h_t]);
+                    }
+                    h_f32_buf = Some(gpu.upload_f32(&padded_data)?);
+                }
                 h_t = new_t;
+                if compare {
+                    let ch = cpu_h.as_ref().unwrap();
+                    let cpu_pad = reflection_pad1d(ch, 1, 0)?;
+                    compare_gpu_cpu(gpu, &h_buf, &cpu_pad, &format!("stage{stage} reflpad"));
+                    cpu_h = Some(cpu_pad);
+                }
             }
 
             // h = h + x_source
             let n = h_c * h_t;
             h_buf = gpu.add(&h_buf, &src_buf, n)?;
+            // Also add in f32 if we have the f32 upsample result
+            if let Some(ref h_f32) = h_f32_buf {
+                let src_f32 = gpu.alloc_f32(n)?;
+                gpu.f16_to_f32(&src_buf, &src_f32, n)?;
+                let sum_f32 = gpu.alloc_f32(n)?;
+                gpu.add_f32(h_f32, &src_f32, &sum_f32, n)?;
+                h_f32_buf = Some(sum_f32);
+            }
+            if compare {
+                let ch = cpu_h.as_ref().unwrap();
+                let nc_src = har_source.conv1d(nc_w, nc_padding, nc_stride, 1, 1)?;
+                let nc_src = nc_src.broadcast_add(&nc_b.unsqueeze(0)?.unsqueeze(2)?)?;
+                let nc_src_final = self.noise_res[stage].forward(&nc_src, style)?;
+                let cpu_added = (ch + nc_src_final)?;
+                compare_gpu_cpu(gpu, &h_buf, &cpu_added, &format!("stage{stage} h+src"));
+                cpu_h = Some(cpu_added);
+            }
+
+            // Commit pending GPU work before resblocks allocate new buffers,
+            // preventing the allocator from reusing buffers still in flight.
+            gpu.flush()?;
 
             // 3 resblocks averaged (using precomputed gamma/beta)
             let base = stage * 3;
-            let r0 = self.resblocks[base].forward_gpu_precomputed(&h_buf, &all_resblock_params[base], gpu, h_c, h_t)?;
-            let r1 = self.resblocks[base + 1].forward_gpu_precomputed(&h_buf, &all_resblock_params[base + 1], gpu, h_c, h_t)?;
-            let r2 = self.resblocks[base + 2].forward_gpu_precomputed(&h_buf, &all_resblock_params[base + 2], gpu, h_c, h_t)?;
-            let sum = gpu.add(&r0, &r1, n)?;
-            let sum = gpu.add(&sum, &r2, n)?;
-            h_buf = gpu.scale(&sum, n, 1.0 / 3.0)?;
+            let dbg_rb = if compare && stage == 0 {
+                Some((cpu_h.as_ref().unwrap(), style))
+            } else { None };
+            // Hold f32 intermediate buffers alive until all resblocks complete
+            // to prevent the allocator from reusing them while GPU is still reading.
+            let mut _rb_keep: Vec<G::Buf> = Vec::new();
+            if gpu.has_f32_intermediates() {
+                // Resblocks in f32; use f32 input when available (avoids f16 quantization)
+                let r0 = if let Some(ref f32_in) = h_f32_buf {
+                    self.resblocks[base].forward_gpu_f32_direct_noconv(f32_in, &all_resblock_params[base], gpu, h_c, h_t, &mut _rb_keep)?
+                } else {
+                    self.resblocks[base].forward_gpu_f32_noconv(&h_buf, &all_resblock_params[base], gpu, h_c, h_t, &mut _rb_keep)?
+                };
+                let r1 = if let Some(ref f32_in) = h_f32_buf {
+                    self.resblocks[base + 1].forward_gpu_f32_direct_noconv(f32_in, &all_resblock_params[base + 1], gpu, h_c, h_t, &mut _rb_keep)?
+                } else {
+                    self.resblocks[base + 1].forward_gpu_f32_noconv(&h_buf, &all_resblock_params[base + 1], gpu, h_c, h_t, &mut _rb_keep)?
+                };
+                let r2 = if let Some(ref f32_in) = h_f32_buf {
+                    self.resblocks[base + 2].forward_gpu_f32_direct_noconv(f32_in, &all_resblock_params[base + 2], gpu, h_c, h_t, &mut _rb_keep)?
+                } else {
+                    self.resblocks[base + 2].forward_gpu_f32_noconv(&h_buf, &all_resblock_params[base + 2], gpu, h_c, h_t, &mut _rb_keep)?
+                };
+                let sum = gpu.alloc_f32(n)?;
+                gpu.add_f32(&r0, &r1, &sum, n)?;
+                let sum2 = gpu.alloc_f32(n)?;
+                gpu.add_f32(&sum, &r2, &sum2, n)?;
+                let avg = gpu.alloc_f32(n)?;
+                gpu.scale_third_f32(&sum2, &avg, n)?;
+                if stage == num_ups - 1 {
+                    // Last stage: keep f32 for conv_post (avoid f16 quantization before exp())
+                    _rb_keep.push(r0); _rb_keep.push(r1); _rb_keep.push(r2);
+                    _rb_keep.push(sum); _rb_keep.push(sum2);
+                    drop(_rb_keep);
+                    gpu.flush()?;
+                    if compare {
+                        let avg_cmp = gpu.download_f32(&avg, n)?;
+                        let ch = cpu_h.as_ref().unwrap();
+                        let cpu_r0 = self.resblocks[base].forward(ch, style)?;
+                        let cpu_r1 = self.resblocks[base + 1].forward(ch, style)?;
+                        let cpu_r2 = self.resblocks[base + 2].forward(ch, style)?;
+                        let cpu_avg = ((cpu_r0 + cpu_r1)? + cpu_r2)? / 3.0;
+                        let cpu_avg = cpu_avg?;
+                        let cpu_data: Vec<f32> = cpu_avg.flatten_all()?.to_vec1()?;
+                        let mut max_err: f32 = 0.0;
+                        let mut rms_sum: f64 = 0.0;
+                        for i in 0..avg_cmp.len().min(cpu_data.len()) {
+                            let d = (avg_cmp[i] - cpu_data[i]).abs();
+                            rms_sum += (d as f64) * (d as f64);
+                            if d > max_err { max_err = d; }
+                        }
+                        let rms = (rms_sum / avg_cmp.len() as f64).sqrt();
+                        eprintln!("  [stage{stage} resblocks f32] n={} max_err={max_err:.4} rms={rms:.6}", avg_cmp.len());
+                    }
+                    // conv_post: leaky_relu(0.01) on f32 → conv1d_f32
+                    // Download f32, apply lrelu on CPU, re-upload as f32
+                    let avg_data = gpu.download_f32(&avg, n)?;
+                    let lrelu_data: Vec<f32> = avg_data.iter()
+                        .map(|&v| if v < 0.0 { v * 0.01 } else { v })
+                        .collect();
+                    let lrelu_buf = gpu.upload_f32(&lrelu_data)?;
+                    let (c_out, _, k) = self.conv_post_weight.dims3()?;
+                    let cp_padding = (k - 1) / 2;
+                    let t_out = h_t;
+                    let w_buf = upload_weight(gpu, &self.conv_post_weight)?;
+                    let b_buf = upload_weight(gpu, &self.conv_post_bias)?;
+                    let out_f32 = gpu.alloc_f32(c_out * t_out)?;
+                    gpu.conv1d_f32(&lrelu_buf, &w_buf, &b_buf, &out_f32, h_c, c_out, h_t, t_out, k, 1, cp_padding, 1)?;
+                    let out_data = gpu.download_f32(&out_f32, c_out * t_out)?;
+                    if compare {
+                        let ch = cpu_h.as_ref().unwrap();
+                        let cpu_r0 = self.resblocks[base].forward(ch, style)?;
+                        let cpu_r1 = self.resblocks[base + 1].forward(ch, style)?;
+                        let cpu_r2 = self.resblocks[base + 2].forward(ch, style)?;
+                        let cpu_avg = ((cpu_r0 + cpu_r1)? + cpu_r2)? / 3.0;
+                        let cpu_avg = cpu_avg?;
+                        let cpu_lrelu = leaky_relu(&cpu_avg, 0.01)?;
+                        let cpu_conv = cpu_lrelu.conv1d(&self.conv_post_weight, cp_padding, 1, 1, 1)?;
+                        let cpu_conv = cpu_conv.broadcast_add(&self.conv_post_bias.unsqueeze(0)?.unsqueeze(2)?)?;
+                        let cpu_data: Vec<f32> = cpu_conv.flatten_all()?.to_vec1()?;
+                        let mut max_err: f32 = 0.0;
+                        let mut rms_sum: f64 = 0.0;
+                        for i in 0..out_data.len().min(cpu_data.len()) {
+                            let d = (out_data[i] - cpu_data[i]).abs();
+                            rms_sum += (d as f64) * (d as f64);
+                            if d > max_err { max_err = d; }
+                        }
+                        let rms = (rms_sum / out_data.len() as f64).sqrt();
+                        eprintln!("  [conv_post f32] n={} max_err={max_err:.4} rms={rms:.6}", out_data.len());
+                    }
+                    let h = Tensor::from_vec(out_data, &[1, c_out, t_out][..], &device)?;
+                    let n_fft = self.istft_n_fft;
+                    let n_bins = n_fft / 2 + 1;
+                    let mag = h.narrow(1, 0, n_bins)?.exp()?;
+                    let phase = h.narrow(1, n_bins, n_bins)?.sin()?;
+                    return istft(&mag, &phase, n_fft, self.istft_hop);
+                }
+                // Non-last stage: save f32 avg as carry for next stage's upsample
+                h_f32_carry = Some(avg);
+                h_buf = gpu.alloc(n)?;
+                gpu.f32_to_f16(h_f32_carry.as_ref().unwrap(), &h_buf, n)?;
+                _rb_keep.push(r0);
+                _rb_keep.push(r1);
+                _rb_keep.push(r2);
+                _rb_keep.push(sum);
+                _rb_keep.push(sum2);
+            } else {
+                let r0 = self.resblocks[base].forward_gpu_precomputed_dbg(&h_buf, &all_resblock_params[base], gpu, h_c, h_t, dbg_rb)?;
+                let r1 = self.resblocks[base + 1].forward_gpu_precomputed(&h_buf, &all_resblock_params[base + 1], gpu, h_c, h_t)?;
+                let r2 = self.resblocks[base + 2].forward_gpu_precomputed(&h_buf, &all_resblock_params[base + 2], gpu, h_c, h_t)?;
+                let sum = gpu.add(&r0, &r1, n)?;
+                let sum = gpu.add(&sum, &r2, n)?;
+                h_buf = gpu.scale(&sum, n, 1.0 / 3.0)?;
+            }
+            drop(_rb_keep);
+
+            if compare {
+                let ch = cpu_h.as_ref().unwrap();
+                let cpu_r0 = self.resblocks[base].forward(ch, style)?;
+                let cpu_r1 = self.resblocks[base + 1].forward(ch, style)?;
+                let cpu_r2 = self.resblocks[base + 2].forward(ch, style)?;
+                let cpu_avg = ((cpu_r0 + cpu_r1)? + cpu_r2)? / 3.0;
+                let cpu_avg = cpu_avg?;
+                compare_gpu_cpu(gpu, &h_buf, &cpu_avg, &format!("stage{stage} resblocks"));
+                cpu_h = Some(cpu_avg);
+            }
         }
 
-        // Leaky_relu(0.01) + conv_post
-        let (h_buf, h_c, h_t) = buf_conv1d_lrelu001(gpu, &h_buf, &self.conv_post_weight, &self.conv_post_bias, h_c, h_t, 3, 1, 1)?;
+        // Ensure all resblock work completes before conv_post reads h_buf
+        gpu.flush()?;
 
-        // Download and do iSTFT on CPU
-        #[cfg(feature = "triton-metal")]
-        let _ = self.conv_post_weight.device().as_metal_device().map(|md| md.wait_until_completed());
-        let out_data = gpu.download_f16(&h_buf, h_c * h_t)?;
-        let h = Tensor::from_vec(out_data, &[1, h_c, h_t][..], &device)?.to_dtype(DType::F32)?;
+        // Leaky_relu(0.01) + conv_post
+        // When f32 intermediates available, output conv_post as f32 to avoid
+
+        // exp() amplifying f16 quantization error in iSTFT magnitude
+        let h = if gpu.has_f32_intermediates() {
+            let n = h_c * h_t;
+            let lrelu_buf = gpu.alloc(n)?;
+            gpu.leaky_relu(&h_buf, &lrelu_buf, n, 0.01)?;
+            gpu.flush()?;
+            let h_f32 = gpu.alloc_f32(n)?;
+            gpu.f16_to_f32(&lrelu_buf, &h_f32, n)?;
+            gpu.flush()?;
+            let (c_out, _, k) = self.conv_post_weight.dims3()?;
+            let padding = (k - 1) / 2;
+            let t_out = h_t; // padding=(k-1)/2, stride=1 → t_out = t_in
+            let w_buf = upload_weight(gpu, &self.conv_post_weight)?;
+            let b_buf = upload_weight(gpu, &self.conv_post_bias)?;
+            let out_f32 = gpu.alloc_f32(c_out * t_out)?;
+            gpu.conv1d_f32(&h_f32, &w_buf, &b_buf, &out_f32, h_c, c_out, h_t, t_out, k, 1, padding, 1)?;
+            let out_data = gpu.download_f32(&out_f32, c_out * t_out)?;
+            if compare {
+                let ch = cpu_h.as_ref().unwrap();
+                let cpu_lrelu = leaky_relu(ch, 0.01)?;
+                let cpu_conv = cpu_lrelu.conv1d(&self.conv_post_weight, 3, 1, 1, 1)?;
+                let cpu_conv = cpu_conv.broadcast_add(&self.conv_post_bias.unsqueeze(0)?.unsqueeze(2)?)?;
+                let cpu_data: Vec<f32> = cpu_conv.flatten_all()?.to_vec1()?;
+                let mut max_err: f32 = 0.0;
+                let mut max_idx = 0;
+                for i in 0..out_data.len().min(cpu_data.len()) {
+                    let d = (out_data[i] - cpu_data[i]).abs();
+                    if d > max_err { max_err = d; max_idx = i; }
+                }
+                eprintln!("  [conv_post f32] n={} max_err={max_err:.4} (gpu={:.4} cpu={:.4} at {max_idx})",
+                    out_data.len(), out_data[max_idx], cpu_data[max_idx]);
+            }
+            Tensor::from_vec(out_data, &[1, c_out, t_out][..], &device)?
+        } else {
+            let (h_buf, h_c, h_t) = buf_conv1d_lrelu001(gpu, &h_buf, &self.conv_post_weight, &self.conv_post_bias, h_c, h_t, 3, 1, 1)?;
+
+            if compare {
+                let ch = cpu_h.as_ref().unwrap();
+                let cpu_lrelu = leaky_relu(ch, 0.01)?;
+                let cpu_conv = cpu_lrelu.conv1d(&self.conv_post_weight, 3, 1, 1, 1)?;
+                let cpu_conv = cpu_conv.broadcast_add(&self.conv_post_bias.unsqueeze(0)?.unsqueeze(2)?)?;
+                compare_gpu_cpu(gpu, &h_buf, &cpu_conv, "conv_post");
+            }
+
+            // Download and do iSTFT on CPU
+            #[cfg(feature = "triton-metal")]
+            let _ = self.conv_post_weight.device().as_metal_device().map(|md| md.wait_until_completed());
+            let out_data = gpu.download_f16(&h_buf, h_c * h_t)?;
+            Tensor::from_vec(out_data, &[1, h_c, h_t][..], &device)?.to_dtype(DType::F32)?
+        };
+
         let n_fft = self.istft_n_fft;
         let n_bins = n_fft / 2 + 1;
         let mag = h.narrow(1, 0, n_bins)?.exp()?;
@@ -531,6 +800,29 @@ impl Generator {
 // ── Tensor↔Buffer bridge: all GPU work stays in buffer space ──
 
 #[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
+fn compare_gpu_cpu<G: KokoroGpuBackend>(gpu: &G, gpu_buf: &G::Buf, cpu_tensor: &Tensor, label: &str) {
+    let cpu_f16: Vec<half::f16> = cpu_tensor.to_dtype(DType::F16).unwrap()
+        .flatten_all().unwrap().to_vec1().unwrap();
+    let n = cpu_f16.len();
+    let gpu_data = gpu.download_f16(gpu_buf, n).unwrap();
+    let mut max_err: f32 = 0.0;
+    let mut sum_sq: f64 = 0.0;
+    let mut max_idx = 0;
+    for i in 0..n {
+        let diff = (gpu_data[i].to_f32() - cpu_f16[i].to_f32()).abs();
+        sum_sq += (diff as f64) * (diff as f64);
+        if diff > max_err {
+            max_err = diff;
+            max_idx = i;
+        }
+    }
+    let rms = (sum_sq / n as f64).sqrt();
+    let gpu_val = gpu_data[max_idx].to_f32();
+    let cpu_val = cpu_f16[max_idx].to_f32();
+    eprintln!("  [{label}] n={n} max_err={max_err:.4} rms={rms:.6} (at {max_idx}: gpu={gpu_val:.4} cpu={cpu_val:.4})");
+}
+
+#[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
 fn tensor_id_usize(t: &Tensor) -> usize {
     let id = t.id();
     unsafe { std::mem::transmute::<candle_core::TensorId, usize>(id) }
@@ -638,9 +930,21 @@ impl ResBlock {
         &self, x: &G::Buf, adain_params: &[(G::Buf, G::Buf)], gpu: &G,
         channels: usize, seq_len: usize,
     ) -> Result<G::Buf> {
+        self.forward_gpu_precomputed_dbg(x, adain_params, gpu, channels, seq_len, None)
+    }
+
+    fn forward_gpu_precomputed_dbg<G: KokoroGpuBackend>(
+        &self, x: &G::Buf, adain_params: &[(G::Buf, G::Buf)], gpu: &G,
+        channels: usize, seq_len: usize, dbg_input: Option<(&Tensor, &Tensor)>,
+    ) -> Result<G::Buf> {
+        if gpu.has_f32_intermediates() {
+            return self.forward_gpu_f32(x, adain_params, gpu, channels, seq_len);
+        }
+
         let dilations = [1usize, 3, 5];
         let n = channels * seq_len;
         let mut h = x.clone();
+        let mut cpu_h_opt: Option<Tensor> = dbg_input.map(|(t, _)| t.clone());
 
         for i in 0..3 {
             let residual = h.clone();
@@ -650,23 +954,361 @@ impl ResBlock {
             gpu.adain_snake(&h, &adain_params[i].0, &adain_params[i].1, &alpha1_buf, &out, channels, seq_len)?;
             h = out;
 
+            if let Some(ref ch) = cpu_h_opt {
+                let style = dbg_input.unwrap().1;
+                let cpu_val = adain(ch, style, &self.adain1[i], channels)?;
+                let cpu_val = snake_activation_tensor(&cpu_val, &self.alpha1[i])?;
+                compare_gpu_cpu(gpu, &h, &cpu_val.to_dtype(DType::F16)?.to_dtype(DType::F32)?, &format!("rb_iter{i} adain_snake1"));
+                cpu_h_opt = Some(cpu_val);
+            }
+
             let dilation = dilations[i];
             let padding1 = (self.kernel_size - 1) * dilation / 2;
             let (w1, b1) = &self.convs1[i];
             let (h_new, _, _) = buf_conv1d(gpu, &h, w1, b1, channels, seq_len, padding1, 1, dilation)?;
             h = h_new;
 
+            if let Some(ref ch) = cpu_h_opt {
+                let cpu_val = ch.conv1d(w1, padding1, 1, dilation, 1)?;
+                let cpu_val = cpu_val.broadcast_add(&b1.unsqueeze(0)?.unsqueeze(2)?)?;
+                compare_gpu_cpu(gpu, &h, &cpu_val.to_dtype(DType::F16)?.to_dtype(DType::F32)?, &format!("rb_iter{i} conv1"));
+                cpu_h_opt = Some(cpu_val);
+            }
+
             let alpha2_buf = upload_weight(gpu, &self.alpha2[i].reshape(channels)?)?;
             let out = gpu.alloc(n)?;
             gpu.adain_snake(&h, &adain_params[3 + i].0, &adain_params[3 + i].1, &alpha2_buf, &out, channels, seq_len)?;
             h = out;
+
+            if let Some(ref ch) = cpu_h_opt {
+                let style = dbg_input.unwrap().1;
+                let cpu_val = adain(ch, style, &self.adain2[i], channels)?;
+                let cpu_val = snake_activation_tensor(&cpu_val, &self.alpha2[i])?;
+                compare_gpu_cpu(gpu, &h, &cpu_val.to_dtype(DType::F16)?.to_dtype(DType::F32)?, &format!("rb_iter{i} adain_snake2"));
+                cpu_h_opt = Some(cpu_val);
+            }
 
             let padding2 = (self.kernel_size - 1) / 2;
             let (w2, b2) = &self.convs2[i];
             let (h_new, _, _) = buf_conv1d(gpu, &h, w2, b2, channels, seq_len, padding2, 1, 1)?;
             h = h_new;
 
+            if let Some(ref ch) = cpu_h_opt {
+                let cpu_val = ch.conv1d(w2, padding2, 1, 1, 1)?;
+                let cpu_val = cpu_val.broadcast_add(&b2.unsqueeze(0)?.unsqueeze(2)?)?;
+                compare_gpu_cpu(gpu, &h, &cpu_val.to_dtype(DType::F16)?.to_dtype(DType::F32)?, &format!("rb_iter{i} conv2"));
+                cpu_h_opt = Some(cpu_val);
+            }
+
             h = gpu.add(&h, &residual, n)?;
+        }
+
+        Ok(h)
+    }
+
+    /// F32-intermediate resblock: keeps activations in f32 within the resblock
+    /// to prevent instance normalization from amplifying f16 quantization errors.
+    fn forward_gpu_f32<G: KokoroGpuBackend>(
+        &self, x: &G::Buf, adain_params: &[(G::Buf, G::Buf)], gpu: &G,
+        channels: usize, seq_len: usize,
+    ) -> Result<G::Buf> {
+        let mut keep = Vec::new();
+        self.forward_gpu_f32_into(x, adain_params, gpu, channels, seq_len, &mut keep)
+    }
+
+    /// Like forward_gpu_f32_noconv but takes an already-f32 input buffer (no f16→f32 step).
+    /// Returns f32 buffer.
+    fn forward_gpu_f32_direct_noconv<G: KokoroGpuBackend>(
+        &self, x_f32: &G::Buf, adain_params: &[(G::Buf, G::Buf)], gpu: &G,
+        channels: usize, seq_len: usize, keep: &mut Vec<G::Buf>,
+    ) -> Result<G::Buf> {
+        let dilations = [1usize, 3, 5];
+        let n = channels * seq_len;
+        let mut h = x_f32.clone();
+        for i in 0..3 {
+            let residual = h.clone();
+            let alpha1_buf = upload_weight(gpu, &self.alpha1[i].reshape(channels)?)?;
+            let out = gpu.alloc_f32(n)?;
+            gpu.adain_snake_f32(&h, &adain_params[i].0, &adain_params[i].1, &alpha1_buf, &out, channels, seq_len)?;
+            keep.push(h); h = out;
+            let dilation = dilations[i];
+            let padding1 = (self.kernel_size - 1) * dilation / 2;
+            let (w1, b1) = &self.convs1[i];
+            let w1_buf = upload_weight(gpu, w1)?;
+            let b1_buf = upload_weight(gpu, b1)?;
+            let out = gpu.alloc_f32(n)?;
+            gpu.conv1d_f32(&h, &w1_buf, &b1_buf, &out, channels, channels, seq_len, seq_len, self.kernel_size, 1, padding1, dilation)?;
+            keep.push(h); h = out;
+            let alpha2_buf = upload_weight(gpu, &self.alpha2[i].reshape(channels)?)?;
+            let out = gpu.alloc_f32(n)?;
+            gpu.adain_snake_f32(&h, &adain_params[3 + i].0, &adain_params[3 + i].1, &alpha2_buf, &out, channels, seq_len)?;
+            keep.push(h); h = out;
+            let padding2 = (self.kernel_size - 1) / 2;
+            let (w2, b2) = &self.convs2[i];
+            let w2_buf = upload_weight(gpu, w2)?;
+            let b2_buf = upload_weight(gpu, b2)?;
+            let out = gpu.alloc_f32(n)?;
+            gpu.conv1d_f32(&h, &w2_buf, &b2_buf, &out, channels, channels, seq_len, seq_len, self.kernel_size, 1, padding2, 1)?;
+            keep.push(h); h = out;
+            let out = gpu.alloc_f32(n)?;
+            gpu.add_f32(&h, &residual, &out, n)?;
+            keep.push(h); h = out;
+        }
+        Ok(h)
+    }
+
+    /// Like forward_gpu_f32_into but takes an already-f32 input buffer (no f16→f32 step).
+    /// Returns f16 buffer (for noise path).
+    fn forward_gpu_f32_direct<G: KokoroGpuBackend>(
+        &self, x_f32: &G::Buf, adain_params: &[(G::Buf, G::Buf)], gpu: &G,
+        channels: usize, seq_len: usize, keep: &mut Vec<G::Buf>,
+    ) -> Result<G::Buf> {
+        let dbg = std::env::var("KOKORO_DBG_NOISE").is_ok() && seq_len > 10000;
+        let dilations = [1usize, 3, 5];
+        let n = channels * seq_len;
+        let mut h = x_f32.clone();
+
+        if dbg {
+            let data = gpu.download_f32(&h, n)?;
+            let idx = 883174usize.min(n - 1);
+            let ch_idx = idx / seq_len;
+            let t_idx = idx % seq_len;
+            let ch_data = &data[ch_idx*seq_len..(ch_idx+1)*seq_len];
+            let mean: f64 = ch_data.iter().map(|v| *v as f64).sum::<f64>() / seq_len as f64;
+            let var: f64 = ch_data.iter().map(|v| { let d = *v as f64 - mean; d*d }).sum::<f64>() / seq_len as f64;
+            let rstd = 1.0 / (var as f32 + 1e-5).sqrt();
+            eprintln!("    [noise_dbg] input: val[{idx}]={:.6} ch{ch_idx} t{t_idx} mean={:.6} var={:.6} rstd={:.2}", data[idx], mean, var, rstd);
+        }
+
+        for i in 0..3 {
+            let residual = h.clone();
+
+            let alpha1_buf = upload_weight(gpu, &self.alpha1[i].reshape(channels)?)?;
+            let out = gpu.alloc_f32(n)?;
+            gpu.adain_snake_f32(&h, &adain_params[i].0, &adain_params[i].1, &alpha1_buf, &out, channels, seq_len)?;
+            keep.push(h);
+            h = out;
+
+            if dbg {
+                let data = gpu.download_f32(&h, n)?;
+                let idx = 883174usize.min(n - 1);
+                eprintln!("    [noise_dbg] i={i} after adain1: val[{idx}]={:.6}", data[idx]);
+            }
+
+            let dilation = dilations[i];
+            let padding1 = (self.kernel_size - 1) * dilation / 2;
+            let (w1, b1) = &self.convs1[i];
+            let w1_buf = upload_weight(gpu, w1)?;
+            let b1_buf = upload_weight(gpu, b1)?;
+            let out = gpu.alloc_f32(n)?;
+            gpu.conv1d_f32(&h, &w1_buf, &b1_buf, &out, channels, channels, seq_len, seq_len, self.kernel_size, 1, padding1, dilation)?;
+            keep.push(h);
+            h = out;
+
+            if dbg {
+                let data = gpu.download_f32(&h, n)?;
+                let idx = 883174usize.min(n - 1);
+                eprintln!("    [noise_dbg] i={i} after conv1: val[{idx}]={:.6}", data[idx]);
+            }
+
+            let alpha2_buf = upload_weight(gpu, &self.alpha2[i].reshape(channels)?)?;
+            let out = gpu.alloc_f32(n)?;
+            gpu.adain_snake_f32(&h, &adain_params[3 + i].0, &adain_params[3 + i].1, &alpha2_buf, &out, channels, seq_len)?;
+            keep.push(h);
+            h = out;
+
+            if dbg {
+                let data = gpu.download_f32(&h, n)?;
+                let idx = 883174usize.min(n - 1);
+                eprintln!("    [noise_dbg] i={i} after adain2: val[{idx}]={:.6}", data[idx]);
+            }
+
+            let padding2 = (self.kernel_size - 1) / 2;
+            let (w2, b2) = &self.convs2[i];
+            let w2_buf = upload_weight(gpu, w2)?;
+            let b2_buf = upload_weight(gpu, b2)?;
+            let out = gpu.alloc_f32(n)?;
+            gpu.conv1d_f32(&h, &w2_buf, &b2_buf, &out, channels, channels, seq_len, seq_len, self.kernel_size, 1, padding2, 1)?;
+            keep.push(h);
+            h = out;
+
+            if dbg {
+                let data = gpu.download_f32(&h, n)?;
+                let idx = 883174usize.min(n - 1);
+                eprintln!("    [noise_dbg] i={i} after conv2: val[{idx}]={:.6}", data[idx]);
+            }
+
+            let out = gpu.alloc_f32(n)?;
+            gpu.add_f32(&h, &residual, &out, n)?;
+            keep.push(h);
+            h = out;
+
+            if dbg {
+                let data = gpu.download_f32(&h, n)?;
+                let idx = 883174usize.min(n - 1);
+                eprintln!("    [noise_dbg] i={i} after add: val[{idx}]={:.6}", data[idx]);
+            }
+        }
+
+        if dbg {
+            let data = gpu.download_f32(&h, n)?;
+            let idx = 883174usize.min(n - 1);
+            eprintln!("    [noise_dbg] f32 output: val[{idx}]={:.6}", data[idx]);
+        }
+
+        let out_f16 = gpu.alloc(n)?;
+        gpu.f32_to_f16(&h, &out_f16, n)?;
+
+        if dbg {
+            let f16_data = gpu.download_f16(&out_f16, n)?;
+            let idx = 883174usize.min(n - 1);
+            eprintln!("    [noise_dbg] f16 output: val[{idx}]={:.6}", f16_data[idx].to_f32());
+        }
+
+        Ok(out_f16)
+    }
+
+    fn forward_gpu_f32_into<G: KokoroGpuBackend>(
+        &self, x: &G::Buf, adain_params: &[(G::Buf, G::Buf)], gpu: &G,
+        channels: usize, seq_len: usize, keep: &mut Vec<G::Buf>,
+    ) -> Result<G::Buf> {
+        let dbg = std::env::var("KOKORO_DBG_RB").is_ok() && channels == 128;
+        let dilations = [1usize, 3, 5];
+        let n = channels * seq_len;
+
+        let mut h = gpu.alloc_f32(n)?;
+        gpu.f16_to_f32(x, &h, n)?;
+
+        if dbg {
+            let data = gpu.download_f32(&h, n)?;
+            let max_abs = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            eprintln!("    [rb_dbg] after f16_to_f32: max_abs={max_abs:.4} first10={:.4?}", &data[..10]);
+        }
+
+        for i in 0..3 {
+            let residual = h.clone();
+
+            let alpha1_buf = upload_weight(gpu, &self.alpha1[i].reshape(channels)?)?;
+            let out = gpu.alloc_f32(n)?;
+            gpu.adain_snake_f32(&h, &adain_params[i].0, &adain_params[i].1, &alpha1_buf, &out, channels, seq_len)?;
+            keep.push(h);
+            h = out;
+
+            if dbg && i == 0 {
+                let data = gpu.download_f32(&h, n)?;
+                let max_abs = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                eprintln!("    [rb_dbg] i={i} after adain1: max_abs={max_abs:.4} first10={:.4?}", &data[..10]);
+            }
+
+            let dilation = dilations[i];
+            let padding1 = (self.kernel_size - 1) * dilation / 2;
+            let (w1, b1) = &self.convs1[i];
+            let w1_buf = upload_weight(gpu, w1)?;
+            let b1_buf = upload_weight(gpu, b1)?;
+            let out = gpu.alloc_f32(n)?;
+            gpu.conv1d_f32(&h, &w1_buf, &b1_buf, &out, channels, channels, seq_len, seq_len, self.kernel_size, 1, padding1, dilation)?;
+            keep.push(h);
+            h = out;
+
+            if dbg && i == 0 {
+                let data = gpu.download_f32(&h, n)?;
+                let max_abs = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                eprintln!("    [rb_dbg] i={i} after conv1: max_abs={max_abs:.4} first10={:.4?}", &data[..10]);
+            }
+
+            let alpha2_buf = upload_weight(gpu, &self.alpha2[i].reshape(channels)?)?;
+            let out = gpu.alloc_f32(n)?;
+            gpu.adain_snake_f32(&h, &adain_params[3 + i].0, &adain_params[3 + i].1, &alpha2_buf, &out, channels, seq_len)?;
+            keep.push(h);
+            h = out;
+
+            if dbg && i == 0 {
+                let data = gpu.download_f32(&h, n)?;
+                let max_abs = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                eprintln!("    [rb_dbg] i={i} after adain2: max_abs={max_abs:.4} first10={:.4?}", &data[..10]);
+            }
+
+            let padding2 = (self.kernel_size - 1) / 2;
+            let (w2, b2) = &self.convs2[i];
+            let w2_buf = upload_weight(gpu, w2)?;
+            let b2_buf = upload_weight(gpu, b2)?;
+            let out = gpu.alloc_f32(n)?;
+            gpu.conv1d_f32(&h, &w2_buf, &b2_buf, &out, channels, channels, seq_len, seq_len, self.kernel_size, 1, padding2, 1)?;
+            keep.push(h);
+            h = out;
+
+            if dbg && i == 0 {
+                let data = gpu.download_f32(&h, n)?;
+                let max_abs = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                eprintln!("    [rb_dbg] i={i} after conv2: max_abs={max_abs:.4} first10={:.4?}", &data[..10]);
+            }
+
+            let out = gpu.alloc_f32(n)?;
+            gpu.add_f32(&h, &residual, &out, n)?;
+            keep.push(h);
+            h = out;
+
+            if dbg && i == 0 {
+                let data = gpu.download_f32(&h, n)?;
+                let max_abs = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                eprintln!("    [rb_dbg] i={i} after add: max_abs={max_abs:.4} first10={:.4?}", &data[..10]);
+            }
+        }
+
+        let out_f16 = gpu.alloc(n)?;
+        gpu.f32_to_f16(&h, &out_f16, n)?;
+        Ok(out_f16)
+    }
+
+    /// Like forward_gpu_f32_into but returns the f32 buffer directly (no f32→f16 conversion).
+    fn forward_gpu_f32_noconv<G: KokoroGpuBackend>(
+        &self, x: &G::Buf, adain_params: &[(G::Buf, G::Buf)], gpu: &G,
+        channels: usize, seq_len: usize, keep: &mut Vec<G::Buf>,
+    ) -> Result<G::Buf> {
+        let dilations = [1usize, 3, 5];
+        let n = channels * seq_len;
+
+        let mut h = gpu.alloc_f32(n)?;
+        gpu.f16_to_f32(x, &h, n)?;
+
+        for i in 0..3 {
+            let residual = h.clone();
+
+            let alpha1_buf = upload_weight(gpu, &self.alpha1[i].reshape(channels)?)?;
+            let out = gpu.alloc_f32(n)?;
+            gpu.adain_snake_f32(&h, &adain_params[i].0, &adain_params[i].1, &alpha1_buf, &out, channels, seq_len)?;
+            keep.push(h);
+            h = out;
+
+            let dilation = dilations[i];
+            let padding1 = (self.kernel_size - 1) * dilation / 2;
+            let (w1, b1) = &self.convs1[i];
+            let w1_buf = upload_weight(gpu, w1)?;
+            let b1_buf = upload_weight(gpu, b1)?;
+            let out = gpu.alloc_f32(n)?;
+            gpu.conv1d_f32(&h, &w1_buf, &b1_buf, &out, channels, channels, seq_len, seq_len, self.kernel_size, 1, padding1, dilation)?;
+            keep.push(h);
+            h = out;
+
+            let alpha2_buf = upload_weight(gpu, &self.alpha2[i].reshape(channels)?)?;
+            let out = gpu.alloc_f32(n)?;
+            gpu.adain_snake_f32(&h, &adain_params[3 + i].0, &adain_params[3 + i].1, &alpha2_buf, &out, channels, seq_len)?;
+            keep.push(h);
+            h = out;
+
+            let padding2 = (self.kernel_size - 1) / 2;
+            let (w2, b2) = &self.convs2[i];
+            let w2_buf = upload_weight(gpu, w2)?;
+            let b2_buf = upload_weight(gpu, b2)?;
+            let out = gpu.alloc_f32(n)?;
+            gpu.conv1d_f32(&h, &w2_buf, &b2_buf, &out, channels, channels, seq_len, seq_len, self.kernel_size, 1, padding2, 1)?;
+            keep.push(h);
+            h = out;
+
+            let out = gpu.alloc_f32(n)?;
+            gpu.add_f32(&h, &residual, &out, n)?;
+            keep.push(h);
+            h = out;
         }
 
         Ok(h)
@@ -730,6 +1372,39 @@ impl ResBlock {
             let (w2, b2) = &self.convs2[i];
             h = h.conv1d(w2, padding2, 1, 1, 1)?;
             h = h.broadcast_add(&b2.unsqueeze(0)?.unsqueeze(2)?)?;
+
+            h = (h + residual)?;
+        }
+
+        Ok(h)
+    }
+
+    /// Forward with f16-quantized weights (simulates GPU precision).
+    fn forward_f16_weights(&self, x: &Tensor, style: &Tensor) -> Result<Tensor> {
+        let dilations = [1usize, 3, 5];
+        let mut h = x.clone();
+
+        for i in 0..3 {
+            let residual = h.clone();
+            let dilation = dilations[i];
+            let padding1 = (self.kernel_size - 1) * dilation / 2;
+            let padding2 = (self.kernel_size - 1) / 2;
+
+            h = adain(&h, style, &self.adain1[i], self.channels)?;
+            h = snake_activation_tensor(&h, &self.alpha1[i])?;
+            let (w1, b1) = &self.convs1[i];
+            let w1_f16 = w1.to_dtype(DType::F16)?.to_dtype(DType::F32)?;
+            let b1_f16 = b1.to_dtype(DType::F16)?.to_dtype(DType::F32)?;
+            h = h.conv1d(&w1_f16, padding1, 1, dilation, 1)?;
+            h = h.broadcast_add(&b1_f16.unsqueeze(0)?.unsqueeze(2)?)?;
+
+            h = adain(&h, style, &self.adain2[i], self.channels)?;
+            h = snake_activation_tensor(&h, &self.alpha2[i])?;
+            let (w2, b2) = &self.convs2[i];
+            let w2_f16 = w2.to_dtype(DType::F16)?.to_dtype(DType::F32)?;
+            let b2_f16 = b2.to_dtype(DType::F16)?.to_dtype(DType::F32)?;
+            h = h.conv1d(&w2_f16, padding2, 1, 1, 1)?;
+            h = h.broadcast_add(&b2_f16.unsqueeze(0)?.unsqueeze(2)?)?;
 
             h = (h + residual)?;
         }

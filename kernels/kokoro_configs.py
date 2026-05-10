@@ -19,9 +19,39 @@ KOKORO_KERNELS = [
      4, ["cdiv(n_elements, 1024)", "1", "1"]),
 
     # ── Fused AdaIN + Snake (saves one full pass over data) ──
+    # 1k: single-pass for seq_len <= 1024
     ("kokoro_adain_snake_1024", "adain_snake_fused",
      "*fp16, *fp16, *fp16, *fp16, *fp16, i32, i32, 1024",
      4, ["n_channels", "1", "1"]),
+
+    # 2k: looped for seq_len <= 2048 (stage0: 256ch x 1240t)
+    ("kokoro_adain_snake_2048", "adain_snake_looped",
+     "*fp16, *fp16, *fp16, *fp16, *fp16, i32, i32, 1024, 2048",
+     4, ["n_channels", "1", "1"]),
+
+    # 8k: looped for seq_len <= 8192 (stage1: 128ch x 7441t)
+    ("kokoro_adain_snake_8192", "adain_snake_looped",
+     "*fp16, *fp16, *fp16, *fp16, *fp16, i32, i32, 1024, 8192",
+     4, ["n_channels", "1", "1"]),
+
+    # ── Two-pass AdaIN+Snake (split reduction from element-wise) ──
+    # Pass 1: instance norm stats (mean+rstd per channel)
+    ("kokoro_instance_norm_stats_2k", "instance_norm_stats",
+     "*fp16, *fp32, i32, i32, 1024, 2048",
+     4, ["n_channels", "1", "1"]),
+
+    ("kokoro_instance_norm_stats_8k", "instance_norm_stats",
+     "*fp16, *fp32, i32, i32, 1024, 8192",
+     4, ["n_channels", "1", "1"]),
+
+    ("kokoro_instance_norm_stats_32k", "instance_norm_stats",
+     "*fp16, *fp32, i32, i32, 1024, 32768",
+     4, ["n_channels", "1", "1"]),
+
+    # Pass 2: normalize + style + snake (element-wise)
+    ("kokoro_norm_style_snake", "norm_style_snake",
+     "*fp16, *fp32, *fp16, *fp16, *fp16, *fp16, i32, i32, i32, 1024",
+     4, ["cdiv(n_elements, 1024)", "1", "1"]),
 
 
     # ── LeakyReLU ──
@@ -98,6 +128,53 @@ KOKORO_KERNELS = [
     # ── Row-broadcast bias add: out[i] = x[i] + bias[i / n_cols] ──
     ("kokoro_row_bias_add", "row_bias_add",
      "*fp16, *fp16, *fp16, i32, i32, 1024",
+     4, ["cdiv(n_elements, 1024)", "1", "1"]),
+
+    # ── F32-intermediate variants (prevents precision loss through normalization) ──
+
+    # Conv1d with f32 input/output, f16 weights
+    ("kokoro_conv1d_f32io", "conv1d_f32io",
+     "*fp32, *fp16, *fp16, *fp32, i32, i32, i32, i32, i32, i32, i32, i32, 256",
+     4, ["C_out", "cdiv(T_out, 256)", "1"]),
+
+    # Instance norm stats from f32 input (2k variant)
+    ("kokoro_instance_norm_stats_f32in_2k", "instance_norm_stats_f32in",
+     "*fp32, *fp32, i32, i32, 1024, 2048",
+     4, ["n_channels", "1", "1"]),
+
+    # Instance norm stats from f32 input (8k variant)
+    ("kokoro_instance_norm_stats_f32in_8k", "instance_norm_stats_f32in",
+     "*fp32, *fp32, i32, i32, 1024, 8192",
+     4, ["n_channels", "1", "1"]),
+
+    # Instance norm stats from f32 input (32k variant, for long sequences after full upsample)
+    ("kokoro_instance_norm_stats_f32in_32k", "instance_norm_stats_f32in",
+     "*fp32, *fp32, i32, i32, 1024, 32768",
+     4, ["n_channels", "1", "1"]),
+
+    # Normalize + style + snake: f32 in, f32 out
+    ("kokoro_norm_style_snake_f32io", "norm_style_snake_f32io",
+     "*fp32, *fp32, *fp16, *fp16, *fp16, *fp32, i32, i32, i32, 1024",
+     4, ["cdiv(n_elements, 1024)", "1", "1"]),
+
+    # Element-wise add of f32 buffers
+    ("kokoro_add_f32", "elementwise_add_f32",
+     "*fp32, *fp32, *fp32, i32, 1024",
+     4, ["cdiv(n_elements, 1024)", "1", "1"]),
+
+    # Scale f32 by 1/3
+    ("kokoro_scale_third_f32", "elementwise_scale_third_f32",
+     "*fp32, *fp32, i32, 1024",
+     4, ["cdiv(n_elements, 1024)", "1", "1"]),
+
+    # Convert f32 → f16
+    ("kokoro_f32_to_f16", "convert_f32_to_f16_kernel",
+     "*fp32, *fp16, i32, 1024",
+     4, ["cdiv(n_elements, 1024)", "1", "1"]),
+
+    # Convert f16 → f32
+    ("kokoro_f16_to_f32", "convert_f16_to_f32_kernel",
+     "*fp16, *fp32, i32, 1024",
      4, ["cdiv(n_elements, 1024)", "1", "1"]),
 
 ]

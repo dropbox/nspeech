@@ -20,6 +20,11 @@ pub trait KokoroGpuBackend {
     /// Download f16 buffer to CPU.
     fn download_f16(&self, buf: &Self::Buf, count: usize) -> Result<Vec<half::f16>>;
 
+    /// Upload f32 data (activation — not cached).
+    fn upload_f32(&self, data: &[f32]) -> Result<Self::Buf> {
+        Err(anyhow::anyhow!("upload_f32 not supported"))
+    }
+
     /// Element-wise add: returns new buffer where out[i] = a[i] + b[i].
     fn add(&self, a: &Self::Buf, b: &Self::Buf, n: usize) -> Result<Self::Buf> {
         let a_data = self.download_f16(a, n)?;
@@ -110,6 +115,7 @@ pub trait KokoroGpuBackend {
                      k: usize, stride: usize, padding: usize, dilation: usize) -> Result<()> {
         let col_buf = self.alloc(c_in * k * t_out)?;
         self.im2col(x, &col_buf, c_in, t_in, t_out, k, stride, padding, dilation)?;
+        self.flush()?;
         self.matmul_bias(w, &col_buf, bias, out, c_out, t_out, c_in * k)
     }
 
@@ -119,6 +125,61 @@ pub trait KokoroGpuBackend {
                            k: usize, stride: usize, padding: usize, dilation: usize) -> Result<()> {
         let col_buf = self.alloc(c_in * k * t_out)?;
         self.im2col_lrelu(x, &col_buf, c_in, t_in, t_out, k, stride, padding, dilation)?;
+        self.flush()?;
         self.matmul_bias(w, &col_buf, bias, out, c_out, t_out, c_in * k)
+    }
+
+    /// Flush pending GPU work. Ensures all previously dispatched kernels are
+    /// committed before new allocations, preventing buffer reuse races.
+    fn flush(&self) -> Result<()> { Ok(()) }
+
+    // ── F32-intermediate operations (prevent precision loss through normalization) ──
+
+    /// Whether this backend supports f32 intermediate buffers.
+    /// If true, resblocks use f32 activations to avoid f16 error amplification.
+    fn has_f32_intermediates(&self) -> bool { false }
+
+    /// Download f32 buffer to CPU. Only available when has_f32_intermediates() is true.
+    fn download_f32(&self, _buf: &Self::Buf, _count: usize) -> Result<Vec<f32>> {
+        Err(anyhow::anyhow!("download_f32 not supported"))
+    }
+
+    /// Allocate an f32 buffer for `count` elements (4 bytes each).
+    fn alloc_f32(&self, _count: usize) -> Result<Self::Buf> {
+        Err(anyhow::anyhow!("f32 alloc not supported"))
+    }
+
+    /// Convert f16 buffer to f32.
+    fn f16_to_f32(&self, _x: &Self::Buf, _out: &Self::Buf, _n: usize) -> Result<()> {
+        Err(anyhow::anyhow!("f16_to_f32 not supported"))
+    }
+
+    /// Convert f32 buffer to f16.
+    fn f32_to_f16(&self, _x: &Self::Buf, _out: &Self::Buf, _n: usize) -> Result<()> {
+        Err(anyhow::anyhow!("f32_to_f16 not supported"))
+    }
+
+    /// Conv1d with f32 input, f16 weights, f32 output.
+    fn conv1d_f32(&self, _x: &Self::Buf, _w: &Self::Buf, _bias: &Self::Buf, _out: &Self::Buf,
+                  _c_in: usize, _c_out: usize, _t_in: usize, _t_out: usize,
+                  _k: usize, _stride: usize, _padding: usize, _dilation: usize) -> Result<()> {
+        Err(anyhow::anyhow!("conv1d_f32 not supported"))
+    }
+
+    /// AdaIN + snake with f32 input and f32 output.
+    fn adain_snake_f32(&self, _x: &Self::Buf, _gamma: &Self::Buf, _beta: &Self::Buf,
+                       _alpha: &Self::Buf, _out: &Self::Buf,
+                       _channels: usize, _seq_len: usize) -> Result<()> {
+        Err(anyhow::anyhow!("adain_snake_f32 not supported"))
+    }
+
+    /// Element-wise add of f32 buffers.
+    fn add_f32(&self, _a: &Self::Buf, _b: &Self::Buf, _out: &Self::Buf, _n: usize) -> Result<()> {
+        Err(anyhow::anyhow!("add_f32 not supported"))
+    }
+
+    /// Scale f32 buffer by 1/3.
+    fn scale_third_f32(&self, _x: &Self::Buf, _out: &Self::Buf, _n: usize) -> Result<()> {
+        Err(anyhow::anyhow!("scale_third_f32 not supported"))
     }
 }

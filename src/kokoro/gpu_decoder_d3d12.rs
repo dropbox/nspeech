@@ -139,18 +139,55 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
     fn adain_snake(&self, x: &GpuBuffer, gamma: &GpuBuffer, beta: &GpuBuffer,
                    alpha: &GpuBuffer, out: &GpuBuffer,
                    channels: usize, seq_len: usize) -> Result<()> {
+        if seq_len <= 1024 {
+            let grid_x = channels as u32;
+            let n_elements = channels * seq_len;
+            let rc: Vec<u32> = vec![channels as u32, seq_len as u32, grid_x, 1, 1];
+            let uavs = [
+                uav_f16(x, n_elements as u32),
+                uav_f16(gamma, channels as u32),
+                uav_f16(beta, channels as u32),
+                uav_f16(alpha, channels as u32),
+                uav_f16(out, n_elements as u32),
+            ];
+            return self.gpu.record_dispatch(&self.kernels.adain_snake_1k, &rc, &uavs, [grid_x, 1, 1])
+                .map_err(|e| anyhow::anyhow!("adain_snake: {e}"));
+        }
+
+        // Two-pass approach for seq_len > 1024:
+        // Pass 1: compute per-channel mean+rstd into f32 stats buffer
+        let stats_pso = if seq_len <= 2048 {
+            &self.kernels.instance_norm_stats_2k
+        } else if seq_len <= 8192 {
+            &self.kernels.instance_norm_stats_8k
+        } else {
+            &self.kernels.instance_norm_stats_32k
+        };
+        let stats_buf = self.gpu.create_buffer((channels * 2 * 4) as u64)
+            .map_err(|e| anyhow::anyhow!("create stats buf: {e}"))?;
         let grid_x = channels as u32;
         let n_elements = channels * seq_len;
-        let rc: Vec<u32> = vec![channels as u32, seq_len as u32, grid_x, 1, 1];
-        let uavs = [
+        let rc1: Vec<u32> = vec![channels as u32, seq_len as u32, grid_x, 1, 1];
+        let uavs1 = [
             uav_f16(x, n_elements as u32),
+            BufferBinding::structured_f32(&stats_buf, (channels * 2) as u32),
+        ];
+        self.gpu.record_dispatch(stats_pso, &rc1, &uavs1, [grid_x, 1, 1])
+            .map_err(|e| anyhow::anyhow!("instance_norm_stats: {e}"))?;
+
+        // Pass 2: element-wise normalize + style + snake
+        let grid2 = cdiv(n_elements, 1024) as u32;
+        let rc2: Vec<u32> = vec![n_elements as u32, channels as u32, seq_len as u32, grid2, 1, 1];
+        let uavs2 = [
+            uav_f16(x, n_elements as u32),
+            BufferBinding::structured_f32(&stats_buf, (channels * 2) as u32),
             uav_f16(gamma, channels as u32),
             uav_f16(beta, channels as u32),
             uav_f16(alpha, channels as u32),
             uav_f16(out, n_elements as u32),
         ];
-        self.gpu.record_dispatch(&self.kernels.adain_snake_1k, &rc, &uavs, [grid_x, 1, 1])
-            .map_err(|e| anyhow::anyhow!("adain_snake: {e}"))
+        self.gpu.record_dispatch(&self.kernels.norm_style_snake, &rc2, &uavs2, [grid2, 1, 1])
+            .map_err(|e| anyhow::anyhow!("norm_style_snake: {e}"))
     }
 
     fn conv1d(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
@@ -176,7 +213,12 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
     fn conv1d_k(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
                 c_in: usize, c_out: usize, t_in: usize, t_out: usize,
                 k: usize, stride: usize, padding: usize, dilation: usize) -> Result<()> {
-        self.conv1d_matmul(x, w, bias, out, c_in, c_out, t_in, t_out, k, stride, padding, dilation)
+        let kk = c_in * k;
+        if kk % 32 == 0 {
+            self.conv1d_matmul(x, w, bias, out, c_in, c_out, t_in, t_out, k, stride, padding, dilation)
+        } else {
+            self.conv1d(x, w, bias, out, c_in, c_out, t_in, t_out, k, stride, padding, dilation)
+        }
     }
 
     fn conv_transpose1d(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
@@ -202,21 +244,10 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
     fn conv_transpose1d_lrelu(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
                               c_in: usize, c_out: usize, t_in: usize, t_out: usize,
                               k: usize, stride: usize, padding: usize) -> Result<()> {
-        let grid_x = c_out as u32;
-        let grid_y = cdiv(t_out, 256) as u32;
-        let rc: Vec<u32> = vec![
-            c_in as u32, c_out as u32, t_in as u32, t_out as u32,
-            k as u32, stride as u32, padding as u32,
-            grid_x, grid_y, 1,
-        ];
-        let uavs = [
-            uav_f16(x, (c_in * t_in) as u32),
-            uav_f16(w, (c_in * c_out * k) as u32),
-            uav_f16(bias, c_out as u32),
-            uav_f16(out, (c_out * t_out) as u32),
-        ];
-        self.gpu.record_dispatch(&self.kernels.conv_transpose1d_lrelu, &rc, &uavs, [grid_x, grid_y, 1])
-            .map_err(|e| anyhow::anyhow!("conv_transpose1d_lrelu: {e}"))
+        let n = c_in * t_in;
+        let tmp = self.alloc(n)?;
+        self.leaky_relu(x, &tmp, n, 0.1)?;
+        self.conv_transpose1d(&tmp, w, bias, out, c_in, c_out, t_in, t_out, k, stride, padding)
     }
 
     fn conv1d_lrelu001(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
@@ -319,5 +350,191 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
         ];
         self.gpu.record_dispatch(&self.kernels.row_bias_add, &bias_rc, &bias_uavs, [bias_grid, 1, 1])
             .map_err(|e| anyhow::anyhow!("row_bias_add: {e}"))
+    }
+
+    fn conv1d_matmul(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
+                     c_in: usize, c_out: usize, t_in: usize, t_out: usize,
+                     k: usize, stride: usize, padding: usize, dilation: usize) -> Result<()> {
+        let kk = c_in * k;
+        let kk_padded = cdiv(kk, 32) * 32;
+        if kk_padded == kk {
+            let col_buf = self.alloc(kk * t_out)?;
+            self.im2col(x, &col_buf, c_in, t_in, t_out, k, stride, padding, dilation)?;
+            return self.matmul_bias(w, &col_buf, bias, out, c_out, t_out, kk);
+        }
+        // K not aligned to 32: pad weight rows and im2col to avoid matmul reading across rows.
+        let col_buf = self.alloc(kk_padded * t_out)?;
+        self.im2col(x, &col_buf, c_in, t_in, t_out, k, stride, padding, dilation)?;
+        // im2col writes kk*t_out elements contiguously; the extra (kk_padded-kk)*t_out stay zero.
+        // But matmul reads B as [K_padded, N] row-major → need B reshaped with stride N per K row.
+        // Actually im2col writes [kk, t_out] contiguously. With stride_bk=N, B[row,col] = b[row*N+col].
+        // The first kk rows are from im2col, rows kk..kk_padded are zeros (from alloc).
+        // This works as-is IF alloc zeroes memory. But it might not.
+        // Instead: allocate exact kk*t_out for im2col, then create kk_padded*t_out buffer with zeros
+        // and copy im2col data into it. But that requires a copy kernel.
+        //
+        // Simpler: just pad the WEIGHT matrix (which is already on GPU, cached).
+        let w_data = self.gpu.download_buffer(w, (c_out * kk * 2) as u64)
+            .map_err(|e| anyhow::anyhow!("download w: {e}"))?;
+        let mut w_padded = vec![0u8; c_out * kk_padded * 2];
+        for row in 0..c_out {
+            let src = &w_data[row * kk * 2..(row + 1) * kk * 2];
+            let dst = &mut w_padded[row * kk_padded * 2..row * kk_padded * 2 + kk * 2];
+            dst.copy_from_slice(src);
+        }
+        let w_pad_buf = self.gpu.create_buffer((c_out * kk_padded * 2) as u64)
+            .map_err(|e| anyhow::anyhow!("create padded w: {e}"))?;
+        self.gpu.upload_to_buffer(&w_padded, &w_pad_buf)
+            .map_err(|e| anyhow::anyhow!("upload padded w: {e}"))?;
+
+        // For B (im2col): allocate kk_padded * t_out (extra rows zero from alloc... hopefully).
+        // Actually, alloc creates uninitialized memory. Need to write zeros.
+        // The im2col kernel writes exactly kk * t_out elements. If we allocate kk_padded * t_out,
+        // the layout is contiguous but B is read as stride_bk=N row-major.
+        // im2col writes: for each (c, k_pos, t) → col_buf[(c * k + k_pos) * t_out + t]
+        // So col_buf is [kk, t_out] contiguous. Extra rows (kk..kk_padded) need to be 0.
+        // Simple: allocate larger, im2col fills first kk*t_out, rest must be zero.
+        let col_full = self.gpu.create_buffer((kk_padded * t_out * 2) as u64)
+            .map_err(|e| anyhow::anyhow!("create padded col: {e}"))?;
+        // Zero it
+        let zeros = vec![0u8; kk_padded * t_out * 2];
+        self.gpu.upload_to_buffer(&zeros, &col_full)
+            .map_err(|e| anyhow::anyhow!("zero col: {e}"))?;
+        // Run im2col into first kk*t_out elements
+        let n_elements = kk * t_out;
+        let grid_x = cdiv(n_elements, 1024) as u32;
+        let rc: Vec<u32> = vec![
+            c_in as u32, t_in as u32, t_out as u32, k as u32,
+            stride as u32, padding as u32, dilation as u32,
+            grid_x, 1, 1,
+        ];
+        let uavs = [
+            uav_f16(x, (c_in * t_in) as u32),
+            uav_f16(&col_full, (kk_padded * t_out) as u32),
+        ];
+        self.gpu.record_dispatch(&self.kernels.im2col, &rc, &uavs, [grid_x, 1, 1])
+            .map_err(|e| anyhow::anyhow!("im2col: {e}"))?;
+
+        self.matmul_bias(&w_pad_buf, &col_full, bias, out, c_out, t_out, kk_padded)
+    }
+
+    // ── F32-intermediate operations ──
+
+    fn has_f32_intermediates(&self) -> bool { true }
+
+    fn download_f32(&self, buf: &GpuBuffer, count: usize) -> Result<Vec<f32>> {
+        let bytes = self.gpu.download_buffer(buf, (count * 4) as u64)
+            .map_err(|e| anyhow::anyhow!("download f32: {e}"))?;
+        Ok(bytes.chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect())
+    }
+
+    fn alloc_f32(&self, count: usize) -> Result<GpuBuffer> {
+        self.gpu.create_buffer((count * 4) as u64)
+            .map_err(|e| anyhow::anyhow!("create_buffer f32: {e}"))
+    }
+
+    fn f16_to_f32(&self, x: &GpuBuffer, out: &GpuBuffer, n: usize) -> Result<()> {
+        let grid_x = cdiv(n, 1024) as u32;
+        let rc: Vec<u32> = vec![n as u32, grid_x, 1, 1];
+        let uavs = [
+            uav_f16(x, n as u32),
+            BufferBinding::structured_f32(out, n as u32),
+        ];
+        self.gpu.record_dispatch(&self.kernels.f16_to_f32, &rc, &uavs, [grid_x, 1, 1])
+            .map_err(|e| anyhow::anyhow!("f16_to_f32: {e}"))
+    }
+
+    fn f32_to_f16(&self, x: &GpuBuffer, out: &GpuBuffer, n: usize) -> Result<()> {
+        let grid_x = cdiv(n, 1024) as u32;
+        let rc: Vec<u32> = vec![n as u32, grid_x, 1, 1];
+        let uavs = [
+            BufferBinding::structured_f32(x, n as u32),
+            uav_f16(out, n as u32),
+        ];
+        self.gpu.record_dispatch(&self.kernels.f32_to_f16, &rc, &uavs, [grid_x, 1, 1])
+            .map_err(|e| anyhow::anyhow!("f32_to_f16: {e}"))
+    }
+
+    fn conv1d_f32(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
+                  c_in: usize, c_out: usize, t_in: usize, t_out: usize,
+                  k: usize, stride: usize, padding: usize, dilation: usize) -> Result<()> {
+        let grid_x = c_out as u32;
+        let grid_y = cdiv(t_out, 256) as u32;
+        let rc: Vec<u32> = vec![
+            c_in as u32, c_out as u32, t_in as u32, t_out as u32,
+            k as u32, stride as u32, padding as u32, dilation as u32,
+            grid_x, grid_y, 1,
+        ];
+        let uavs = [
+            BufferBinding::structured_f32(x, (c_in * t_in) as u32),
+            uav_f16(w, (c_out * c_in * k) as u32),
+            uav_f16(bias, c_out as u32),
+            BufferBinding::structured_f32(out, (c_out * t_out) as u32),
+        ];
+        self.gpu.record_dispatch(&self.kernels.conv1d_f32io, &rc, &uavs, [grid_x, grid_y, 1])
+            .map_err(|e| anyhow::anyhow!("conv1d_f32io: {e}"))
+    }
+
+    fn adain_snake_f32(&self, x: &GpuBuffer, gamma: &GpuBuffer, beta: &GpuBuffer,
+                       alpha: &GpuBuffer, out: &GpuBuffer,
+                       channels: usize, seq_len: usize) -> Result<()> {
+        let n_elements = channels * seq_len;
+        // Two-pass: compute stats from f32 input, then normalize+style+snake in f32
+        let stats_pso = if seq_len <= 2048 {
+            &self.kernels.instance_norm_stats_f32in_2k
+        } else if seq_len <= 8192 {
+            &self.kernels.instance_norm_stats_f32in_8k
+        } else {
+            &self.kernels.instance_norm_stats_f32in_32k
+        };
+        let stats_buf = self.gpu.create_buffer((channels * 2 * 4) as u64)
+            .map_err(|e| anyhow::anyhow!("create stats buf: {e}"))?;
+        let grid_x = channels as u32;
+        let rc1: Vec<u32> = vec![channels as u32, seq_len as u32, grid_x, 1, 1];
+        let uavs1 = [
+            BufferBinding::structured_f32(x, n_elements as u32),
+            BufferBinding::structured_f32(&stats_buf, (channels * 2) as u32),
+        ];
+        self.gpu.record_dispatch(stats_pso, &rc1, &uavs1, [grid_x, 1, 1])
+            .map_err(|e| anyhow::anyhow!("instance_norm_stats_f32in: {e}"))?;
+
+        // Pass 2: normalize + style + snake (f32 in, f32 out)
+        let grid2 = cdiv(n_elements, 1024) as u32;
+        let rc2: Vec<u32> = vec![n_elements as u32, channels as u32, seq_len as u32, grid2, 1, 1];
+        let uavs2 = [
+            BufferBinding::structured_f32(x, n_elements as u32),
+            BufferBinding::structured_f32(&stats_buf, (channels * 2) as u32),
+            uav_f16(gamma, channels as u32),
+            uav_f16(beta, channels as u32),
+            uav_f16(alpha, channels as u32),
+            BufferBinding::structured_f32(out, n_elements as u32),
+        ];
+        self.gpu.record_dispatch(&self.kernels.norm_style_snake_f32io, &rc2, &uavs2, [grid2, 1, 1])
+            .map_err(|e| anyhow::anyhow!("norm_style_snake_f32io: {e}"))
+    }
+
+    fn add_f32(&self, a: &GpuBuffer, b: &GpuBuffer, out: &GpuBuffer, n: usize) -> Result<()> {
+        let grid_x = cdiv(n, 1024) as u32;
+        let rc: Vec<u32> = vec![n as u32, grid_x, 1, 1];
+        let uavs = [
+            BufferBinding::structured_f32(a, n as u32),
+            BufferBinding::structured_f32(b, n as u32),
+            BufferBinding::structured_f32(out, n as u32),
+        ];
+        self.gpu.record_dispatch(&self.kernels.add_f32, &rc, &uavs, [grid_x, 1, 1])
+            .map_err(|e| anyhow::anyhow!("add_f32: {e}"))
+    }
+
+    fn scale_third_f32(&self, x: &GpuBuffer, out: &GpuBuffer, n: usize) -> Result<()> {
+        let grid_x = cdiv(n, 1024) as u32;
+        let rc: Vec<u32> = vec![n as u32, grid_x, 1, 1];
+        let uavs = [
+            BufferBinding::structured_f32(x, n as u32),
+            BufferBinding::structured_f32(out, n as u32),
+        ];
+        self.gpu.record_dispatch(&self.kernels.scale_third_f32, &rc, &uavs, [grid_x, 1, 1])
+            .map_err(|e| anyhow::anyhow!("scale_third_f32: {e}"))
     }
 }

@@ -232,6 +232,7 @@ def adain_snake_fused(
       out[c, :] = snake(norm, alpha[c])
 
     This fuses two memory-bound operations into one pass.
+    BLOCK_T must be <= max threads per group (1024 on D3D12).
     """
     ch_idx = tl.program_id(0)
     if ch_idx >= n_channels:
@@ -265,6 +266,158 @@ def adain_snake_fused(
     out = styled + sin_sq * inv_alpha
 
     tl.store(out_ptr + base + t_offsets, out.to(tl.float16), mask=mask)
+
+
+@triton.jit
+def adain_snake_looped(
+    x_ptr, gamma_ptr, beta_ptr, alpha_ptr, out_ptr,
+    n_channels, seq_len,
+    BLOCK_SIZE: tl.constexpr,
+    MAX_SEQ: tl.constexpr,
+):
+    """Looped AdaIN + Snake for seq_len > 1024 (D3D12 thread group limit).
+
+    Two passes:
+      Pass 1: compute mean and variance via loop over BLOCK_SIZE chunks.
+      Pass 2: apply normalization + style + snake via same loop.
+
+    Each thread group handles one channel. Grid: [n_channels, 1, 1].
+    """
+    ch_idx = tl.program_id(0)
+    if ch_idx >= n_channels:
+        return
+
+    base = ch_idx * seq_len
+    tid = tl.arange(0, BLOCK_SIZE)
+
+    # Pass 1: compute mean
+    acc_sum = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    for start in tl.static_range(0, MAX_SEQ, BLOCK_SIZE):
+        offsets = start + tid
+        mask = offsets < seq_len
+        vals = tl.load(x_ptr + base + offsets, mask=mask, other=0.0).to(tl.float32)
+        acc_sum += tl.where(mask, vals, 0.0)
+    total_sum = tl.sum(acc_sum, axis=0)
+    mean = total_sum / seq_len
+
+    # Pass 1b: compute variance
+    acc_var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    for start in tl.static_range(0, MAX_SEQ, BLOCK_SIZE):
+        offsets = start + tid
+        mask = offsets < seq_len
+        vals = tl.load(x_ptr + base + offsets, mask=mask, other=0.0).to(tl.float32)
+        diff = vals - mean
+        acc_var += tl.where(mask, diff * diff, 0.0)
+    total_var = tl.sum(acc_var, axis=0)
+    var = total_var / seq_len
+    rstd = 1.0 / tl.sqrt(var + 1e-5)
+
+    # Load style params
+    gamma = tl.load(gamma_ptr + ch_idx).to(tl.float32)
+    beta = tl.load(beta_ptr + ch_idx).to(tl.float32)
+    alpha = tl.load(alpha_ptr + ch_idx).to(tl.float32)
+    inv_alpha = 1.0 / (alpha + 1e-9)
+    scale = (gamma + 1.0) * rstd
+
+    # Pass 2: normalize + style + snake
+    for start in tl.static_range(0, MAX_SEQ, BLOCK_SIZE):
+        offsets = start + tid
+        mask = offsets < seq_len
+        vals = tl.load(x_ptr + base + offsets, mask=mask, other=0.0).to(tl.float32)
+        normed = (vals - mean) * scale + beta
+        ax = alpha * normed
+        sin_val = tl.sin(ax)
+        result = normed + sin_val * sin_val * inv_alpha
+        tl.store(out_ptr + base + offsets, result.to(tl.float16), mask=mask)
+
+
+@triton.jit
+def instance_norm_stats(
+    x_ptr, stats_ptr,
+    n_channels, seq_len,
+    BLOCK_SIZE: tl.constexpr,
+    MAX_SEQ: tl.constexpr,
+):
+    """Compute per-channel mean and variance for instance normalization.
+
+    Grid: [n_channels, 1, 1]. Each group handles one channel.
+    Output: stats_ptr[ch*2] = mean, stats_ptr[ch*2+1] = rstd
+    """
+    ch_idx = tl.program_id(0)
+    if ch_idx >= n_channels:
+        return
+
+    base = ch_idx * seq_len
+    tid = tl.arange(0, BLOCK_SIZE)
+
+    # Compute mean
+    acc_sum = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    for start in tl.static_range(0, MAX_SEQ, BLOCK_SIZE):
+        offsets = start + tid
+        mask = offsets < seq_len
+        vals = tl.load(x_ptr + base + offsets, mask=mask, other=0.0).to(tl.float32)
+        acc_sum += tl.where(mask, vals, 0.0)
+    total_sum = tl.sum(acc_sum, axis=0)
+    mean = total_sum / seq_len
+
+    # Compute variance
+    acc_var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    for start in tl.static_range(0, MAX_SEQ, BLOCK_SIZE):
+        offsets = start + tid
+        mask = offsets < seq_len
+        vals = tl.load(x_ptr + base + offsets, mask=mask, other=0.0).to(tl.float32)
+        diff = vals - mean
+        acc_var += tl.where(mask, diff * diff, 0.0)
+    total_var = tl.sum(acc_var, axis=0)
+    var = total_var / seq_len
+    rstd = 1.0 / tl.sqrt(var + 1e-5)
+
+    # Store stats
+    tl.store(stats_ptr + ch_idx * 2, mean)
+    tl.store(stats_ptr + ch_idx * 2 + 1, rstd)
+
+
+@triton.jit
+def norm_style_snake(
+    x_ptr, stats_ptr, gamma_ptr, beta_ptr, alpha_ptr, out_ptr,
+    n_elements, n_channels, seq_len,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Element-wise: read per-channel stats, normalize, apply style, snake.
+
+    Grid: [cdiv(n_elements, BLOCK_SIZE), 1, 1].
+    stats_ptr[ch*2] = mean, stats_ptr[ch*2+1] = rstd (f32 buffer).
+    """
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+
+    # Determine channel index for each element
+    ch_idx = offsets // seq_len
+
+    # Load per-channel stats (mean, rstd)
+    mean = tl.load(stats_ptr + ch_idx * 2, mask=mask, other=0.0)
+    rstd = tl.load(stats_ptr + ch_idx * 2 + 1, mask=mask, other=0.0)
+
+    # Load per-channel style params
+    gamma = tl.load(gamma_ptr + ch_idx, mask=mask, other=0.0).to(tl.float32)
+    beta = tl.load(beta_ptr + ch_idx, mask=mask, other=0.0).to(tl.float32)
+    alpha = tl.load(alpha_ptr + ch_idx, mask=mask, other=0.0).to(tl.float32)
+
+    # Normalize + style
+    normed = (x - mean) * rstd
+    styled = (gamma + 1.0) * normed + beta
+
+    # Snake: x + sin²(αx)/α
+    ax = alpha * styled
+    sin_val = tl.sin(ax)
+    sin_sq = sin_val * sin_val
+    inv_alpha = 1.0 / (alpha + 1e-9)
+    result = styled + sin_sq * inv_alpha
+
+    tl.store(out_ptr + offsets, result.to(tl.float16), mask=mask)
 
 
 # ─── Im2col for conv1d: rearrange input for matmul-based convolution ──────────
@@ -577,3 +730,196 @@ def row_bias_add(
     row_idx = offsets // n_cols
     b = tl.load(bias_ptr + row_idx, mask=mask)
     tl.store(out_ptr + offsets, x + b, mask=mask)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# F32-intermediate variants for D3D12 precision
+#
+# On D3D12, f16 round-trips between ops compound through instance normalization.
+# These kernels keep activations in f32 within resblocks to prevent amplification.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@triton.jit
+def conv1d_f32io(
+    x_ptr, w_ptr, bias_ptr, out_ptr,
+    C_in, C_out, T_in, T_out, K,
+    stride, padding, dilation,
+    BLOCK_T: tl.constexpr,
+):
+    """Conv1d with f32 input/output, f16 weights.
+
+    x: [C_in, T_in] (f32)
+    w: [C_out, C_in, K] (fp16)
+    bias: [C_out] (fp16)
+    out: [C_out, T_out] (f32)
+
+    Grid: [C_out, cdiv(T_out, BLOCK_T), 1]
+    """
+    c_out_idx = tl.program_id(0)
+    t_block = tl.program_id(1)
+
+    t_offs = t_block * BLOCK_T + tl.arange(0, BLOCK_T)
+    t_mask = t_offs < T_out
+
+    acc = tl.zeros((BLOCK_T,), dtype=tl.float32)
+
+    CK = C_in * K
+    for ck in range(CK):
+        c = ck // K
+        ki = ck % K
+        t_in_pos = t_offs * stride - padding + ki * dilation
+        valid = t_mask & (t_in_pos >= 0) & (t_in_pos < T_in)
+
+        x_idx = c * T_in + t_in_pos
+        x_val = tl.load(x_ptr + x_idx, mask=valid, other=0.0)
+
+        w_idx = c_out_idx * CK + ck
+        w_val = tl.load(w_ptr + w_idx).to(tl.float32)
+
+        acc += x_val * w_val
+
+    b = tl.load(bias_ptr + c_out_idx).to(tl.float32)
+    acc += b
+
+    out_idx = c_out_idx * T_out + t_offs
+    tl.store(out_ptr + out_idx, acc, mask=t_mask)
+
+
+@triton.jit
+def instance_norm_stats_f32in(
+    x_ptr, stats_ptr,
+    n_channels, seq_len,
+    BLOCK_SIZE: tl.constexpr,
+    MAX_SEQ: tl.constexpr,
+):
+    """Compute per-channel mean and rstd from f32 input.
+
+    x: [n_channels, seq_len] (f32)
+    stats: [n_channels * 2] (f32) — interleaved [mean0, rstd0, mean1, rstd1, ...]
+
+    Grid: [n_channels, 1, 1]
+    """
+    ch = tl.program_id(0)
+    base = ch * seq_len
+
+    mean_acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    var_acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+
+    for start in tl.static_range(0, MAX_SEQ, BLOCK_SIZE):
+        offs = start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < seq_len
+        x = tl.load(x_ptr + base + offs, mask=mask, other=0.0)
+        mean_acc += x
+        var_acc += x * x
+
+    total = tl.sum(mean_acc, axis=0)
+    sq_total = tl.sum(var_acc, axis=0)
+    mean = total / seq_len
+    var = sq_total / seq_len - mean * mean
+    rstd = 1.0 / tl.sqrt(var + 1e-5)
+
+    tl.store(stats_ptr + ch * 2, mean)
+    tl.store(stats_ptr + ch * 2 + 1, rstd)
+
+
+@triton.jit
+def norm_style_snake_f32io(
+    x_ptr, stats_ptr, gamma_ptr, beta_ptr, alpha_ptr, out_ptr,
+    n_elements, n_channels, seq_len,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Normalize + style + snake with f32 input and f32 output.
+
+    x: [n_channels, seq_len] (f32)
+    stats: [n_channels * 2] (f32) — mean, rstd per channel
+    gamma, beta, alpha: [n_channels] (fp16)
+    out: [n_channels, seq_len] (f32)
+
+    Grid: [cdiv(n_elements, BLOCK_SIZE), 1, 1]
+    """
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+
+    ch_idx = offsets // seq_len
+
+    mean = tl.load(stats_ptr + ch_idx * 2, mask=mask, other=0.0)
+    rstd = tl.load(stats_ptr + ch_idx * 2 + 1, mask=mask, other=0.0)
+
+    gamma = tl.load(gamma_ptr + ch_idx, mask=mask, other=0.0).to(tl.float32)
+    beta = tl.load(beta_ptr + ch_idx, mask=mask, other=0.0).to(tl.float32)
+    alpha = tl.load(alpha_ptr + ch_idx, mask=mask, other=0.0).to(tl.float32)
+
+    normed = (x - mean) * rstd
+    styled = (gamma + 1.0) * normed + beta
+
+    ax = alpha * styled
+    sin_val = tl.sin(ax)
+    sin_sq = sin_val * sin_val
+    inv_alpha = 1.0 / (alpha + 1e-9)
+    result = styled + sin_sq * inv_alpha
+
+    tl.store(out_ptr + offsets, result, mask=mask)
+
+
+@triton.jit
+def elementwise_add_f32(
+    a_ptr, b_ptr, out_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Element-wise add of f32 buffers: out[i] = a[i] + b[i]"""
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    a = tl.load(a_ptr + offsets, mask=mask)
+    b = tl.load(b_ptr + offsets, mask=mask)
+    tl.store(out_ptr + offsets, a + b, mask=mask)
+
+
+@triton.jit
+def elementwise_scale_third_f32(
+    x_ptr, out_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Element-wise scale f32 by 1/3: out[i] = x[i] / 3"""
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    x = tl.load(x_ptr + offsets, mask=mask)
+    tl.store(out_ptr + offsets, x * 0.3333333333333333, mask=mask)
+
+
+@triton.jit
+def convert_f32_to_f16_kernel(
+    x_ptr, out_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Convert f32 buffer to f16."""
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    x = tl.load(x_ptr + offsets, mask=mask)
+    tl.store(out_ptr + offsets, x.to(tl.float16), mask=mask)
+
+
+@triton.jit
+def convert_f16_to_f32_kernel(
+    x_ptr, out_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Convert f16 buffer to f32."""
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    x = tl.load(x_ptr + offsets, mask=mask).to(tl.float32)
+    tl.store(out_ptr + offsets, x, mask=mask)

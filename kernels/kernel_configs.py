@@ -364,6 +364,21 @@ KERNEL_METADATA = {
     "kokoro_adain_snake_1024": {
         "alias": "adain_snake_1k", "group": "kokoro", "d3d12": True,
     },
+    "kokoro_adain_snake_2048": {
+        "alias": "adain_snake_2k", "group": "kokoro",
+    },
+    "kokoro_adain_snake_8192": {
+        "alias": "adain_snake_8k", "group": "kokoro",
+    },
+    "kokoro_instance_norm_stats_2k": {
+        "alias": "instance_norm_stats_2k", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_instance_norm_stats_8k": {
+        "alias": "instance_norm_stats_8k", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_norm_style_snake": {
+        "alias": "norm_style_snake", "group": "kokoro", "d3d12": True,
+    },
     "kokoro_leaky_relu_01": {
         "alias": "leaky_relu_01", "group": "kokoro", "d3d12": True,
     },
@@ -377,19 +392,19 @@ KERNEL_METADATA = {
         "alias": "conv1d", "group": "kokoro", "d3d12": True,
     },
     "kokoro_conv1d_k3": {
-        "alias": "conv1d_k3", "group": "kokoro", "d3d12": True,
+        "alias": "conv1d_k3", "group": "kokoro",
     },
     "kokoro_conv1d_k7": {
-        "alias": "conv1d_k7", "group": "kokoro", "d3d12": True,
+        "alias": "conv1d_k7", "group": "kokoro",
     },
     "kokoro_conv1d_k11": {
-        "alias": "conv1d_k11", "group": "kokoro", "d3d12": True,
+        "alias": "conv1d_k11", "group": "kokoro",
     },
     "kokoro_conv_transpose1d": {
         "alias": "conv_transpose1d", "group": "kokoro", "d3d12": True,
     },
     "kokoro_conv_transpose1d_lrelu": {
-        "alias": "conv_transpose1d_lrelu", "group": "kokoro", "d3d12": True,
+        "alias": "conv_transpose1d_lrelu", "group": "kokoro",
     },
     "kokoro_conv1d_lrelu001": {
         "alias": "conv1d_lrelu001", "group": "kokoro", "d3d12": True,
@@ -411,6 +426,38 @@ KERNEL_METADATA = {
     },
     "kokoro_row_bias_add": {
         "alias": "row_bias_add", "group": "kokoro", "d3d12": True,
+    },
+
+    # ── Kokoro F32-intermediate variants ──
+    "kokoro_conv1d_f32io": {
+        "alias": "conv1d_f32io", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_instance_norm_stats_32k": {
+        "alias": "instance_norm_stats_32k", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_instance_norm_stats_f32in_2k": {
+        "alias": "instance_norm_stats_f32in_2k", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_instance_norm_stats_f32in_8k": {
+        "alias": "instance_norm_stats_f32in_8k", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_instance_norm_stats_f32in_32k": {
+        "alias": "instance_norm_stats_f32in_32k", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_norm_style_snake_f32io": {
+        "alias": "norm_style_snake_f32io", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_add_f32": {
+        "alias": "add_f32", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_scale_third_f32": {
+        "alias": "scale_third_f32", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_f32_to_f16": {
+        "alias": "f32_to_f16", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_f16_to_f32": {
+        "alias": "f16_to_f32", "group": "kokoro", "d3d12": True,
     },
 }
 
