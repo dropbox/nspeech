@@ -137,6 +137,11 @@ KOKORO_KERNELS = [
      "*fp32, *fp16, *fp16, *fp32, i32, i32, i32, i32, i32, i32, i32, i32, 256",
      4, ["C_out", "cdiv(T_out, 256)", "1"]),
 
+    # Conv1d f32io with fused leaky_relu(0.01) on input
+    ("kokoro_conv1d_f32io_lrelu", "conv1d_f32io_lrelu",
+     "*fp32, *fp16, *fp16, *fp32, i32, i32, i32, i32, i32, i32, i32, i32, 256",
+     4, ["C_out", "cdiv(T_out, 256)", "1"]),
+
     # Instance norm stats from f32 input (2k variant)
     ("kokoro_instance_norm_stats_f32in_2k", "instance_norm_stats_f32in",
      "*fp32, *fp32, i32, i32, 1024, 2048",

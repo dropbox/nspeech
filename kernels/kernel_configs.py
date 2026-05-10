@@ -432,6 +432,9 @@ KERNEL_METADATA = {
     "kokoro_conv1d_f32io": {
         "alias": "conv1d_f32io", "group": "kokoro", "d3d12": True,
     },
+    "kokoro_conv1d_f32io_lrelu": {
+        "alias": "conv1d_f32io_lrelu", "group": "kokoro", "d3d12": True,
+    },
     "kokoro_instance_norm_stats_32k": {
         "alias": "instance_norm_stats_32k", "group": "kokoro", "d3d12": True,
     },

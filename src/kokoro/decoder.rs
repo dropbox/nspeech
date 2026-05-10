@@ -544,20 +544,14 @@ impl Generator {
                         let rms = (rms_sum / avg_cmp.len() as f64).sqrt();
                         eprintln!("  [stage{stage} resblocks f32] n={} max_err={max_err:.4} rms={rms:.6}", avg_cmp.len());
                     }
-                    // conv_post: leaky_relu(0.01) on f32 → conv1d_f32
-                    // Download f32, apply lrelu on CPU, re-upload as f32
-                    let avg_data = gpu.download_f32(&avg, n)?;
-                    let lrelu_data: Vec<f32> = avg_data.iter()
-                        .map(|&v| if v < 0.0 { v * 0.01 } else { v })
-                        .collect();
-                    let lrelu_buf = gpu.upload_f32(&lrelu_data)?;
+                    // conv_post: fused leaky_relu(0.01) + conv1d_f32 (no CPU round-trip)
                     let (c_out, _, k) = self.conv_post_weight.dims3()?;
                     let cp_padding = (k - 1) / 2;
                     let t_out = h_t;
                     let w_buf = upload_weight(gpu, &self.conv_post_weight)?;
                     let b_buf = upload_weight(gpu, &self.conv_post_bias)?;
                     let out_f32 = gpu.alloc_f32(c_out * t_out)?;
-                    gpu.conv1d_f32(&lrelu_buf, &w_buf, &b_buf, &out_f32, h_c, c_out, h_t, t_out, k, 1, cp_padding, 1)?;
+                    gpu.conv1d_f32_lrelu(&avg, &w_buf, &b_buf, &out_f32, h_c, c_out, h_t, t_out, k, 1, cp_padding, 1)?;
                     let out_data = gpu.download_f32(&out_f32, c_out * t_out)?;
                     if compare {
                         let ch = cpu_h.as_ref().unwrap();

@@ -786,6 +786,53 @@ def conv1d_f32io(
 
 
 @triton.jit
+def conv1d_f32io_lrelu(
+    x_ptr, w_ptr, bias_ptr, out_ptr,
+    C_in, C_out, T_in, T_out, K,
+    stride, padding, dilation,
+    BLOCK_T: tl.constexpr,
+):
+    """Conv1d with f32 input/output, f16 weights, fused leaky_relu(0.01) on input.
+
+    x: [C_in, T_in] (f32)
+    w: [C_out, C_in, K] (fp16)
+    bias: [C_out] (fp16)
+    out: [C_out, T_out] (f32)
+
+    Grid: [C_out, cdiv(T_out, BLOCK_T), 1]
+    """
+    c_out_idx = tl.program_id(0)
+    t_block = tl.program_id(1)
+
+    t_offs = t_block * BLOCK_T + tl.arange(0, BLOCK_T)
+    t_mask = t_offs < T_out
+
+    acc = tl.zeros((BLOCK_T,), dtype=tl.float32)
+
+    CK = C_in * K
+    for ck in range(CK):
+        c = ck // K
+        ki = ck % K
+        t_in_pos = t_offs * stride - padding + ki * dilation
+        valid = t_mask & (t_in_pos >= 0) & (t_in_pos < T_in)
+
+        x_idx = c * T_in + t_in_pos
+        x_val = tl.load(x_ptr + x_idx, mask=valid, other=0.0)
+        x_val = tl.where(x_val >= 0.0, x_val, x_val * 0.01)
+
+        w_idx = c_out_idx * CK + ck
+        w_val = tl.load(w_ptr + w_idx).to(tl.float32)
+
+        acc += x_val * w_val
+
+    b = tl.load(bias_ptr + c_out_idx).to(tl.float32)
+    acc += b
+
+    out_idx = c_out_idx * T_out + t_offs
+    tl.store(out_ptr + out_idx, acc, mask=t_mask)
+
+
+@triton.jit
 def instance_norm_stats_f32in(
     x_ptr, stats_ptr,
     n_channels, seq_len,
