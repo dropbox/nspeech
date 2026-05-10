@@ -462,10 +462,6 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         GpuBuffer::alloc_shared_f16(&self.device, count).map_err(Into::into)
     }
 
-    fn flush(&self) -> Result<()> {
-        self.device.wait_until_completed().map_err(Into::into)
-    }
-
     fn upload_f16(&self, data: &[half::f16]) -> Result<GpuBuffer> {
         GpuBuffer::from_f16_data(&self.device, data).map_err(Into::into)
     }
@@ -655,7 +651,6 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         let n = c_in * t_in;
         let tmp = self.alloc(n)?;
         self.leaky_relu(x, &tmp, n, 0.1)?;
-        self.device.flush()?;
         self.conv_transpose1d(&tmp, w, bias, out, c_in, c_out, t_in, t_out, k, stride, padding)
     }
 
@@ -665,7 +660,6 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         let n = c_in * t_in;
         let lrelu_tmp = self.alloc(n)?;
         self.leaky_relu(x, &lrelu_tmp, n, 0.01)?;
-        self.device.flush()?;
         let kk = c_in * k;
         let matmul_ok = self.kernels.matmul.max_total_threads_per_threadgroup() >= 256;
         if matmul_ok && kk % 32 == 0 && c_out % 64 == 0 && t_out % 64 == 0 {
@@ -1013,12 +1007,8 @@ impl KokoroGpuDecoder {
 
         let col_buf = self.alloc(kk * m_pad)?;
         self.im2col(x, &col_buf, c_in, t_in, m_pad, k, stride, padding, dilation)?;
-        self.device.flush()?;
-
         let tmp = self.alloc(c_out * m_pad)?;
         self.matmul_bias(w, &col_buf, bias, &tmp, c_out, m_pad, kk)?;
-        self.device.flush()?;
-
         // Copy valid columns: tmp[c, 0..t_out] → out[c, 0..t_out]
         self.im2col(&tmp, out, c_out, m_pad, t_out, 1, 1, 0, 1)?;
         Ok(())

@@ -370,9 +370,6 @@ impl Generator {
         let mut h_f32_carry: Option<G::Buf> = None;
 
         for (stage, (up_w, up_b)) in self.ups.iter().enumerate() {
-            // Commit prior GPU work so the allocator won't reuse in-flight buffers.
-            gpu.flush()?;
-
             // Noise source: conv1d(har_source) → noise_res
             let (nc_w, nc_b) = &self.noise_convs[stage];
             let nc_stride = self.noise_conv_strides[stage];
@@ -419,7 +416,6 @@ impl Generator {
                 };
                 let lrelu_f32 = gpu.alloc_f32(h_c * h_t)?;
                 gpu.leaky_relu_f32(&f32_in, &lrelu_f32, h_c * h_t, 0.1)?;
-                gpu.flush()?;
                 let out_f32 = gpu.alloc_f32(c_out * t_out)?;
                 gpu.conv_transpose1d_f32io(&lrelu_f32, &w_buf, &b_buf, &out_f32, h_c, c_out, h_t, t_out, k, up_stride, up_padding)?;
                 // Also produce f16 version for h_buf
@@ -484,10 +480,6 @@ impl Generator {
                 cpu_h = Some(cpu_added);
             }
 
-            // Commit pending GPU work before resblocks allocate new buffers,
-            // preventing the allocator from reusing buffers still in flight.
-            gpu.flush()?;
-
             // 3 resblocks averaged (using precomputed gamma/beta)
             let base = stage * 3;
             let dbg_rb = if compare && stage == 0 {
@@ -524,7 +516,6 @@ impl Generator {
                     _rb_keep.push(r0); _rb_keep.push(r1); _rb_keep.push(r2);
                     _rb_keep.push(sum); _rb_keep.push(sum2);
                     drop(_rb_keep);
-                    gpu.flush()?;
                     if compare {
                         let avg_cmp = gpu.download_f32(&avg, n)?;
                         let ch = cpu_h.as_ref().unwrap();
@@ -614,21 +605,15 @@ impl Generator {
             }
         }
 
-        // Ensure all resblock work completes before conv_post reads h_buf
-        gpu.flush()?;
-
         // Leaky_relu(0.01) + conv_post
         // When f32 intermediates available, output conv_post as f32 to avoid
-
         // exp() amplifying f16 quantization error in iSTFT magnitude
         let h = if gpu.has_f32_intermediates() {
             let n = h_c * h_t;
             let lrelu_buf = gpu.alloc(n)?;
             gpu.leaky_relu(&h_buf, &lrelu_buf, n, 0.01)?;
-            gpu.flush()?;
             let h_f32 = gpu.alloc_f32(n)?;
             gpu.f16_to_f32(&lrelu_buf, &h_f32, n)?;
-            gpu.flush()?;
             let (c_out, _, k) = self.conv_post_weight.dims3()?;
             let padding = (k - 1) / 2;
             let t_out = h_t; // padding=(k-1)/2, stride=1 → t_out = t_in

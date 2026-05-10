@@ -115,7 +115,6 @@ pub trait KokoroGpuBackend {
                      k: usize, stride: usize, padding: usize, dilation: usize) -> Result<()> {
         let col_buf = self.alloc(c_in * k * t_out)?;
         self.im2col(x, &col_buf, c_in, t_in, t_out, k, stride, padding, dilation)?;
-        self.flush()?;
         self.matmul_bias(w, &col_buf, bias, out, c_out, t_out, c_in * k)
     }
 
@@ -125,13 +124,8 @@ pub trait KokoroGpuBackend {
                            k: usize, stride: usize, padding: usize, dilation: usize) -> Result<()> {
         let col_buf = self.alloc(c_in * k * t_out)?;
         self.im2col_lrelu(x, &col_buf, c_in, t_in, t_out, k, stride, padding, dilation)?;
-        self.flush()?;
         self.matmul_bias(w, &col_buf, bias, out, c_out, t_out, c_in * k)
     }
-
-    /// Flush pending GPU work. Ensures all previously dispatched kernels are
-    /// committed before new allocations, preventing buffer reuse races.
-    fn flush(&self) -> Result<()> { Ok(()) }
 
     // ── F32-intermediate operations (prevent precision loss through normalization) ──
 
