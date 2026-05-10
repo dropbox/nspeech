@@ -58,6 +58,7 @@ impl KokoroGpuDecoder {
     }
 }
 
+#[allow(dead_code)]
 impl KokoroGpuDecoder {
     pub fn test_conv1d_f32io(&self) {
         self.test_adain_snake_f32();
@@ -323,7 +324,6 @@ impl KokoroGpuDecoder {
         // CPU reference — use f16-quantized input for stats (matches GPU path)
         let x_f16: Vec<f32> = x_data.iter().map(|v| half::f16::from_f32(*v).to_f32()).collect();
         let mut max_err: f32 = 0.0;
-        let mut max_idx = 0;
         for ch in 0..channels {
             let base = ch * seq_len;
             let slice = &x_f16[base..base + seq_len];
@@ -344,7 +344,7 @@ impl KokoroGpuDecoder {
                 let expected = styled + s * s * inv_a;
                 let gpu_val = gpu_out[base + t];
                 let d = (gpu_val - expected).abs();
-                if d > max_err { max_err = d; max_idx = base + t; }
+                if d > max_err { max_err = d; }
             }
         }
         eprintln!("[adain_snake_f32 test] channels={channels} seq_len={seq_len} max_err={max_err:.6} gpu[0]={:.4}",
@@ -856,8 +856,12 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
             &self.kernels.instance_norm_stats_f32in_2k
         } else if seq_len <= 8192 {
             &self.kernels.instance_norm_stats_f32in_8k
-        } else {
+        } else if seq_len <= 32768 {
             &self.kernels.instance_norm_stats_f32in_32k
+        } else if seq_len <= 65536 {
+            &self.kernels.instance_norm_stats_f32in_64k
+        } else {
+            &self.kernels.instance_norm_stats_f32in_128k
         };
         encoder.set_compute_pipeline_state(stats_pipeline);
         encoder.set_buffer(0, Some(x.buf()), x.offset);

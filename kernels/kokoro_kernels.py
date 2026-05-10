@@ -792,7 +792,7 @@ def instance_norm_stats_f32in(
     BLOCK_SIZE: tl.constexpr,
     MAX_SEQ: tl.constexpr,
 ):
-    """Compute per-channel mean and rstd from f32 input.
+    """Compute per-channel mean and rstd from f32 input (single-pass, for short sequences).
 
     x: [n_channels, seq_len] (f32)
     stats: [n_channels * 2] (f32) — interleaved [mean0, rstd0, mean1, rstd1, ...]
@@ -816,6 +816,49 @@ def instance_norm_stats_f32in(
     sq_total = tl.sum(var_acc, axis=0)
     mean = total / seq_len
     var = sq_total / seq_len - mean * mean
+    rstd = 1.0 / tl.sqrt(var + 1e-5)
+
+    tl.store(stats_ptr + ch * 2, mean)
+    tl.store(stats_ptr + ch * 2 + 1, rstd)
+
+
+@triton.jit
+def instance_norm_stats_f32in_twopass(
+    x_ptr, stats_ptr,
+    n_channels, seq_len,
+    BLOCK_SIZE: tl.constexpr,
+    MAX_SEQ: tl.constexpr,
+):
+    """Compute per-channel mean and rstd from f32 input (two-pass, for long sequences).
+
+    x: [n_channels, seq_len] (f32)
+    stats: [n_channels * 2] (f32) — interleaved [mean0, rstd0, mean1, rstd1, ...]
+
+    Grid: [n_channels, 1, 1]
+    """
+    ch = tl.program_id(0)
+    base = ch * seq_len
+
+    # Pass 1: compute mean
+    mean_acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    for start in tl.static_range(0, MAX_SEQ, BLOCK_SIZE):
+        offs = start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < seq_len
+        x = tl.load(x_ptr + base + offs, mask=mask, other=0.0)
+        mean_acc += x
+
+    mean = tl.sum(mean_acc, axis=0) / seq_len
+
+    # Pass 2: compute variance as E[(x - mean)^2]
+    var_acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    for start in tl.static_range(0, MAX_SEQ, BLOCK_SIZE):
+        offs = start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < seq_len
+        x = tl.load(x_ptr + base + offs, mask=mask, other=0.0)
+        diff = tl.where(mask, x - mean, 0.0)
+        var_acc += diff * diff
+
+    var = tl.sum(var_acc, axis=0) / seq_len
     rstd = 1.0 / tl.sqrt(var + 1e-5)
 
     tl.store(stats_ptr + ch * 2, mean)

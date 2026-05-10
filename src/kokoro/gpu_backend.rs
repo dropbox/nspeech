@@ -21,7 +21,7 @@ pub trait KokoroGpuBackend {
     fn download_f16(&self, buf: &Self::Buf, count: usize) -> Result<Vec<half::f16>>;
 
     /// Upload f32 data (activation — not cached).
-    fn upload_f32(&self, data: &[f32]) -> Result<Self::Buf> {
+    fn upload_f32(&self, _data: &[f32]) -> Result<Self::Buf> {
         Err(anyhow::anyhow!("upload_f32 not supported"))
     }
 

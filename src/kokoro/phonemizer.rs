@@ -90,10 +90,6 @@ impl Phonemizer {
         result
     }
 
-    fn word_to_ipa(&self, word: &str) -> String {
-        self.word_to_ipa_tagged(word).0
-    }
-
     /// Returns (ipa, is_spelled_acronym).
     fn word_to_ipa_tagged(&self, word: &str) -> (String, bool) {
         let lower = word.to_lowercase();

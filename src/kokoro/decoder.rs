@@ -380,7 +380,7 @@ impl Generator {
             let nc_padding = if nc_k > 1 { (nc_stride + 1) / 2 } else { 0 };
             let har_t = har_source.dim(2)?;
             let mut _noise_keep: Vec<G::Buf> = Vec::new();
-            let (src_buf, src_c, src_t) = if gpu.has_f32_intermediates() {
+            let (src_buf, _src_c, _src_t) = if gpu.has_f32_intermediates() {
                 let (c_out, _, k) = nc_w.dims3()?;
                 let t_out = (har_t + 2 * nc_padding - 1 * (k - 1) - 1) / nc_stride + 1;
                 let har_f32 = gpu.alloc_f32(har_c * har_t)?;
@@ -1063,22 +1063,9 @@ impl ResBlock {
         &self, x_f32: &G::Buf, adain_params: &[(G::Buf, G::Buf)], gpu: &G,
         channels: usize, seq_len: usize, keep: &mut Vec<G::Buf>,
     ) -> Result<G::Buf> {
-        let dbg = std::env::var("KOKORO_DBG_NOISE").is_ok() && seq_len > 10000;
         let dilations = [1usize, 3, 5];
         let n = channels * seq_len;
         let mut h = x_f32.clone();
-
-        if dbg {
-            let data = gpu.download_f32(&h, n)?;
-            let idx = 883174usize.min(n - 1);
-            let ch_idx = idx / seq_len;
-            let t_idx = idx % seq_len;
-            let ch_data = &data[ch_idx*seq_len..(ch_idx+1)*seq_len];
-            let mean: f64 = ch_data.iter().map(|v| *v as f64).sum::<f64>() / seq_len as f64;
-            let var: f64 = ch_data.iter().map(|v| { let d = *v as f64 - mean; d*d }).sum::<f64>() / seq_len as f64;
-            let rstd = 1.0 / (var as f32 + 1e-5).sqrt();
-            eprintln!("    [noise_dbg] input: val[{idx}]={:.6} ch{ch_idx} t{t_idx} mean={:.6} var={:.6} rstd={:.2}", data[idx], mean, var, rstd);
-        }
 
         for i in 0..3 {
             let residual = h.clone();
@@ -1088,12 +1075,6 @@ impl ResBlock {
             gpu.adain_snake_f32(&h, &adain_params[i].0, &adain_params[i].1, &alpha1_buf, &out, channels, seq_len)?;
             keep.push(h);
             h = out;
-
-            if dbg {
-                let data = gpu.download_f32(&h, n)?;
-                let idx = 883174usize.min(n - 1);
-                eprintln!("    [noise_dbg] i={i} after adain1: val[{idx}]={:.6}", data[idx]);
-            }
 
             let dilation = dilations[i];
             let padding1 = (self.kernel_size - 1) * dilation / 2;
@@ -1105,23 +1086,11 @@ impl ResBlock {
             keep.push(h);
             h = out;
 
-            if dbg {
-                let data = gpu.download_f32(&h, n)?;
-                let idx = 883174usize.min(n - 1);
-                eprintln!("    [noise_dbg] i={i} after conv1: val[{idx}]={:.6}", data[idx]);
-            }
-
             let alpha2_buf = upload_weight(gpu, &self.alpha2[i].reshape(channels)?)?;
             let out = gpu.alloc_f32(n)?;
             gpu.adain_snake_f32(&h, &adain_params[3 + i].0, &adain_params[3 + i].1, &alpha2_buf, &out, channels, seq_len)?;
             keep.push(h);
             h = out;
-
-            if dbg {
-                let data = gpu.download_f32(&h, n)?;
-                let idx = 883174usize.min(n - 1);
-                eprintln!("    [noise_dbg] i={i} after adain2: val[{idx}]={:.6}", data[idx]);
-            }
 
             let padding2 = (self.kernel_size - 1) / 2;
             let (w2, b2) = &self.convs2[i];
@@ -1132,38 +1101,14 @@ impl ResBlock {
             keep.push(h);
             h = out;
 
-            if dbg {
-                let data = gpu.download_f32(&h, n)?;
-                let idx = 883174usize.min(n - 1);
-                eprintln!("    [noise_dbg] i={i} after conv2: val[{idx}]={:.6}", data[idx]);
-            }
-
             let out = gpu.alloc_f32(n)?;
             gpu.add_f32(&h, &residual, &out, n)?;
             keep.push(h);
             h = out;
-
-            if dbg {
-                let data = gpu.download_f32(&h, n)?;
-                let idx = 883174usize.min(n - 1);
-                eprintln!("    [noise_dbg] i={i} after add: val[{idx}]={:.6}", data[idx]);
-            }
-        }
-
-        if dbg {
-            let data = gpu.download_f32(&h, n)?;
-            let idx = 883174usize.min(n - 1);
-            eprintln!("    [noise_dbg] f32 output: val[{idx}]={:.6}", data[idx]);
         }
 
         let out_f16 = gpu.alloc(n)?;
         gpu.f32_to_f16(&h, &out_f16, n)?;
-
-        if dbg {
-            let f16_data = gpu.download_f16(&out_f16, n)?;
-            let idx = 883174usize.min(n - 1);
-            eprintln!("    [noise_dbg] f16 output: val[{idx}]={:.6}", f16_data[idx].to_f32());
-        }
 
         Ok(out_f16)
     }
@@ -1379,7 +1324,7 @@ impl ResBlock {
         Ok(h)
     }
 
-    /// Forward with f16-quantized weights (simulates GPU precision).
+    #[allow(dead_code)]
     fn forward_f16_weights(&self, x: &Tensor, style: &Tensor) -> Result<Tensor> {
         let dilations = [1usize, 3, 5];
         let mut h = x.clone();
@@ -1475,19 +1420,21 @@ fn snake_activation_tensor(x: &Tensor, alpha: &Tensor) -> Result<Tensor> {
     (x + sin_sq.broadcast_mul(&inv_alpha)?).map_err(Into::into)
 }
 
-/// Simple xorshift64 PRNG for reproducible noise generation.
+thread_local! {
+    static RAND_STATE: std::cell::Cell<u64> = std::cell::Cell::new(0x12345678_9abcdef0);
+}
+
+pub fn reset_rng() {
+    RAND_STATE.with(|s| s.set(0x12345678_9abcdef0));
+}
+
 fn rand_normal() -> f32 {
-    use std::cell::Cell;
-    thread_local! {
-        static STATE: Cell<u64> = Cell::new(0x12345678_9abcdef0);
-    }
-    STATE.with(|s| {
+    RAND_STATE.with(|s| {
         let mut x = s.get();
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
         s.set(x);
-        // Box-Muller approximation using two uniform samples
         let u1 = (x & 0xFFFFFFFF) as f32 / u32::MAX as f32;
         x ^= x << 13;
         x ^= x >> 7;

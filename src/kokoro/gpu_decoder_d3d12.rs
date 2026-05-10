@@ -486,8 +486,12 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             &self.kernels.instance_norm_stats_f32in_2k
         } else if seq_len <= 8192 {
             &self.kernels.instance_norm_stats_f32in_8k
-        } else {
+        } else if seq_len <= 32768 {
             &self.kernels.instance_norm_stats_f32in_32k
+        } else if seq_len <= 65536 {
+            &self.kernels.instance_norm_stats_f32in_64k
+        } else {
+            &self.kernels.instance_norm_stats_f32in_128k
         };
         let stats_buf = self.gpu.create_buffer((channels * 2 * 4) as u64)
             .map_err(|e| anyhow::anyhow!("create stats buf: {e}"))?;

@@ -444,6 +444,12 @@ KERNEL_METADATA = {
     "kokoro_instance_norm_stats_f32in_32k": {
         "alias": "instance_norm_stats_f32in_32k", "group": "kokoro", "d3d12": True,
     },
+    "kokoro_instance_norm_stats_f32in_64k": {
+        "alias": "instance_norm_stats_f32in_64k", "group": "kokoro", "d3d12": True,
+    },
+    "kokoro_instance_norm_stats_f32in_128k": {
+        "alias": "instance_norm_stats_f32in_128k", "group": "kokoro", "d3d12": True,
+    },
     "kokoro_norm_style_snake_f32io": {
         "alias": "norm_style_snake_f32io", "group": "kokoro", "d3d12": True,
     },

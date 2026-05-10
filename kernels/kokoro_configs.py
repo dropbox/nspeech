@@ -147,9 +147,19 @@ KOKORO_KERNELS = [
      "*fp32, *fp32, i32, i32, 1024, 8192",
      4, ["n_channels", "1", "1"]),
 
-    # Instance norm stats from f32 input (32k variant, for long sequences after full upsample)
-    ("kokoro_instance_norm_stats_f32in_32k", "instance_norm_stats_f32in",
+    # Instance norm stats from f32 input (32k variant, two-pass for numerical stability)
+    ("kokoro_instance_norm_stats_f32in_32k", "instance_norm_stats_f32in_twopass",
      "*fp32, *fp32, i32, i32, 1024, 32768",
+     4, ["n_channels", "1", "1"]),
+
+    # Instance norm stats from f32 input (64k variant, two-pass for numerical stability)
+    ("kokoro_instance_norm_stats_f32in_64k", "instance_norm_stats_f32in_twopass",
+     "*fp32, *fp32, i32, i32, 1024, 65536",
+     4, ["n_channels", "1", "1"]),
+
+    # Instance norm stats from f32 input (128k variant, two-pass for numerical stability)
+    ("kokoro_instance_norm_stats_f32in_128k", "instance_norm_stats_f32in_twopass",
+     "*fp32, *fp32, i32, i32, 1024, 131072",
      4, ["n_channels", "1", "1"]),
 
     # Normalize + style + snake: f32 in, f32 out

@@ -25,3 +25,4 @@ pub mod gpu_decoder_d3d12;
 pub use config::KokoroConfig;
 pub use model::KokoroModel;
 pub use phonemizer::{phonemize, Phonemizer};
+pub use decoder::reset_rng;
