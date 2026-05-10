@@ -477,26 +477,6 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             .map_err(|e| anyhow::anyhow!("conv1d_f32io: {e}"))
     }
 
-    fn conv1d_f32_lrelu(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
-                        c_in: usize, c_out: usize, t_in: usize, t_out: usize,
-                        k: usize, stride: usize, padding: usize, dilation: usize) -> Result<()> {
-        let grid_x = c_out as u32;
-        let grid_y = cdiv(t_out, 256) as u32;
-        let rc: Vec<u32> = vec![
-            c_in as u32, c_out as u32, t_in as u32, t_out as u32,
-            k as u32, stride as u32, padding as u32, dilation as u32,
-            grid_x, grid_y, 1,
-        ];
-        let uavs = [
-            BufferBinding::structured_f32(x, (c_in * t_in) as u32),
-            uav_f16(w, (c_out * c_in * k) as u32),
-            uav_f16(bias, c_out as u32),
-            BufferBinding::structured_f32(out, (c_out * t_out) as u32),
-        ];
-        self.gpu.record_dispatch(&self.kernels.conv1d_f32io_lrelu, &rc, &uavs, [grid_x, grid_y, 1])
-            .map_err(|e| anyhow::anyhow!("conv1d_f32io_lrelu: {e}"))
-    }
-
     fn adain_snake_f32(&self, x: &GpuBuffer, gamma: &GpuBuffer, beta: &GpuBuffer,
                        alpha: &GpuBuffer, out: &GpuBuffer,
                        channels: usize, seq_len: usize) -> Result<()> {

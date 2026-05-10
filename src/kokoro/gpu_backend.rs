@@ -166,12 +166,6 @@ pub trait KokoroGpuBackend {
         Err(anyhow::anyhow!("conv1d_f32 not supported"))
     }
 
-    fn conv1d_f32_lrelu(&self, _x: &Self::Buf, _w: &Self::Buf, _bias: &Self::Buf, _out: &Self::Buf,
-                        _c_in: usize, _c_out: usize, _t_in: usize, _t_out: usize,
-                        _k: usize, _stride: usize, _padding: usize, _dilation: usize) -> Result<()> {
-        Err(anyhow::anyhow!("conv1d_f32_lrelu not supported"))
-    }
-
     /// AdaIN + snake with f32 input and f32 output.
     fn adain_snake_f32(&self, _x: &Self::Buf, _gamma: &Self::Buf, _beta: &Self::Buf,
                        _alpha: &Self::Buf, _out: &Self::Buf,

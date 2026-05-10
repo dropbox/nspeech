@@ -842,29 +842,6 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         Ok(())
     }
 
-    fn conv1d_f32_lrelu(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
-                        c_in: usize, c_out: usize, t_in: usize, t_out: usize,
-                        k: usize, stride: usize, padding: usize, dilation: usize) -> Result<()> {
-        let encoder = self.device.command_encoder()?;
-        encoder.set_compute_pipeline_state(&self.kernels.conv1d_f32io_lrelu);
-        encoder.set_buffer(0, Some(x.buf()), x.offset);
-        encoder.set_buffer(1, Some(w.buf()), w.offset);
-        encoder.set_buffer(2, Some(bias.buf()), bias.offset);
-        encoder.set_buffer(3, Some(out.buf()), out.offset);
-        encoder.set_bytes(4, &(c_in as i32));
-        encoder.set_bytes(5, &(c_out as i32));
-        encoder.set_bytes(6, &(t_in as i32));
-        encoder.set_bytes(7, &(t_out as i32));
-        encoder.set_bytes(8, &(k as i32));
-        encoder.set_bytes(9, &(stride as i32));
-        encoder.set_bytes(10, &(padding as i32));
-        encoder.set_bytes(11, &(dilation as i32));
-        let grid = MTLSize { width: c_out, height: cdiv(t_out, 256), depth: 1 };
-        let tg = MTLSize { width: 256, height: 1, depth: 1 };
-        encoder.dispatch_thread_groups(grid, tg);
-        Ok(())
-    }
-
     fn adain_snake_f32(&self, x: &GpuBuffer, gamma: &GpuBuffer, beta: &GpuBuffer,
                        alpha: &GpuBuffer, out: &GpuBuffer,
                        channels: usize, seq_len: usize) -> Result<()> {
