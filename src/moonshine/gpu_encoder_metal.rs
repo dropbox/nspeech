@@ -73,11 +73,11 @@ impl EncoderBackend for MetalEncoderBackend {
     type Weight = GpuBuffer;
 
     fn alloc_activation(&self, count: usize) -> Result<GpuBuffer> {
-        Ok(GpuBuffer::alloc_f16(&self.device, count)?)
+        Ok(GpuBuffer::alloc_shared_f16(&self.device, count)?)
     }
 
     fn alloc_residual(&self, count: usize) -> Result<GpuBuffer> {
-        Ok(GpuBuffer::alloc_f16(&self.device, count)?)
+        Ok(GpuBuffer::alloc_shared_f16(&self.device, count)?)
     }
 
     fn upload_matmul_weight(&self, data_f32: &[f32], _rows: usize, _cols: usize) -> Result<GpuBuffer> {
@@ -227,8 +227,7 @@ impl EncoderBackend for MetalEncoderBackend {
         // our new command encoder starts reading the buffer.
         self.flush()?;
 
-        // Zero padding region via CPU memset (shared memory buffer).
-        // FA reads all padded_seq rows, so padding must be zero.
+        // Zero padding region (FA reads all padded_seq rows, padding must be zero).
         if padded_n > n {
             unsafe {
                 let ptr = dst.contents_ptr() as *mut u8;

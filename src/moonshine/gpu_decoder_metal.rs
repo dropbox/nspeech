@@ -39,9 +39,9 @@ impl MetalBackend {
         let encoder_kernels = TritonKernels::load(device)?;
 
         // n_splits=32, BLOCK_D=128, 3 arrays (m, l, acc) per partial
-        let f32_splitkv_partial = GpuBuffer::alloc_f32(device, n_q_heads * 32 * 3 * 128)?;
+        let f32_splitkv_partial = GpuBuffer::alloc_shared_f32(device, n_q_heads * 32 * 3 * 128)?;
         // F16 partial buffer for split-K GEMV
-        let f16_partial = GpuBuffer::alloc_f16(device, 3 * 16 * 2 * intermediate_size)?;
+        let f16_partial = GpuBuffer::alloc_shared_f16(device, 3 * 16 * 2 * intermediate_size)?;
 
         Ok(Self {
             device: device.clone(),
@@ -64,11 +64,11 @@ impl DecoderBackend for MetalBackend {
     type Buf = GpuBuffer;
 
     fn alloc_f16(&self, count: usize) -> Result<GpuBuffer> {
-        Ok(GpuBuffer::alloc_f16(&self.device, count)?)
+        Ok(GpuBuffer::alloc_shared_f16(&self.device, count)?)
     }
 
     fn alloc_f32(&self, count: usize) -> Result<GpuBuffer> {
-        Ok(GpuBuffer::alloc_f32(&self.device, count)?)
+        Ok(GpuBuffer::alloc_shared_f32(&self.device, count)?)
     }
 
     fn upload_f16_weight(&self, data_f32: &[f32]) -> Result<GpuBuffer> {

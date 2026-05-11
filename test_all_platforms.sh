@@ -28,7 +28,8 @@ fail()   { FAIL=$((FAIL+1)); RESULTS+="  FAIL  $1\n"; }
 #(cd kernels && python build.py) 2>&1 | tail -5
 
 header "Building for M2 Mac (aarch64-apple-darwin)"
-cargo build --release --features triton-metal --example $EXAMPLE 2>&1 \
+cargo build --release --features triton-metal --example $EXAMPLE \
+  --target aarch64-apple-darwin 2>&1 \
   | grep -E 'Compiling speech|Finished|error' || true
 
 header "Building for Intel Mac (x86_64-apple-darwin)"
@@ -47,12 +48,12 @@ header "Deploying binaries"
 echo "  Intel Mac..."
 ecp target/x86_64-apple-darwin/release/examples/$EXAMPLE mac:speech/
 echo "  Windows..."
-ecp target/x86_64-pc-windows-msvc/release/examples/$EXAMPLE.exe windows:candle/
+ecp target/x86_64-pc-windows-msvc/release/examples/$EXAMPLE.exe windows:speech/
 
 # ── 3. Run on M2 Mac (local) ──────────────────────────────────────────────
 
 header "M2 Mac (local)"
-OUTPUT=$(target/release/examples/$EXAMPLE "$WAV" assets 3 2>&1) || true
+OUTPUT=$(target/aarch64-apple-darwin/release/examples/$EXAMPLE "$WAV" assets 2>&1) || true
 echo "$OUTPUT" | tail -5
 if echo "$OUTPUT" | grep -q 'RTF'; then
   ok "M2 Mac"
@@ -64,7 +65,7 @@ fi
 # ── 4. Run on Intel Mac ───────────────────────────────────────────────────
 
 header "Intel Mac (ssh mac)"
-OUTPUT=$(ssh mac "cd speech && ./$EXAMPLE $WAV assets 3" 2>&1) || true
+OUTPUT=$(ssh mac "cd speech && ./$EXAMPLE $WAV assets" 2>&1) || true
 echo "$OUTPUT" | tail -5
 if echo "$OUTPUT" | grep -q 'RTF'; then
   ok "Intel Mac"
@@ -76,7 +77,7 @@ fi
 # ── 5. Run on Windows ─────────────────────────────────────────────────────
 
 header "Windows (ssh windows)"
-OUTPUT=$(ssh windows "cd candle && ./$EXAMPLE.exe $WAV assets 3" 2>&1) || true
+OUTPUT=$(ssh windows "cd speech && ./$EXAMPLE.exe $WAV assets" 2>&1) || true
 echo "$OUTPUT" | tail -5
 if echo "$OUTPUT" | grep -q 'RTF'; then
   ok "Windows"

@@ -81,30 +81,8 @@ fn main() {
         println!("cargo:rerun-if-changed={}", manifest_dir.join("kernels/out/dxil").display());
     }
 
-    // Per-platform stamp — skip if up to date
-    let stamp_name = format!(".stamp_{}", platforms.join("_"));
-    let stamp = kernels_dir.join("out").join(&stamp_name);
-    if stamp.exists() {
-        let stamp_time = std::fs::metadata(&stamp)
-            .and_then(|m| m.modified())
-            .ok();
-        if let Some(st) = stamp_time {
-            let all_fresh = kernel_sources.iter().all(|s| {
-                std::fs::metadata(manifest_dir.join(s))
-                    .and_then(|m| m.modified())
-                    .map(|t| t <= st)
-                    .unwrap_or(true)
-            }) && compiler_sources.iter().all(|s| {
-                std::fs::metadata(triton_metal_dir.join(s))
-                    .and_then(|m| m.modified())
-                    .map(|t| t <= st)
-                    .unwrap_or(true)
-            });
-            if all_fresh {
-                return;
-            }
-        }
-    }
+    // Always run build.py — ninja handles incremental rebuilds efficiently,
+    // and this prevents stale kernel issues when sources change outside cargo's view.
 
     // Find python — venv uses Scripts/ on Windows, bin/ elsewhere.
     // Use host OS (not target), since build.py runs on the build machine.
@@ -116,7 +94,7 @@ fn main() {
     let python = if venv_python.exists() { venv_python } else { PathBuf::from("python3") };
 
     let platform_str = platforms.join(", ");
-    println!("cargo:warning=Compiling Triton kernels for [{platform_str}] (sources changed)...");
+    println!("cargo:warning=Compiling Triton kernels for [{platform_str}]...");
 
     let status = Command::new(&python)
         .arg("build.py")
@@ -126,7 +104,6 @@ fn main() {
 
     match status {
         Ok(s) if s.success() => {
-            let _ = std::fs::write(&stamp, format!("{:?}", std::time::SystemTime::now()));
             println!("cargo:warning=Triton kernels compiled successfully ({platform_str}).");
         }
         Ok(s) => {
