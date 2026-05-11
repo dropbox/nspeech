@@ -39,8 +39,8 @@ def matmul_fp16(
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, K, BLOCK_K):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] + k < K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] + k < K, other=0.0)
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] + k < K), other=0.0)
+        b = tl.load(b_ptrs, mask=(offs_k[:, None] + k < K) & (offs_n[None, :] < N), other=0.0)
         acc += tl.dot(a, b)
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
@@ -76,8 +76,8 @@ def matmul_f16a_f32w(
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, K, BLOCK_K):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] + k < K, other=0.0).to(tl.float32)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] + k < K, other=0.0)
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] + k < K), other=0.0).to(tl.float32)
+        b = tl.load(b_ptrs, mask=(offs_k[:, None] + k < K) & (offs_n[None, :] < N), other=0.0)
         acc += tl.dot(a, b)
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
@@ -124,8 +124,8 @@ def matmul_bias_fp16(
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, K, BLOCK_K):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] + k < K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] + k < K, other=0.0)
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] + k < K), other=0.0)
+        b = tl.load(b_ptrs, mask=(offs_k[:, None] + k < K) & (offs_n[None, :] < N), other=0.0)
         acc += tl.dot(a, b)
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
@@ -163,8 +163,8 @@ def matmul_bias_f16a_f32w(
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, K, BLOCK_K):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] + k < K, other=0.0).to(tl.float32)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] + k < K, other=0.0)
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] + k < K), other=0.0).to(tl.float32)
+        b = tl.load(b_ptrs, mask=(offs_k[:, None] + k < K) & (offs_n[None, :] < N), other=0.0)
         acc += tl.dot(a, b)
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
@@ -204,8 +204,8 @@ def matmul_q8(
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, K, BLOCK_K):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] + k < K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] + k < K, other=0).to(tl.float16)
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] + k < K), other=0.0)
+        b = tl.load(b_ptrs, mask=(offs_k[:, None] + k < K) & (offs_n[None, :] < N), other=0).to(tl.float16)
         acc += tl.dot(a, b)
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
@@ -241,8 +241,8 @@ def matmul_q8_bias(
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, K, BLOCK_K):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] + k < K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] + k < K, other=0).to(tl.float16)
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] + k < K), other=0.0)
+        b = tl.load(b_ptrs, mask=(offs_k[:, None] + k < K) & (offs_n[None, :] < N), other=0).to(tl.float16)
         acc += tl.dot(a, b)
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
@@ -281,8 +281,8 @@ def matmul_q8_bias_gelu(
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, K, BLOCK_K):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] + k < K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] + k < K, other=0).to(tl.float16)
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] + k < K), other=0.0)
+        b = tl.load(b_ptrs, mask=(offs_k[:, None] + k < K) & (offs_n[None, :] < N), other=0).to(tl.float16)
         acc += tl.dot(a, b)
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
