@@ -206,6 +206,11 @@ KOKORO_KERNELS = [
      "*fp32, *fp16, *fp16, *fp32, i32, i32, i32, i32, i32, i32, i32, i32, 256, None",
      4, ["C_out", "cdiv(T_out, 256)", "1"]),
 
+    # ── Im2col f32→f16: read f32 input, write f16 im2col output ──
+    ("kokoro_im2col_f32_to_f16", "im2col_f32_to_f16",
+     "*fp32, *fp16, i32, i32, i32, i32, i32, i32, i32, 1024",
+     4, ["cdiv(C_in * K * T_out, 1024)", "1", "1"]),
+
     # ── Reflection pad1d (pad_left=1, pad_right=0) for f32 buffers ──
     ("kokoro_reflection_pad1d_f32", "reflection_pad1d_f32",
      "*fp32, *fp32, i32, i32, 1024",

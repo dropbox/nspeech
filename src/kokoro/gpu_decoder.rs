@@ -813,9 +813,55 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         Ok(())
     }
 
+    fn im2col_f32_to_f16(&self, x: &GpuBuffer, out: &GpuBuffer,
+                         c_in: usize, t_in: usize, t_out: usize, k: usize,
+                         stride: usize, padding: usize, dilation: usize) -> Result<()> {
+        let n_elements = c_in * k * t_out;
+        let encoder = self.device.command_encoder()?;
+        encoder.set_compute_pipeline_state(&self.kernels.im2col_f32_to_f16);
+        encoder.set_buffer(0, Some(x.buf()), x.offset);
+        encoder.set_buffer(1, Some(out.buf()), out.offset);
+        encoder.set_bytes(2, &(c_in as i32));
+        encoder.set_bytes(3, &(t_in as i32));
+        encoder.set_bytes(4, &(t_out as i32));
+        encoder.set_bytes(5, &(k as i32));
+        encoder.set_bytes(6, &(stride as i32));
+        encoder.set_bytes(7, &(padding as i32));
+        encoder.set_bytes(8, &(dilation as i32));
+        let max_tg = self.kernels.im2col_f32_to_f16.max_total_threads_per_threadgroup() as usize;
+        let tg_width = 1024.min(max_tg);
+        let grid = MTLSize { width: cdiv(n_elements, tg_width), height: 1, depth: 1 };
+        let tg = MTLSize { width: tg_width, height: 1, depth: 1 };
+        encoder.dispatch_thread_groups(grid, tg);
+        Ok(())
+    }
+
     fn conv1d_f32(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
                   c_in: usize, c_out: usize, t_in: usize, t_out: usize,
                   k: usize, stride: usize, padding: usize, dilation: usize) -> Result<()> {
+        let kk = c_in * k;
+        let matmul_ok = self.kernels.matmul.max_total_threads_per_threadgroup() >= 256;
+        if matmul_ok && kk % 32 == 0 && c_out % 64 == 0 && t_out % 64 == 0 {
+            let col_buf = self.alloc(kk * t_out)?;
+            self.im2col_f32_to_f16(x, &col_buf, c_in, t_in, t_out, k, stride, padding, dilation)?;
+            let matmul_out = self.alloc(c_out * t_out)?;
+            self.matmul_bias(w, &col_buf, bias, &matmul_out, c_out, t_out, kk)?;
+            self.f16_to_f32(&matmul_out, out, c_out * t_out)?;
+            return Ok(());
+        }
+        if matmul_ok && kk % 32 == 0 && c_out % 64 == 0 {
+            let m_pad = cdiv(t_out, 64) * 64;
+            let col_buf = self.alloc(kk * m_pad)?;
+            self.im2col_f32_to_f16(x, &col_buf, c_in, t_in, m_pad, k, stride, padding, dilation)?;
+            let tmp = self.alloc(c_out * m_pad)?;
+            self.matmul_bias(w, &col_buf, bias, &tmp, c_out, m_pad, kk)?;
+            let n_copy = c_out * t_out;
+            let narrow = self.alloc(n_copy)?;
+            self.im2col(&tmp, &narrow, c_out, m_pad, t_out, 1, 1, 0, 1)?;
+            self.f16_to_f32(&narrow, out, n_copy)?;
+            return Ok(());
+        }
+        // Fallback to naive kernel
         let encoder = self.device.command_encoder()?;
         encoder.set_compute_pipeline_state(&self.kernels.conv1d_f32io);
         encoder.set_buffer(0, Some(x.buf()), x.offset);

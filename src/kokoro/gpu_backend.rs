@@ -153,11 +153,28 @@ pub trait KokoroGpuBackend {
         Err(anyhow::anyhow!("f32_to_f16 not supported"))
     }
 
+    /// Im2col from f32 input to f16 output: [C_in, T_in] f32 → [C_in*K, T_out] f16.
+    fn im2col_f32_to_f16(&self, _x: &Self::Buf, _out: &Self::Buf,
+                         _c_in: usize, _t_in: usize, _t_out: usize, _k: usize,
+                         _stride: usize, _padding: usize, _dilation: usize) -> Result<()> {
+        Err(anyhow::anyhow!("im2col_f32_to_f16 not supported"))
+    }
+
     /// Conv1d with f32 input, f16 weights, f32 output.
-    fn conv1d_f32(&self, _x: &Self::Buf, _w: &Self::Buf, _bias: &Self::Buf, _out: &Self::Buf,
-                  _c_in: usize, _c_out: usize, _t_in: usize, _t_out: usize,
-                  _k: usize, _stride: usize, _padding: usize, _dilation: usize) -> Result<()> {
-        Err(anyhow::anyhow!("conv1d_f32 not supported"))
+    /// Default impl uses im2col_f32→f16 + matmul when dimensions align.
+    fn conv1d_f32(&self, x: &Self::Buf, w: &Self::Buf, bias: &Self::Buf, out: &Self::Buf,
+                  c_in: usize, c_out: usize, t_in: usize, t_out: usize,
+                  k: usize, stride: usize, padding: usize, dilation: usize) -> Result<()> {
+        let kk = c_in * k;
+        if kk % 32 == 0 && c_out % 64 == 0 {
+            let col_buf = self.alloc(kk * t_out)?;
+            self.im2col_f32_to_f16(x, &col_buf, c_in, t_in, t_out, k, stride, padding, dilation)?;
+            let matmul_out = self.alloc(c_out * t_out)?;
+            self.matmul_bias(w, &col_buf, bias, &matmul_out, c_out, t_out, kk)?;
+            self.f16_to_f32(&matmul_out, out, c_out * t_out)?;
+            return Ok(());
+        }
+        Err(anyhow::anyhow!("conv1d_f32 not supported for these dimensions"))
     }
 
     /// AdaIN + snake with f32 input and f32 output.

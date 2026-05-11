@@ -457,9 +457,37 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             .map_err(|e| anyhow::anyhow!("f32_to_f16: {e}"))
     }
 
+    fn im2col_f32_to_f16(&self, x: &GpuBuffer, out: &GpuBuffer,
+                         c_in: usize, t_in: usize, t_out: usize, k: usize,
+                         stride: usize, padding: usize, dilation: usize) -> Result<()> {
+        let n_elements = c_in * k * t_out;
+        let grid_x = cdiv(n_elements, 1024) as u32;
+        let rc: Vec<u32> = vec![
+            c_in as u32, t_in as u32, t_out as u32, k as u32,
+            stride as u32, padding as u32, dilation as u32,
+            grid_x, 1, 1,
+        ];
+        let uavs = [
+            BufferBinding::structured_f32(x, (c_in * t_in) as u32),
+            uav_f16(out, n_elements as u32),
+        ];
+        self.gpu.record_dispatch(&self.kernels.im2col_f32_to_f16, &rc, &uavs, [grid_x, 1, 1])
+            .map_err(|e| anyhow::anyhow!("im2col_f32_to_f16: {e}"))
+    }
+
     fn conv1d_f32(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
                   c_in: usize, c_out: usize, t_in: usize, t_out: usize,
                   k: usize, stride: usize, padding: usize, dilation: usize) -> Result<()> {
+        let kk = c_in * k;
+        if kk % 32 == 0 {
+            let col_buf = self.alloc(kk * t_out)?;
+            self.im2col_f32_to_f16(x, &col_buf, c_in, t_in, t_out, k, stride, padding, dilation)?;
+            let matmul_out = self.alloc(c_out * t_out)?;
+            self.matmul_bias(w, &col_buf, bias, &matmul_out, c_out, t_out, kk)?;
+            self.f16_to_f32(&matmul_out, out, c_out * t_out)?;
+            return Ok(());
+        }
+        // Fallback to naive kernel
         let grid_x = c_out as u32;
         let grid_y = cdiv(t_out, 256) as u32;
         let rc: Vec<u32> = vec![

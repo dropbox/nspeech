@@ -477,6 +477,9 @@ KERNEL_METADATA = {
     "kokoro_conv_transpose1d_f32io": {
         "alias": "conv_transpose1d_f32io", "group": "kokoro", "d3d12": True,
     },
+    "kokoro_im2col_f32_to_f16": {
+        "alias": "im2col_f32_to_f16", "group": "kokoro", "d3d12": True,
+    },
     "kokoro_reflection_pad1d_f32": {
         "alias": "reflection_pad1d_f32", "group": "kokoro", "d3d12": True,
     },

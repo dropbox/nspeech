@@ -456,6 +456,37 @@ def im2col_conv1d(
     tl.store(out_ptr + offsets, val, mask=mask)
 
 
+# ─── Im2col f32→f16: read f32 input, write f16 output ─────────────────────────
+
+@triton.jit
+def im2col_f32_to_f16(
+    x_ptr, out_ptr,
+    C_in, T_in, T_out, K,
+    stride, padding, dilation,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Im2col for conv1d: read f32 input [C_in, T_in], write f16 [C_in*K, T_out].
+
+    Grid: [cdiv(C_in * K * T_out, BLOCK_SIZE), 1, 1]
+    """
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    n_elements = C_in * K * T_out
+    mask = offsets < n_elements
+
+    t_out_idx = offsets % T_out
+    row = offsets // T_out
+    c = row // K
+    ki = row % K
+
+    t_in_pos = t_out_idx * stride - padding + ki * dilation
+    valid = mask & (t_in_pos >= 0) & (t_in_pos < T_in)
+
+    x_idx = c * T_in + t_in_pos
+    val = tl.load(x_ptr + x_idx, mask=valid, other=0.0)
+    tl.store(out_ptr + offsets, val.to(tl.float16), mask=mask)
+
+
 # ─── Im2col with fused leaky_relu on input ────────────────────────────────────
 
 @triton.jit
