@@ -223,4 +223,11 @@ pub trait KokoroGpuBackend {
     fn istft_gpu(&self, _x: &Self::Buf, _out: &Self::Buf, _n_frames: usize, _out_len: usize) -> Result<()> {
         Err(anyhow::anyhow!("istft_gpu not supported"))
     }
+
+    /// Begin batching dispatches (avoids per-dispatch submit+wait overhead).
+    /// Default is no-op (Metal doesn't need this — its command encoder already batches).
+    fn begin_batch(&self) -> Result<()> { Ok(()) }
+
+    /// End batch and execute all recorded dispatches.
+    fn end_batch(&self) -> Result<()> { Ok(()) }
 }

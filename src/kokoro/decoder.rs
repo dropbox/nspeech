@@ -339,6 +339,27 @@ impl Generator {
     }
 
     #[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
+    fn preupload_weights<G: KokoroGpuBackend>(&self, gpu: &G) -> Result<()> {
+        for (w, b) in &self.ups {
+            upload_weight(gpu, w)?;
+            upload_weight(gpu, b)?;
+        }
+        for (w, b) in &self.noise_convs {
+            upload_weight(gpu, w)?;
+            upload_weight(gpu, b)?;
+        }
+        upload_weight(gpu, &self.conv_post_weight)?;
+        upload_weight(gpu, &self.conv_post_bias)?;
+        for rb in &self.resblocks {
+            rb.preupload_weights(gpu)?;
+        }
+        for rb in &self.noise_res {
+            rb.preupload_weights(gpu)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
     fn forward_gpu<G: KokoroGpuBackend>(&self, x: &Tensor, f0: &Tensor, style: &Tensor, gpu: &G) -> Result<Tensor> {
         let compare = std::env::var("KOKORO_COMPARE").is_ok();
         let dtype = x.dtype();
@@ -360,7 +381,11 @@ impl Generator {
         // CPU reference (only when comparing)
         let mut cpu_h = if compare { Some(x.clone()) } else { None };
 
+        // Pre-upload all weights and activations so batch is never interrupted by uploads
+        self.preupload_weights(gpu)?;
         let mut h_buf = upload_activation(gpu, &x.to_dtype(DType::F16)?)?;
+
+        gpu.begin_batch()?;
         let mut h_c = c_in;
         let mut h_t = t_frames;
         let num_ups = self.ups.len();
@@ -518,6 +543,7 @@ impl Generator {
                     drop(_rb_keep);
                     if compare {
                         let avg_cmp = gpu.download_f32(&avg, n)?;
+                        gpu.begin_batch()?;
                         let ch = cpu_h.as_ref().unwrap();
                         let cpu_r0 = self.resblocks[base].forward(ch, style)?;
                         let cpu_r1 = self.resblocks[base + 1].forward(ch, style)?;
@@ -553,6 +579,7 @@ impl Generator {
                     let audio_len = (n_frames - 1) * hop;
                     let audio_buf = gpu.alloc_f32(audio_len)?;
                     gpu.istft_gpu(&out_f32, &audio_buf, n_frames, audio_len)?;
+                    gpu.end_batch()?;
                     let audio_data = gpu.download_f32(&audio_buf, audio_len)?;
 
                     if compare {
@@ -634,6 +661,7 @@ impl Generator {
             let audio_len = (n_frames - 1) * hop; // trimmed output length
             let audio_buf = gpu.alloc_f32(audio_len)?;
             gpu.istft_gpu(&out_f32, &audio_buf, n_frames, audio_len)?;
+            gpu.end_batch()?;
             let audio_data = gpu.download_f32(&audio_buf, audio_len)?;
 
             if compare {
@@ -668,6 +696,7 @@ impl Generator {
             compare_gpu_cpu(gpu, &h_buf, &cpu_conv, "conv_post");
         }
 
+        gpu.end_batch()?;
         #[cfg(feature = "triton-metal")]
         let _ = self.conv_post_weight.device().as_metal_device().map(|md| md.wait_until_completed());
         let out_data = gpu.download_f16(&h_buf, h_c * h_t)?;
@@ -904,6 +933,20 @@ fn buf_reflection_pad1d<G: KokoroGpuBackend>(
 
 #[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
 impl ResBlock {
+    fn preupload_weights<G: KokoroGpuBackend>(&self, gpu: &G) -> Result<()> {
+        for i in 0..3 {
+            upload_weight(gpu, &self.alpha1[i])?;
+            upload_weight(gpu, &self.alpha2[i])?;
+            let (w1, b1) = &self.convs1[i];
+            upload_weight(gpu, w1)?;
+            upload_weight(gpu, b1)?;
+            let (w2, b2) = &self.convs2[i];
+            upload_weight(gpu, w2)?;
+            upload_weight(gpu, b2)?;
+        }
+        Ok(())
+    }
+
     /// Precompute all adain gamma/beta pairs on CPU and upload to GPU.
     /// Returns 6 pairs: (gamma_buf, beta_buf) for adain1[0..3] then adain2[0..3].
     fn precompute_adain_params<G: KokoroGpuBackend>(&self, style: &Tensor, gpu: &G) -> Result<Vec<(G::Buf, G::Buf)>> {
@@ -947,7 +990,7 @@ impl ResBlock {
         for i in 0..3 {
             let residual = h.clone();
 
-            let alpha1_buf = upload_weight(gpu, &self.alpha1[i].reshape(channels)?)?;
+            let alpha1_buf = upload_weight(gpu, &self.alpha1[i])?;
             let out = gpu.alloc(n)?;
             gpu.adain_snake(&h, &adain_params[i].0, &adain_params[i].1, &alpha1_buf, &out, channels, seq_len)?;
             h = out;
@@ -973,7 +1016,7 @@ impl ResBlock {
                 cpu_h_opt = Some(cpu_val);
             }
 
-            let alpha2_buf = upload_weight(gpu, &self.alpha2[i].reshape(channels)?)?;
+            let alpha2_buf = upload_weight(gpu, &self.alpha2[i])?;
             let out = gpu.alloc(n)?;
             gpu.adain_snake(&h, &adain_params[3 + i].0, &adain_params[3 + i].1, &alpha2_buf, &out, channels, seq_len)?;
             h = out;
@@ -1025,7 +1068,7 @@ impl ResBlock {
         let mut h = x_f32.clone();
         for i in 0..3 {
             let residual = h.clone();
-            let alpha1_buf = upload_weight(gpu, &self.alpha1[i].reshape(channels)?)?;
+            let alpha1_buf = upload_weight(gpu, &self.alpha1[i])?;
             let out = gpu.alloc_f32(n)?;
             gpu.adain_snake_f32(&h, &adain_params[i].0, &adain_params[i].1, &alpha1_buf, &out, channels, seq_len)?;
             keep.push(h); h = out;
@@ -1037,7 +1080,7 @@ impl ResBlock {
             let out = gpu.alloc_f32(n)?;
             gpu.conv1d_f32(&h, &w1_buf, &b1_buf, &out, channels, channels, seq_len, seq_len, self.kernel_size, 1, padding1, dilation)?;
             keep.push(h); h = out;
-            let alpha2_buf = upload_weight(gpu, &self.alpha2[i].reshape(channels)?)?;
+            let alpha2_buf = upload_weight(gpu, &self.alpha2[i])?;
             let out = gpu.alloc_f32(n)?;
             gpu.adain_snake_f32(&h, &adain_params[3 + i].0, &adain_params[3 + i].1, &alpha2_buf, &out, channels, seq_len)?;
             keep.push(h); h = out;
@@ -1068,7 +1111,7 @@ impl ResBlock {
         for i in 0..3 {
             let residual = h.clone();
 
-            let alpha1_buf = upload_weight(gpu, &self.alpha1[i].reshape(channels)?)?;
+            let alpha1_buf = upload_weight(gpu, &self.alpha1[i])?;
             let out = gpu.alloc_f32(n)?;
             gpu.adain_snake_f32(&h, &adain_params[i].0, &adain_params[i].1, &alpha1_buf, &out, channels, seq_len)?;
             keep.push(h);
@@ -1084,7 +1127,7 @@ impl ResBlock {
             keep.push(h);
             h = out;
 
-            let alpha2_buf = upload_weight(gpu, &self.alpha2[i].reshape(channels)?)?;
+            let alpha2_buf = upload_weight(gpu, &self.alpha2[i])?;
             let out = gpu.alloc_f32(n)?;
             gpu.adain_snake_f32(&h, &adain_params[3 + i].0, &adain_params[3 + i].1, &alpha2_buf, &out, channels, seq_len)?;
             keep.push(h);
@@ -1131,7 +1174,7 @@ impl ResBlock {
         for i in 0..3 {
             let residual = h.clone();
 
-            let alpha1_buf = upload_weight(gpu, &self.alpha1[i].reshape(channels)?)?;
+            let alpha1_buf = upload_weight(gpu, &self.alpha1[i])?;
             let out = gpu.alloc_f32(n)?;
             gpu.adain_snake_f32(&h, &adain_params[i].0, &adain_params[i].1, &alpha1_buf, &out, channels, seq_len)?;
             keep.push(h);
@@ -1159,7 +1202,7 @@ impl ResBlock {
                 eprintln!("    [rb_dbg] i={i} after conv1: max_abs={max_abs:.4} first10={:.4?}", &data[..10]);
             }
 
-            let alpha2_buf = upload_weight(gpu, &self.alpha2[i].reshape(channels)?)?;
+            let alpha2_buf = upload_weight(gpu, &self.alpha2[i])?;
             let out = gpu.alloc_f32(n)?;
             gpu.adain_snake_f32(&h, &adain_params[3 + i].0, &adain_params[3 + i].1, &alpha2_buf, &out, channels, seq_len)?;
             keep.push(h);
@@ -1217,7 +1260,7 @@ impl ResBlock {
         for i in 0..3 {
             let residual = h.clone();
 
-            let alpha1_buf = upload_weight(gpu, &self.alpha1[i].reshape(channels)?)?;
+            let alpha1_buf = upload_weight(gpu, &self.alpha1[i])?;
             let out = gpu.alloc_f32(n)?;
             gpu.adain_snake_f32(&h, &adain_params[i].0, &adain_params[i].1, &alpha1_buf, &out, channels, seq_len)?;
             keep.push(h);
@@ -1233,7 +1276,7 @@ impl ResBlock {
             keep.push(h);
             h = out;
 
-            let alpha2_buf = upload_weight(gpu, &self.alpha2[i].reshape(channels)?)?;
+            let alpha2_buf = upload_weight(gpu, &self.alpha2[i])?;
             let out = gpu.alloc_f32(n)?;
             gpu.adain_snake_f32(&h, &adain_params[3 + i].0, &adain_params[3 + i].1, &alpha2_buf, &out, channels, seq_len)?;
             keep.push(h);

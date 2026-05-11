@@ -317,7 +317,8 @@ impl DecoderBackend for D3D12Backend {
         };
         self.gpu.write_upload_buffer(&self.embed_staging, bytes)
             .map_err(|e| anyhow::anyhow!("write upload: {e}"))?;
-        self.gpu.record_copy(&self.embed_staging, dst, (data.len() * 4) as u64);
+        self.gpu.record_copy(&self.embed_staging, dst, (data.len() * 4) as u64)
+            .map_err(|e| anyhow::anyhow!("record_copy: {e}"))?;
         Ok(())
     }
 
@@ -435,7 +436,7 @@ impl DecoderBackend for D3D12Backend {
         dispatch_gemv_f16w(&self.kernels, x, w, out, vocab, dim).unwrap();
         // Copy logits to readback buffer for CPU argmax
         self.barrier();
-        self.gpu.record_copy(out, &self.logits_readback, (vocab * 2) as u64);
+        self.gpu.record_copy(out, &self.logits_readback, (vocab * 2) as u64).unwrap();
     }
 
     fn matmul_cross_kv(&self, enc_proj: &GpuBuffer, w: &GpuBuffer, out: &GpuBuffer,

@@ -1,8 +1,8 @@
 //! D3D12 backend for Kokoro TTS decoder.
 //!
 //! Implements KokoroGpuBackend using Triton-compiled DXIL kernels.
-//! Weights are cached on first upload. Each high-level op does a single
-//! begin_batch/record_dispatch/end_batch round trip.
+//! Weights are cached on first upload. All dispatches in a forward pass
+//! are batched into a single command list submission.
 
 use anyhow::Result;
 use candle_d3d12_kernels::{BufferBinding, Gpu, GpuBuffer, ID3D12PipelineState};
@@ -43,6 +43,12 @@ impl KokoroGpuDecoderD3D12 {
                 Ok(None)
             }
         }
+    }
+
+    fn dispatch(&self, pso: &ID3D12PipelineState, rc: &[u32], uavs: &[BufferBinding], groups: [u32; 3]) -> Result<()> {
+        self.gpu.record_uav_barrier();
+        self.gpu.record_dispatch(pso, rc, uavs, groups)
+            .map_err(|e| anyhow::anyhow!("{e}"))
     }
 }
 
@@ -85,13 +91,20 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             .collect())
     }
 
+    fn begin_batch(&self) -> Result<()> {
+        self.gpu.begin_batch().map_err(|e| anyhow::anyhow!("begin_batch: {e}"))
+    }
+
+    fn end_batch(&self) -> Result<()> {
+        self.gpu.end_batch().map_err(|e| anyhow::anyhow!("end_batch: {e}"))
+    }
+
     fn add(&self, a: &GpuBuffer, b: &GpuBuffer, n: usize) -> Result<GpuBuffer> {
         let out = self.alloc(n)?;
         let grid_x = cdiv(n, 1024) as u32;
         let rc: Vec<u32> = vec![n as u32, grid_x, 1, 1];
         let uavs = [uav_f16(a, n as u32), uav_f16(b, n as u32), uav_f16(&out, n as u32)];
-        self.gpu.record_dispatch(&self.kernels.add, &rc, &uavs, [grid_x, 1, 1])
-            .map_err(|e| anyhow::anyhow!("add: {e}"))?;
+        self.dispatch(&self.kernels.add, &rc, &uavs, [grid_x, 1, 1])?;
         Ok(out)
     }
 
@@ -100,8 +113,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
         let grid_x = cdiv(n, 1024) as u32;
         let rc: Vec<u32> = vec![n as u32, grid_x, 1, 1];
         let uavs = [uav_f16(x, n as u32), uav_f16(&out, n as u32)];
-        self.gpu.record_dispatch(&self.kernels.scale_third, &rc, &uavs, [grid_x, 1, 1])
-            .map_err(|e| anyhow::anyhow!("scale_third: {e}"))?;
+        self.dispatch(&self.kernels.scale_third, &rc, &uavs, [grid_x, 1, 1])?;
         Ok(out)
     }
 
@@ -116,8 +128,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
         let grid_x = cdiv(n_elements, 1024) as u32;
         let rc: Vec<u32> = vec![n_elements as u32, grid_x, 1, 1];
         let uavs = [uav_f16(x, n_elements as u32), uav_f16(out, n_elements as u32)];
-        self.gpu.record_dispatch(pso, &rc, &uavs, [grid_x, 1, 1])
-            .map_err(|e| anyhow::anyhow!("leaky_relu: {e}"))
+        self.dispatch(pso, &rc, &uavs, [grid_x, 1, 1])
     }
 
     fn snake(&self, x: &GpuBuffer, alpha: &GpuBuffer, out: &GpuBuffer,
@@ -132,8 +143,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             uav_f16(alpha, channels as u32),
             uav_f16(out, n_elements as u32),
         ];
-        self.gpu.record_dispatch(&self.kernels.snake, &rc, &uavs, [grid_x, 1, 1])
-            .map_err(|e| anyhow::anyhow!("snake: {e}"))
+        self.dispatch(&self.kernels.snake, &rc, &uavs, [grid_x, 1, 1])
     }
 
     fn adain_snake(&self, x: &GpuBuffer, gamma: &GpuBuffer, beta: &GpuBuffer,
@@ -150,8 +160,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
                 uav_f16(alpha, channels as u32),
                 uav_f16(out, n_elements as u32),
             ];
-            return self.gpu.record_dispatch(&self.kernels.adain_snake_1k, &rc, &uavs, [grid_x, 1, 1])
-                .map_err(|e| anyhow::anyhow!("adain_snake: {e}"));
+            return self.dispatch(&self.kernels.adain_snake_1k, &rc, &uavs, [grid_x, 1, 1]);
         }
 
         // Two-pass approach for seq_len > 1024:
@@ -172,8 +181,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             uav_f16(x, n_elements as u32),
             BufferBinding::structured_f32(&stats_buf, (channels * 2) as u32),
         ];
-        self.gpu.record_dispatch(stats_pso, &rc1, &uavs1, [grid_x, 1, 1])
-            .map_err(|e| anyhow::anyhow!("instance_norm_stats: {e}"))?;
+        self.dispatch(stats_pso, &rc1, &uavs1, [grid_x, 1, 1])?;
 
         // Pass 2: element-wise normalize + style + snake
         let grid2 = cdiv(n_elements, 1024) as u32;
@@ -186,8 +194,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             uav_f16(alpha, channels as u32),
             uav_f16(out, n_elements as u32),
         ];
-        self.gpu.record_dispatch(&self.kernels.norm_style_snake, &rc2, &uavs2, [grid2, 1, 1])
-            .map_err(|e| anyhow::anyhow!("norm_style_snake: {e}"))
+        self.dispatch(&self.kernels.norm_style_snake, &rc2, &uavs2, [grid2, 1, 1])
     }
 
     fn conv1d(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
@@ -206,8 +213,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             uav_f16(bias, c_out as u32),
             uav_f16(out, (c_out * t_out) as u32),
         ];
-        self.gpu.record_dispatch(&self.kernels.conv1d, &rc, &uavs, [grid_x, grid_y, 1])
-            .map_err(|e| anyhow::anyhow!("conv1d: {e}"))
+        self.dispatch(&self.kernels.conv1d, &rc, &uavs, [grid_x, grid_y, 1])
     }
 
     fn conv1d_k(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
@@ -237,8 +243,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             uav_f16(bias, c_out as u32),
             uav_f16(out, (c_out * t_out) as u32),
         ];
-        self.gpu.record_dispatch(&self.kernels.conv_transpose1d, &rc, &uavs, [grid_x, grid_y, 1])
-            .map_err(|e| anyhow::anyhow!("conv_transpose1d: {e}"))
+        self.dispatch(&self.kernels.conv_transpose1d, &rc, &uavs, [grid_x, grid_y, 1])
     }
 
     fn conv_transpose1d_lrelu(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
@@ -266,8 +271,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             uav_f16(bias, c_out as u32),
             uav_f16(out, (c_out * t_out) as u32),
         ];
-        self.gpu.record_dispatch(&self.kernels.conv1d_lrelu001, &rc, &uavs, [grid_x, grid_y, 1])
-            .map_err(|e| anyhow::anyhow!("conv1d_lrelu001: {e}"))
+        self.dispatch(&self.kernels.conv1d_lrelu001, &rc, &uavs, [grid_x, grid_y, 1])
     }
 
     fn reflection_pad1d(&self, x: &GpuBuffer, out: &GpuBuffer, channels: usize, seq_len: usize) -> Result<()> {
@@ -278,8 +282,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             uav_f16(x, (channels * seq_len) as u32),
             uav_f16(out, n_out as u32),
         ];
-        self.gpu.record_dispatch(&self.kernels.reflection_pad1d, &rc, &uavs, [grid_x, 1, 1])
-            .map_err(|e| anyhow::anyhow!("reflection_pad1d: {e}"))
+        self.dispatch(&self.kernels.reflection_pad1d, &rc, &uavs, [grid_x, 1, 1])
     }
 
     fn im2col(&self, x: &GpuBuffer, out: &GpuBuffer,
@@ -296,8 +299,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             uav_f16(x, (c_in * t_in) as u32),
             uav_f16(out, n_elements as u32),
         ];
-        self.gpu.record_dispatch(&self.kernels.im2col, &rc, &uavs, [grid_x, 1, 1])
-            .map_err(|e| anyhow::anyhow!("im2col: {e}"))
+        self.dispatch(&self.kernels.im2col, &rc, &uavs, [grid_x, 1, 1])
     }
 
     fn im2col_lrelu(&self, x: &GpuBuffer, out: &GpuBuffer,
@@ -314,17 +316,17 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             uav_f16(x, (c_in * t_in) as u32),
             uav_f16(out, n_elements as u32),
         ];
-        self.gpu.record_dispatch(&self.kernels.im2col_lrelu, &rc, &uavs, [grid_x, 1, 1])
-            .map_err(|e| anyhow::anyhow!("im2col_lrelu: {e}"))
+        self.dispatch(&self.kernels.im2col_lrelu, &rc, &uavs, [grid_x, 1, 1])
     }
 
     fn matmul_bias(&self, a: &GpuBuffer, b: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
                    m: usize, n: usize, k: usize) -> Result<()> {
         let total = m * n;
-        let tmp = self.alloc(total)?;
-
-        let grid_x = cdiv(m, 64) as u32;
-        let grid_y = cdiv(n, 64) as u32;
+        let m_pad = cdiv(m, 64) * 64;
+        let n_pad = cdiv(n, 64) * 64;
+        let grid_x = (m_pad / 64) as u32;
+        let grid_y = (n_pad / 64) as u32;
+        let tmp = self.alloc(m_pad * n_pad)?;
         let rc: Vec<u32> = vec![
             m as u32, n as u32, k as u32,
             k as u32, 1,    // stride_am, stride_ak
@@ -333,12 +335,11 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             grid_x, grid_y, 1,
         ];
         let uavs = [
-            uav_f16(a, (m * k) as u32),
-            uav_f16(b, (k * n) as u32),
-            uav_f16(&tmp, total as u32),
+            uav_f16(a, (a.size() / 2) as u32),
+            uav_f16(b, (b.size() / 2) as u32),
+            uav_f16(&tmp, (m_pad * n_pad) as u32),
         ];
-        self.gpu.record_dispatch(&self.kernels.matmul, &rc, &uavs, [grid_x, grid_y, 1])
-            .map_err(|e| anyhow::anyhow!("matmul: {e}"))?;
+        self.dispatch(&self.kernels.matmul, &rc, &uavs, [grid_x, grid_y, 1])?;
 
         // Row-broadcast bias add: out[i] = tmp[i] + bias[i / n]
         let bias_grid = cdiv(total, 1024) as u32;
@@ -348,8 +349,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             uav_f16(bias, m as u32),
             uav_f16(out, total as u32),
         ];
-        self.gpu.record_dispatch(&self.kernels.row_bias_add, &bias_rc, &bias_uavs, [bias_grid, 1, 1])
-            .map_err(|e| anyhow::anyhow!("row_bias_add: {e}"))
+        self.dispatch(&self.kernels.row_bias_add, &bias_rc, &bias_uavs, [bias_grid, 1, 1])
     }
 
     fn conv1d_matmul(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
@@ -358,22 +358,12 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
         let kk = c_in * k;
         let kk_padded = cdiv(kk, 32) * 32;
         if kk_padded == kk {
-            let col_buf = self.alloc(kk * t_out)?;
+            let n_padded = cdiv(t_out, 64) * 64;
+            let col_buf = self.alloc(kk * n_padded)?;
             self.im2col(x, &col_buf, c_in, t_in, t_out, k, stride, padding, dilation)?;
             return self.matmul_bias(w, &col_buf, bias, out, c_out, t_out, kk);
         }
-        // K not aligned to 32: pad weight rows and im2col to avoid matmul reading across rows.
-        let col_buf = self.alloc(kk_padded * t_out)?;
-        self.im2col(x, &col_buf, c_in, t_in, t_out, k, stride, padding, dilation)?;
-        // im2col writes kk*t_out elements contiguously; the extra (kk_padded-kk)*t_out stay zero.
-        // But matmul reads B as [K_padded, N] row-major → need B reshaped with stride N per K row.
-        // Actually im2col writes [kk, t_out] contiguously. With stride_bk=N, B[row,col] = b[row*N+col].
-        // The first kk rows are from im2col, rows kk..kk_padded are zeros (from alloc).
-        // This works as-is IF alloc zeroes memory. But it might not.
-        // Instead: allocate exact kk*t_out for im2col, then create kk_padded*t_out buffer with zeros
-        // and copy im2col data into it. But that requires a copy kernel.
-        //
-        // Simpler: just pad the WEIGHT matrix (which is already on GPU, cached).
+        // K not aligned to 32: pad weight rows for matmul alignment.
         let w_data = self.gpu.download_buffer(w, (c_out * kk * 2) as u64)
             .map_err(|e| anyhow::anyhow!("download w: {e}"))?;
         let mut w_padded = vec![0u8; c_out * kk_padded * 2];
@@ -400,6 +390,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
         let zeros = vec![0u8; kk_padded * t_out * 2];
         self.gpu.upload_to_buffer(&zeros, &col_full)
             .map_err(|e| anyhow::anyhow!("zero col: {e}"))?;
+        let _ = self.gpu.begin_batch();
         // Run im2col into first kk*t_out elements
         let n_elements = kk * t_out;
         let grid_x = cdiv(n_elements, 1024) as u32;
@@ -412,8 +403,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             uav_f16(x, (c_in * t_in) as u32),
             uav_f16(&col_full, (kk_padded * t_out) as u32),
         ];
-        self.gpu.record_dispatch(&self.kernels.im2col, &rc, &uavs, [grid_x, 1, 1])
-            .map_err(|e| anyhow::anyhow!("im2col: {e}"))?;
+        self.dispatch(&self.kernels.im2col, &rc, &uavs, [grid_x, 1, 1])?;
 
         self.matmul_bias(&w_pad_buf, &col_full, bias, out, c_out, t_out, kk_padded)
     }
@@ -442,8 +432,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             uav_f16(x, n as u32),
             BufferBinding::structured_f32(out, n as u32),
         ];
-        self.gpu.record_dispatch(&self.kernels.f16_to_f32, &rc, &uavs, [grid_x, 1, 1])
-            .map_err(|e| anyhow::anyhow!("f16_to_f32: {e}"))
+        self.dispatch(&self.kernels.f16_to_f32, &rc, &uavs, [grid_x, 1, 1])
     }
 
     fn f32_to_f16(&self, x: &GpuBuffer, out: &GpuBuffer, n: usize) -> Result<()> {
@@ -453,8 +442,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             BufferBinding::structured_f32(x, n as u32),
             uav_f16(out, n as u32),
         ];
-        self.gpu.record_dispatch(&self.kernels.f32_to_f16, &rc, &uavs, [grid_x, 1, 1])
-            .map_err(|e| anyhow::anyhow!("f32_to_f16: {e}"))
+        self.dispatch(&self.kernels.f32_to_f16, &rc, &uavs, [grid_x, 1, 1])
     }
 
     fn im2col_f32_to_f16(&self, x: &GpuBuffer, out: &GpuBuffer,
@@ -471,8 +459,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             BufferBinding::structured_f32(x, (c_in * t_in) as u32),
             uav_f16(out, n_elements as u32),
         ];
-        self.gpu.record_dispatch(&self.kernels.im2col_f32_to_f16, &rc, &uavs, [grid_x, 1, 1])
-            .map_err(|e| anyhow::anyhow!("im2col_f32_to_f16: {e}"))
+        self.dispatch(&self.kernels.im2col_f32_to_f16, &rc, &uavs, [grid_x, 1, 1])
     }
 
     fn conv1d_f32(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
@@ -480,9 +467,10 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
                   k: usize, stride: usize, padding: usize, dilation: usize) -> Result<()> {
         let kk = c_in * k;
         if kk % 32 == 0 {
-            let col_buf = self.alloc(kk * t_out)?;
+            let n_padded = cdiv(t_out, 64) * 64;
+            let col_buf = self.alloc(kk * n_padded)?;
             self.im2col_f32_to_f16(x, &col_buf, c_in, t_in, t_out, k, stride, padding, dilation)?;
-            let matmul_out = self.alloc(c_out * t_out)?;
+            let matmul_out = self.alloc(c_out * n_padded)?;
             self.matmul_bias(w, &col_buf, bias, &matmul_out, c_out, t_out, kk)?;
             self.f16_to_f32(&matmul_out, out, c_out * t_out)?;
             return Ok(());
@@ -501,8 +489,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             uav_f16(bias, c_out as u32),
             BufferBinding::structured_f32(out, (c_out * t_out) as u32),
         ];
-        self.gpu.record_dispatch(&self.kernels.conv1d_f32io, &rc, &uavs, [grid_x, grid_y, 1])
-            .map_err(|e| anyhow::anyhow!("conv1d_f32io: {e}"))
+        self.dispatch(&self.kernels.conv1d_f32io, &rc, &uavs, [grid_x, grid_y, 1])
     }
 
     fn adain_snake_f32(&self, x: &GpuBuffer, gamma: &GpuBuffer, beta: &GpuBuffer,
@@ -529,8 +516,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             BufferBinding::structured_f32(x, n_elements as u32),
             BufferBinding::structured_f32(&stats_buf, (channels * 2) as u32),
         ];
-        self.gpu.record_dispatch(stats_pso, &rc1, &uavs1, [grid_x, 1, 1])
-            .map_err(|e| anyhow::anyhow!("instance_norm_stats_f32in: {e}"))?;
+        self.dispatch(stats_pso, &rc1, &uavs1, [grid_x, 1, 1])?;
 
         // Pass 2: normalize + style + snake (f32 in, f32 out)
         let grid2 = cdiv(n_elements, 1024) as u32;
@@ -543,8 +529,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             uav_f16(alpha, channels as u32),
             BufferBinding::structured_f32(out, n_elements as u32),
         ];
-        self.gpu.record_dispatch(&self.kernels.norm_style_snake_f32io, &rc2, &uavs2, [grid2, 1, 1])
-            .map_err(|e| anyhow::anyhow!("norm_style_snake_f32io: {e}"))
+        self.dispatch(&self.kernels.norm_style_snake_f32io, &rc2, &uavs2, [grid2, 1, 1])
     }
 
     fn add_f32(&self, a: &GpuBuffer, b: &GpuBuffer, out: &GpuBuffer, n: usize) -> Result<()> {
@@ -555,8 +540,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             BufferBinding::structured_f32(b, n as u32),
             BufferBinding::structured_f32(out, n as u32),
         ];
-        self.gpu.record_dispatch(&self.kernels.add_f32, &rc, &uavs, [grid_x, 1, 1])
-            .map_err(|e| anyhow::anyhow!("add_f32: {e}"))
+        self.dispatch(&self.kernels.add_f32, &rc, &uavs, [grid_x, 1, 1])
     }
 
     fn scale_third_f32(&self, x: &GpuBuffer, out: &GpuBuffer, n: usize) -> Result<()> {
@@ -566,8 +550,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             BufferBinding::structured_f32(x, n as u32),
             BufferBinding::structured_f32(out, n as u32),
         ];
-        self.gpu.record_dispatch(&self.kernels.scale_third_f32, &rc, &uavs, [grid_x, 1, 1])
-            .map_err(|e| anyhow::anyhow!("scale_third_f32: {e}"))
+        self.dispatch(&self.kernels.scale_third_f32, &rc, &uavs, [grid_x, 1, 1])
     }
 
     fn leaky_relu_f32(&self, x: &GpuBuffer, out: &GpuBuffer, n: usize, slope: f32) -> Result<()> {
@@ -582,8 +565,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             BufferBinding::structured_f32(x, n as u32),
             BufferBinding::structured_f32(out, n as u32),
         ];
-        self.gpu.record_dispatch(pso, &rc, &uavs, [grid_x, 1, 1])
-            .map_err(|e| anyhow::anyhow!("leaky_relu_f32: {e}"))
+        self.dispatch(pso, &rc, &uavs, [grid_x, 1, 1])
     }
 
     fn conv_transpose1d_f32io_lrelu(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
@@ -606,8 +588,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
                 k as u32, stride as u32, padding as u32, y_off as u32,
                 grid_x, chunk_y as u32, 1,
             ];
-            self.gpu.record_dispatch(&self.kernels.conv_transpose1d_f32io_lrelu, &rc, &uavs, [grid_x, chunk_y as u32, 1])
-                .map_err(|e| anyhow::anyhow!("conv_transpose1d_f32io_lrelu: {e}"))?;
+            self.dispatch(&self.kernels.conv_transpose1d_f32io_lrelu, &rc, &uavs, [grid_x, chunk_y as u32, 1])?;
             y_off += chunk_y;
         }
         Ok(())
@@ -634,8 +615,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
                 k as u32, stride as u32, padding as u32, y_off as u32,
                 grid_x, chunk_y as u32, 1,
             ];
-            self.gpu.record_dispatch(&self.kernels.conv_transpose1d_f32io, &rc, &uavs, [grid_x, chunk_y as u32, 1])
-                .map_err(|e| anyhow::anyhow!("conv_transpose1d_f32io: {e}"))?;
+            self.dispatch(&self.kernels.conv_transpose1d_f32io, &rc, &uavs, [grid_x, chunk_y as u32, 1])?;
             y_off += chunk_y;
         }
         Ok(())
@@ -649,8 +629,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             BufferBinding::structured_f32(x, (channels * seq_len) as u32),
             BufferBinding::structured_f32(out, n_out as u32),
         ];
-        self.gpu.record_dispatch(&self.kernels.reflection_pad1d_f32, &rc, &uavs, [grid_x, 1, 1])
-            .map_err(|e| anyhow::anyhow!("reflection_pad1d_f32: {e}"))
+        self.dispatch(&self.kernels.reflection_pad1d_f32, &rc, &uavs, [grid_x, 1, 1])
     }
 
     fn istft_gpu(&self, x: &GpuBuffer, out: &GpuBuffer, n_frames: usize, out_len: usize) -> Result<()> {
@@ -660,8 +639,7 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             BufferBinding::structured_f32(x, (22 * n_frames) as u32),
             BufferBinding::structured_f32(out, out_len as u32),
         ];
-        self.gpu.record_dispatch(&self.kernels.istft_fused, &rc, &uavs, [grid_x, 1, 1])
-            .map_err(|e| anyhow::anyhow!("istft_gpu: {e}"))
+        self.dispatch(&self.kernels.istft_fused, &rc, &uavs, [grid_x, 1, 1])
     }
 }
 
