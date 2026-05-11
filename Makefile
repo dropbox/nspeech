@@ -13,10 +13,10 @@ ifeq ($(UNAME_S),Darwin)
     RUSTFLAGS_EXTRA :=
     TARGET := aarch64-apple-darwin
   else
-    # Intel Mac: CPU-only with fbgemm
-    FEATURES := fbgemm-bf16
+    # Intel Mac: Metal GPU (Intel UHD 630, no simdgroup_matrix)
+    FEATURES := triton-metal
     WIN_FEATURES := triton-d3d12
-    RUSTFLAGS_EXTRA := -C target-feature=+avx2,+fma
+    RUSTFLAGS_EXTRA :=
     TARGET := x86_64-apple-darwin
   endif
 else ifeq ($(UNAME_S),Linux)
