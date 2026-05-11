@@ -215,7 +215,8 @@ impl MoonshineModel {
             let dec = metal_dev.as_ref().and_then(|md| {
                 use super::gpu_decoder_metal::MetalBackend;
                 let backend = match MetalBackend::new(md,
-                    cfg.decoder_num_heads, cfg.decoder_intermediate_size) {
+                    cfg.decoder_num_heads, cfg.decoder_intermediate_size,
+                    cfg.vocab_size, cfg.decoder_dim) {
                     Ok(b) => b,
                     Err(e) => {
                         println!("  Metal backend unavailable: {e}");

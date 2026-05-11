@@ -17,6 +17,7 @@ pub struct MetalEncoderBackend {
     device: MetalDevice,
     kernels: TritonKernels,
     convert_f32_to_f16: ComputePipeline,
+    staging: std::cell::RefCell<Option<GpuBuffer>>,
 }
 
 impl MetalEncoderBackend {
@@ -27,7 +28,21 @@ impl MetalEncoderBackend {
             device: device.clone(),
             kernels,
             convert_f32_to_f16,
+            staging: std::cell::RefCell::new(None),
         })
+    }
+
+    fn staging_f16(&self, count: usize) -> Result<GpuBuffer> {
+        let needed = count * 2;
+        let mut slot = self.staging.borrow_mut();
+        if let Some(ref buf) = *slot {
+            if buf.buf().length() as usize >= needed {
+                return Ok(buf.clone());
+            }
+        }
+        let buf = GpuBuffer::alloc_shared_f16(&self.device, count)?;
+        *slot = Some(buf.clone());
+        Ok(buf)
     }
 
     pub fn device(&self) -> &MetalDevice { &self.device }
@@ -73,11 +88,11 @@ impl EncoderBackend for MetalEncoderBackend {
     type Weight = GpuBuffer;
 
     fn alloc_activation(&self, count: usize) -> Result<GpuBuffer> {
-        Ok(GpuBuffer::alloc_shared_f16(&self.device, count)?)
+        Ok(GpuBuffer::alloc_f16(&self.device, count)?)
     }
 
     fn alloc_residual(&self, count: usize) -> Result<GpuBuffer> {
-        Ok(GpuBuffer::alloc_shared_f16(&self.device, count)?)
+        Ok(GpuBuffer::alloc_f16(&self.device, count)?)
     }
 
     fn upload_matmul_weight(&self, data_f32: &[f32], _rows: usize, _cols: usize) -> Result<GpuBuffer> {
@@ -91,10 +106,15 @@ impl EncoderBackend for MetalEncoderBackend {
     }
 
     fn upload_input_f16(&self, dst: &GpuBuffer, data: &[half::f16]) -> Result<()> {
+        let staging = self.staging_f16(data.len())?;
         unsafe {
-            let ptr = dst.contents_ptr() as *mut half::f16;
+            let ptr = staging.contents_ptr() as *mut half::f16;
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
         }
+        let blit = self.device.blit_command_encoder()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        blit.copy_from_buffer(staging.buf(), 0, dst.buf(), 0, data.len() * 2);
+        blit.end_encoding();
         Ok(())
     }
 
@@ -103,7 +123,13 @@ impl EncoderBackend for MetalEncoderBackend {
     }
 
     fn download_f16(&self, buf: &GpuBuffer, count: usize) -> Result<Vec<half::f16>> {
-        let ptr = buf.contents_ptr() as *const half::f16;
+        let staging = self.staging_f16(count)?;
+        let blit = self.device.blit_command_encoder()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        blit.copy_from_buffer(buf.buf(), 0, staging.buf(), 0, count * 2);
+        blit.end_encoding();
+        self.device.wait_until_completed()?;
+        let ptr = staging.contents_ptr() as *const half::f16;
         let data = unsafe { std::slice::from_raw_parts(ptr, count) };
         Ok(data.to_vec())
     }
@@ -227,12 +253,12 @@ impl EncoderBackend for MetalEncoderBackend {
         // our new command encoder starts reading the buffer.
         self.flush()?;
 
-        // Zero padding region (FA reads all padded_seq rows, padding must be zero).
+        // Zero padding region via blit fill (buffer is private storage).
         if padded_n > n {
-            unsafe {
-                let ptr = dst.contents_ptr() as *mut u8;
-                std::ptr::write_bytes(ptr.add(n * 2), 0, (padded_n - n) * 2);
-            }
+            let blit = self.device.blit_command_encoder()
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            blit.fill_buffer(dst.buf(), (n * 2, (padded_n - n) * 2), 0);
+            blit.end_encoding();
         }
 
         // Dispatch f32→f16 convert kernel.
