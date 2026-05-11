@@ -208,8 +208,7 @@ impl KokoroModel {
         let expanded_enc = prosody::duration_expand(&dur_enc_out, &durations)?;
         let expanded_text = prosody::duration_expand(&text_enc, &durations)?;
 
-        let f0 = self.prosody.predict_f0(&expanded_enc, &prosody_style)?;
-        let n = self.prosody.predict_n(&expanded_enc, &prosody_style)?;
+        let (f0, n) = self.prosody.predict_f0_n(&expanded_enc, &prosody_style)?;
         eprintln!("    Prosody: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
 
         let t0 = std::time::Instant::now();

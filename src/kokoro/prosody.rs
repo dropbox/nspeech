@@ -165,8 +165,14 @@ impl ProsodyPredictor {
         Ok((durations, dur_enc_out))
     }
 
+    pub fn predict_f0_n(&self, expanded_enc: &Tensor, style: &Tensor) -> Result<(Tensor, Tensor)> {
+        let shared_out = self.run_shared_lstm(expanded_enc, style)?;
+        let f0 = self.predict_prosody_feature(&shared_out, style, &self.f0_blocks, &self.f0_proj, &self.f0_proj_bias)?;
+        let n = self.predict_prosody_feature(&shared_out, style, &self.n_blocks, &self.n_proj, &self.n_proj_bias)?;
+        Ok((f0, n))
+    }
+
     pub fn predict_f0(&self, expanded_enc: &Tensor, style: &Tensor) -> Result<Tensor> {
-        // Python F0Ntrain: shared LSTM first, then AdaIN blocks
         let shared_out = self.run_shared_lstm(expanded_enc, style)?;
         self.predict_prosody_feature(&shared_out, style, &self.f0_blocks, &self.f0_proj, &self.f0_proj_bias)
     }
@@ -241,6 +247,12 @@ impl BiLSTM {
         let dtype = x.dtype();
         let hs = self.hidden_size;
 
+        // Pre-compute all input projections in one batched GEMM: [B*T, input] @ [input, 4*hs]
+        let x_2d = x.reshape((batch * seq_len, ()))?;
+        let ih_gates = x_2d.matmul(&w_ih.t()?)?.broadcast_add(b_ih)?;
+        let ih_gates = ih_gates.reshape((batch, seq_len, 4 * hs))?;
+
+        let w_hh_t = w_hh.t()?;
         let mut h = Tensor::zeros((batch, hs), dtype, device)?;
         let mut c = Tensor::zeros((batch, hs), dtype, device)?;
         let mut outputs = Vec::with_capacity(seq_len);
@@ -252,9 +264,9 @@ impl BiLSTM {
         };
 
         for &t in &indices {
-            let xt = x.narrow(1, t, 1)?.squeeze(1)?.contiguous()?;
-            let gates = (xt.matmul(&w_ih.t()?)?.broadcast_add(b_ih)?
-                + h.matmul(&w_hh.t()?)?.broadcast_add(b_hh)?)?;
+            let ih = ih_gates.narrow(1, t, 1)?.squeeze(1)?;
+            let hh = h.matmul(&w_hh_t)?.broadcast_add(b_hh)?;
+            let gates = (&ih + &hh)?;
 
             let i = nn::ops::sigmoid(&gates.narrow(1, 0, hs)?)?;
             let f = nn::ops::sigmoid(&gates.narrow(1, hs, hs)?)?;
