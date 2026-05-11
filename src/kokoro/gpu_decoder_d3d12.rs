@@ -562,40 +562,55 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
                                     c_in: usize, c_out: usize, t_in: usize, t_out: usize,
                                     k: usize, stride: usize, padding: usize) -> Result<()> {
         let grid_x = c_out as u32;
-        let grid_y = cdiv(t_out, 256) as u32;
-        let rc: Vec<u32> = vec![
-            c_in as u32, c_out as u32, t_in as u32, t_out as u32,
-            k as u32, stride as u32, padding as u32,
-            grid_x, grid_y, 1,
-        ];
+        let total_y = cdiv(t_out, 256);
+        let max_y = if c_in * k > 5000 { 4 } else if c_in * k > 2000 { 8 } else { total_y };
         let uavs = [
             BufferBinding::structured_f32(x, (c_in * t_in) as u32),
             uav_f16(w, (c_in * c_out * k) as u32),
             uav_f16(bias, c_out as u32),
             BufferBinding::structured_f32(out, (c_out * t_out) as u32),
         ];
-        self.gpu.record_dispatch(&self.kernels.conv_transpose1d_f32io_lrelu, &rc, &uavs, [grid_x, grid_y, 1])
-            .map_err(|e| anyhow::anyhow!("conv_transpose1d_f32io_lrelu: {e}"))
+        let mut y_off = 0;
+        while y_off < total_y {
+            let chunk_y = max_y.min(total_y - y_off);
+            let rc: Vec<u32> = vec![
+                c_in as u32, c_out as u32, t_in as u32, t_out as u32,
+                k as u32, stride as u32, padding as u32, y_off as u32,
+                grid_x, chunk_y as u32, 1,
+            ];
+            self.gpu.record_dispatch(&self.kernels.conv_transpose1d_f32io_lrelu, &rc, &uavs, [grid_x, chunk_y as u32, 1])
+                .map_err(|e| anyhow::anyhow!("conv_transpose1d_f32io_lrelu: {e}"))?;
+            y_off += chunk_y;
+        }
+        Ok(())
     }
 
     fn conv_transpose1d_f32io(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer,
                               c_in: usize, c_out: usize, t_in: usize, t_out: usize,
                               k: usize, stride: usize, padding: usize) -> Result<()> {
         let grid_x = c_out as u32;
-        let grid_y = cdiv(t_out, 256) as u32;
-        let rc: Vec<u32> = vec![
-            c_in as u32, c_out as u32, t_in as u32, t_out as u32,
-            k as u32, stride as u32, padding as u32,
-            grid_x, grid_y, 1,
-        ];
+        let total_y = cdiv(t_out, 256);
+        // Chunk Y to avoid TDR: limit work per dispatch based on c_in*k cost per thread.
+        let max_y = if c_in * k > 5000 { 4 } else if c_in * k > 2000 { 8 } else { total_y };
         let uavs = [
             BufferBinding::structured_f32(x, (c_in * t_in) as u32),
             uav_f16(w, (c_in * c_out * k) as u32),
             uav_f16(bias, c_out as u32),
             BufferBinding::structured_f32(out, (c_out * t_out) as u32),
         ];
-        self.gpu.record_dispatch(&self.kernels.conv_transpose1d_f32io, &rc, &uavs, [grid_x, grid_y, 1])
-            .map_err(|e| anyhow::anyhow!("conv_transpose1d_f32io: {e}"))
+        let mut y_off = 0;
+        while y_off < total_y {
+            let chunk_y = max_y.min(total_y - y_off);
+            let rc: Vec<u32> = vec![
+                c_in as u32, c_out as u32, t_in as u32, t_out as u32,
+                k as u32, stride as u32, padding as u32, y_off as u32,
+                grid_x, chunk_y as u32, 1,
+            ];
+            self.gpu.record_dispatch(&self.kernels.conv_transpose1d_f32io, &rc, &uavs, [grid_x, chunk_y as u32, 1])
+                .map_err(|e| anyhow::anyhow!("conv_transpose1d_f32io: {e}"))?;
+            y_off += chunk_y;
+        }
+        Ok(())
     }
 
     fn reflection_pad1d_f32(&self, x: &GpuBuffer, out: &GpuBuffer, channels: usize, seq_len: usize) -> Result<()> {
@@ -610,3 +625,4 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
             .map_err(|e| anyhow::anyhow!("reflection_pad1d_f32: {e}"))
     }
 }
+

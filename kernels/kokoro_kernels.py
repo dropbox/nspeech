@@ -989,7 +989,7 @@ def leaky_relu_f32(
 def conv_transpose1d_f32io(
     x_ptr, w_ptr, bias_ptr, out_ptr,
     C_in, C_out, T_in, T_out, K,
-    stride, padding,
+    stride, padding, T_offset,
     BLOCK_T: tl.constexpr,
     ACTIVATION: tl.constexpr = None,
 ):
@@ -1001,9 +1001,10 @@ def conv_transpose1d_f32io(
     out: [C_out, T_out] (f32)
 
     Grid: [C_out, cdiv(T_out, BLOCK_T), 1]
+    T_offset: added to t_block for chunked dispatch (0 for non-chunked).
     """
     c_out_idx = tl.program_id(0)
-    t_block = tl.program_id(1)
+    t_block = tl.program_id(1) + T_offset
 
     t_offs = t_block * BLOCK_T + tl.arange(0, BLOCK_T)
     t_mask = t_offs < T_out

@@ -842,9 +842,6 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         let n_elements = channels * seq_len;
         let stats_buf = self.alloc_f32(channels * 2)?;
 
-        // Both dispatches share one encoder → sequential execution guaranteed
-        let encoder = self.device.command_encoder()?;
-
         // 1) Compute stats from f32 input
         let stats_pipeline = if seq_len <= 2048 {
             &self.kernels.instance_norm_stats_f32in_2k
@@ -857,18 +854,36 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         } else {
             &self.kernels.instance_norm_stats_f32in_128k
         };
-        encoder.set_compute_pipeline_state(stats_pipeline);
-        encoder.set_buffer(0, Some(x.buf()), x.offset);
-        encoder.set_buffer(1, Some(stats_buf.buf()), stats_buf.offset);
-        encoder.set_bytes(2, &(channels as i32));
-        encoder.set_bytes(3, &(seq_len as i32));
         let max_tg = stats_pipeline.max_total_threads_per_threadgroup() as usize;
-        let tg_width = 1024.min(max_tg);
-        let grid = MTLSize { width: channels, height: 1, depth: 1 };
-        let tg = MTLSize { width: tg_width, height: 1, depth: 1 };
-        encoder.dispatch_thread_groups(grid, tg);
+        if max_tg >= 1024 {
+            let encoder = self.device.command_encoder()?;
+            encoder.set_compute_pipeline_state(stats_pipeline);
+            encoder.set_buffer(0, Some(x.buf()), x.offset);
+            encoder.set_buffer(1, Some(stats_buf.buf()), stats_buf.offset);
+            encoder.set_bytes(2, &(channels as i32));
+            encoder.set_bytes(3, &(seq_len as i32));
+            let grid = MTLSize { width: channels, height: 1, depth: 1 };
+            let tg = MTLSize { width: 1024, height: 1, depth: 1 };
+            encoder.dispatch_thread_groups(grid, tg);
+        } else {
+            // Twopass stats kernels require 1024 threads; compute on CPU when unavailable
+            let x_data = self.download_f32(x, n_elements)?;
+            let stats_ptr = stats_buf.contents_ptr() as *mut f32;
+            let stats_slice = unsafe { std::slice::from_raw_parts_mut(stats_ptr, channels * 2) };
+            for ch in 0..channels {
+                let base = ch * seq_len;
+                let slice = &x_data[base..base + seq_len];
+                let sum: f64 = slice.iter().map(|v| *v as f64).sum();
+                let mean = (sum / seq_len as f64) as f32;
+                let var: f64 = slice.iter().map(|v| { let d = *v as f64 - mean as f64; d * d }).sum::<f64>() / seq_len as f64;
+                let rstd = 1.0 / (var as f32 + 1e-5f32).sqrt();
+                stats_slice[ch * 2] = mean;
+                stats_slice[ch * 2 + 1] = rstd;
+            }
+        }
 
         // 2) Normalize + style + snake (reads stats_buf written above)
+        let encoder = self.device.command_encoder()?;
         encoder.set_compute_pipeline_state(&self.kernels.norm_style_snake_f32io);
         encoder.set_buffer(0, Some(x.buf()), x.offset);
         encoder.set_buffer(1, Some(stats_buf.buf()), stats_buf.offset);
@@ -951,6 +966,7 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         encoder.set_bytes(8, &(k as i32));
         encoder.set_bytes(9, &(stride as i32));
         encoder.set_bytes(10, &(padding as i32));
+        encoder.set_bytes(11, &0i32);
         let grid = MTLSize { width: c_out, height: cdiv(t_out, 256), depth: 1 };
         let tg = MTLSize { width: 256, height: 1, depth: 1 };
         encoder.dispatch_thread_groups(grid, tg);
@@ -973,6 +989,7 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         encoder.set_bytes(8, &(k as i32));
         encoder.set_bytes(9, &(stride as i32));
         encoder.set_bytes(10, &(padding as i32));
+        encoder.set_bytes(11, &0i32);
         let grid = MTLSize { width: c_out, height: cdiv(t_out, 256), depth: 1 };
         let tg = MTLSize { width: 256, height: 1, depth: 1 };
         encoder.dispatch_thread_groups(grid, tg);

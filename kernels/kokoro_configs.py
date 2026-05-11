@@ -198,12 +198,12 @@ KOKORO_KERNELS = [
 
     # ── ConvTranspose1d with f32 I/O (fused LeakyReLU(0.1) on input) ──
     ("kokoro_conv_transpose1d_f32io_lrelu", "conv_transpose1d_f32io",
-     "*fp32, *fp16, *fp16, *fp32, i32, i32, i32, i32, i32, i32, i32, 256, leaky_relu_01_act",
+     "*fp32, *fp16, *fp16, *fp32, i32, i32, i32, i32, i32, i32, i32, i32, 256, leaky_relu_01_act",
      4, ["C_out", "cdiv(T_out, 256)", "1"]),
 
     # ── ConvTranspose1d with f32 I/O (no activation) ──
     ("kokoro_conv_transpose1d_f32io", "conv_transpose1d_f32io",
-     "*fp32, *fp16, *fp16, *fp32, i32, i32, i32, i32, i32, i32, i32, 256, None",
+     "*fp32, *fp16, *fp16, *fp32, i32, i32, i32, i32, i32, i32, i32, i32, 256, None",
      4, ["C_out", "cdiv(T_out, 256)", "1"]),
 
     # ── Reflection pad1d (pad_left=1, pad_right=0) for f32 buffers ──
