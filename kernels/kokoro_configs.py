@@ -216,6 +216,11 @@ KOKORO_KERNELS = [
      "*fp32, *fp32, i32, i32, 1024",
      4, ["cdiv(n_channels * (seq_len + 1), 1024)", "1", "1"]),
 
+    # ── Fused iSTFT: exp(mag) + sin(phase) + iDFT + overlap-add + COLA ──
+    ("kokoro_istft", "istft_fused",
+     "*fp32, *fp32, i32, i32, 256, 20, 5",
+     4, ["cdiv(out_len, 256)", "1", "1"]),
+
 ]
 
 

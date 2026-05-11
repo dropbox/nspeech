@@ -1057,6 +1057,21 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         encoder.dispatch_thread_groups(grid, tg);
         Ok(())
     }
+
+    fn istft_gpu(&self, x: &GpuBuffer, out: &GpuBuffer, n_frames: usize, out_len: usize) -> Result<()> {
+        let encoder = self.device.command_encoder()?;
+        encoder.set_compute_pipeline_state(&self.kernels.istft_fused);
+        encoder.set_buffer(0, Some(x.buf()), x.offset);
+        encoder.set_buffer(1, Some(out.buf()), out.offset);
+        encoder.set_bytes(2, &(n_frames as i32));
+        encoder.set_bytes(3, &(out_len as i32));
+        let max_tg = self.kernels.istft_fused.max_total_threads_per_threadgroup() as usize;
+        let tg_width = 256.min(max_tg);
+        let grid = MTLSize { width: cdiv(out_len, tg_width), height: 1, depth: 1 };
+        let tg = MTLSize { width: tg_width, height: 1, depth: 1 };
+        encoder.dispatch_thread_groups(grid, tg);
+        Ok(())
+    }
 }
 
 impl KokoroGpuDecoder {

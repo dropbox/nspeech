@@ -483,6 +483,9 @@ KERNEL_METADATA = {
     "kokoro_reflection_pad1d_f32": {
         "alias": "reflection_pad1d_f32", "group": "kokoro", "d3d12": True,
     },
+    "kokoro_istft": {
+        "alias": "istft_fused", "group": "kokoro", "d3d12": True,
+    },
 }
 
 

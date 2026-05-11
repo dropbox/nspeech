@@ -652,5 +652,16 @@ impl KokoroGpuBackend for KokoroGpuDecoderD3D12 {
         self.gpu.record_dispatch(&self.kernels.reflection_pad1d_f32, &rc, &uavs, [grid_x, 1, 1])
             .map_err(|e| anyhow::anyhow!("reflection_pad1d_f32: {e}"))
     }
+
+    fn istft_gpu(&self, x: &GpuBuffer, out: &GpuBuffer, n_frames: usize, out_len: usize) -> Result<()> {
+        let grid_x = cdiv(out_len, 256) as u32;
+        let rc: Vec<u32> = vec![n_frames as u32, out_len as u32, grid_x, 1, 1];
+        let uavs = [
+            BufferBinding::structured_f32(x, (22 * n_frames) as u32),
+            BufferBinding::structured_f32(out, out_len as u32),
+        ];
+        self.gpu.record_dispatch(&self.kernels.istft_fused, &rc, &uavs, [grid_x, 1, 1])
+            .map_err(|e| anyhow::anyhow!("istft_gpu: {e}"))
+    }
 }
 

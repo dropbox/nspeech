@@ -1092,3 +1092,92 @@ def reflection_pad1d_f32(
     val = tl.load(x_ptr + x_idx, mask=mask, other=0.0)
 
     tl.store(out_ptr + offsets, val, mask=mask)
+
+
+@triton.jit
+def istft_fused(
+    x_ptr, out_ptr,
+    n_frames, out_len,
+    BLOCK_SIZE: tl.constexpr,
+    N_FFT: tl.constexpr,
+    HOP: tl.constexpr,
+):
+    """Fused iSTFT: exp(mag) + sin(phase) + iDFT + overlap-add + COLA norm.
+
+    x: [22, n_frames] f32 — first 11 rows = log-magnitude, next 11 = phase (pre-sin)
+    out: [out_len] f32 — trimmed audio (center padding removed)
+
+    Fixed: N_FFT=20, HOP=5, freq_bins=11, trim=10 (n_fft/2 from each side).
+    Each output sample accumulates from up to N_FFT/HOP = 4 overlapping frames.
+    """
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < out_len
+
+    FREQ_BINS: tl.constexpr = N_FFT // 2 + 1
+    TRIM: tl.constexpr = N_FFT // 2
+    TWO_PI: tl.constexpr = 6.283185307179586
+
+    # Position in untrimmed buffer
+    pos = offsets + TRIM
+
+    # Accumulate signal and window-squared sum
+    acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    wsum = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+
+    # Each output sample is touched by up to N_FFT/HOP frames
+    # Frame f contributes at position n = pos - f*HOP within its window [0, N_FFT)
+    # First contributing frame: max(0, (pos - N_FFT + 1 + HOP - 1) // HOP) = max(0, ceil((pos-N_FFT+1)/HOP))
+    # Last contributing frame: min(n_frames-1, pos // HOP)
+    for f_offset in tl.static_range(0, N_FFT // HOP):
+        # frame index = pos//HOP - f_offset (iterate from last to first)
+        frame = pos // HOP - f_offset
+        frame_valid = mask & (frame >= 0) & (frame < n_frames)
+
+        # Position within this frame's window
+        n = pos - frame * HOP  # 0 <= n < N_FFT when valid
+
+        # Periodic Hann window: w[n] = 0.5 - 0.5*cos(2π*n/N_FFT)
+        angle_w = TWO_PI * n.to(tl.float32) / N_FFT
+        window_val = 0.5 - 0.5 * tl.cos(angle_w)
+
+        # iDFT for this frame at position n:
+        # x[n] = (1/N) * sum_k scale_k * (real_k * cos(2πkn/N) - imag_k * sin(2πkn/N))
+        # where real_k = exp(mag_k) * cos(sin(phase_k)), imag_k = exp(mag_k) * sin(sin(phase_k))
+        # Wait — phase column stores raw value, we apply sin() to get actual phase angle.
+        frame_val = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+        for k in tl.static_range(0, FREQ_BINS):
+            # Load mag and phase for this freq bin and frame
+            mag_idx = k * n_frames + frame
+            phase_idx = (FREQ_BINS + k) * n_frames + frame
+            log_mag = tl.load(x_ptr + mag_idx, mask=frame_valid, other=0.0)
+            raw_phase = tl.load(x_ptr + phase_idx, mask=frame_valid, other=0.0)
+
+            mag = tl.exp(log_mag)
+            phase_angle = tl.sin(raw_phase)
+
+            real = mag * tl.cos(phase_angle)
+            imag = mag * tl.sin(phase_angle)
+
+            # iDFT basis
+            dft_angle = TWO_PI * k * n.to(tl.float32) / N_FFT
+            cos_val = tl.cos(dft_angle)
+            sin_val = tl.sin(dft_angle)
+
+            # One-sided spectrum: scale non-DC/Nyquist by 2
+            scale = tl.where((k == 0) | (k == FREQ_BINS - 1), 1.0, 2.0)
+            frame_val += scale * (real * cos_val - imag * sin_val)
+
+        frame_val = frame_val / N_FFT
+
+        # Windowed overlap-add
+        contrib = tl.where(frame_valid, frame_val * window_val, 0.0)
+        acc += contrib
+
+        # COLA window sum
+        w2 = tl.where(frame_valid, window_val * window_val, 0.0)
+        wsum += w2
+
+    # COLA normalization
+    result = tl.where(wsum > 1e-8, acc / wsum, 0.0)
+    tl.store(out_ptr + offsets, result, mask=mask)

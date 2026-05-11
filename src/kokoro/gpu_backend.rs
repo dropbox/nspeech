@@ -217,4 +217,10 @@ pub trait KokoroGpuBackend {
     fn reflection_pad1d_f32(&self, _x: &Self::Buf, _out: &Self::Buf, _channels: usize, _seq_len: usize) -> Result<()> {
         Err(anyhow::anyhow!("reflection_pad1d_f32 not supported"))
     }
+
+    /// Fused iSTFT on GPU: conv_post output [22, n_frames] f32 → audio [out_len] f32.
+    /// Fuses exp(mag) + sin(phase) + iDFT + overlap-add + COLA normalization.
+    fn istft_gpu(&self, _x: &Self::Buf, _out: &Self::Buf, _n_frames: usize, _out_len: usize) -> Result<()> {
+        Err(anyhow::anyhow!("istft_gpu not supported"))
+    }
 }

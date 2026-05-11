@@ -535,7 +535,7 @@ impl Generator {
                         let rms = (rms_sum / avg_cmp.len() as f64).sqrt();
                         eprintln!("  [stage{stage} resblocks f32] n={} max_err={max_err:.4} rms={rms:.6}", avg_cmp.len());
                     }
-                    // conv_post: leaky_relu(0.01) on f32 → conv1d_f32
+                    // conv_post: leaky_relu(0.01) on f32 → conv1d_f32 → iSTFT on GPU
                     let lrelu_buf = gpu.alloc_f32(n)?;
                     gpu.leaky_relu_f32(&avg, &lrelu_buf, n, 0.01)?;
                     let (c_out, _, k) = self.conv_post_weight.dims3()?;
@@ -545,7 +545,16 @@ impl Generator {
                     let b_buf = upload_weight(gpu, &self.conv_post_bias)?;
                     let out_f32 = gpu.alloc_f32(c_out * t_out)?;
                     gpu.conv1d_f32(&lrelu_buf, &w_buf, &b_buf, &out_f32, h_c, c_out, h_t, t_out, k, 1, cp_padding, 1)?;
-                    let out_data = gpu.download_f32(&out_f32, c_out * t_out)?;
+
+                    // iSTFT on GPU
+                    let n_fft = self.istft_n_fft;
+                    let hop = self.istft_hop;
+                    let n_frames = t_out;
+                    let audio_len = (n_frames - 1) * hop;
+                    let audio_buf = gpu.alloc_f32(audio_len)?;
+                    gpu.istft_gpu(&out_f32, &audio_buf, n_frames, audio_len)?;
+                    let audio_data = gpu.download_f32(&audio_buf, audio_len)?;
+
                     if compare {
                         let ch = cpu_h.as_ref().unwrap();
                         let cpu_r0 = self.resblocks[base].forward(ch, style)?;
@@ -556,23 +565,19 @@ impl Generator {
                         let cpu_lrelu = leaky_relu(&cpu_avg, 0.01)?;
                         let cpu_conv = cpu_lrelu.conv1d(&self.conv_post_weight, cp_padding, 1, 1, 1)?;
                         let cpu_conv = cpu_conv.broadcast_add(&self.conv_post_bias.unsqueeze(0)?.unsqueeze(2)?)?;
-                        let cpu_data: Vec<f32> = cpu_conv.flatten_all()?.to_vec1()?;
+                        let n_bins = n_fft / 2 + 1;
+                        let mag = cpu_conv.narrow(1, 0, n_bins)?.exp()?;
+                        let phase = cpu_conv.narrow(1, n_bins, n_bins)?.sin()?;
+                        let cpu_audio = istft(&mag, &phase, n_fft, hop)?;
+                        let cpu_data: Vec<f32> = cpu_audio.flatten_all()?.to_vec1()?;
                         let mut max_err: f32 = 0.0;
-                        let mut rms_sum: f64 = 0.0;
-                        for i in 0..out_data.len().min(cpu_data.len()) {
-                            let d = (out_data[i] - cpu_data[i]).abs();
-                            rms_sum += (d as f64) * (d as f64);
+                        for i in 0..audio_data.len().min(cpu_data.len()) {
+                            let d = (audio_data[i] - cpu_data[i]).abs();
                             if d > max_err { max_err = d; }
                         }
-                        let rms = (rms_sum / out_data.len() as f64).sqrt();
-                        eprintln!("  [conv_post f32] n={} max_err={max_err:.4} rms={rms:.6}", out_data.len());
+                        eprintln!("  [istft gpu] n={} max_err={max_err:.6}", audio_data.len());
                     }
-                    let h = Tensor::from_vec(out_data, &[1, c_out, t_out][..], &device)?;
-                    let n_fft = self.istft_n_fft;
-                    let n_bins = n_fft / 2 + 1;
-                    let mag = h.narrow(1, 0, n_bins)?.exp()?;
-                    let phase = h.narrow(1, n_bins, n_bins)?.sin()?;
-                    return istft(&mag, &phase, n_fft, self.istft_hop);
+                    return Ok(Tensor::from_vec(audio_data, (1, audio_len), &device)?);
                 }
                 // Non-last stage: save f32 avg as carry for next stage's upsample
                 h_f32_carry = Some(avg);
@@ -605,10 +610,10 @@ impl Generator {
             }
         }
 
-        // Leaky_relu(0.01) + conv_post
+        // Leaky_relu(0.01) + conv_post + iSTFT (all on GPU)
         // When f32 intermediates available, output conv_post as f32 to avoid
         // exp() amplifying f16 quantization error in iSTFT magnitude
-        let h = if gpu.has_f32_intermediates() {
+        if gpu.has_f32_intermediates() {
             let n = h_c * h_t;
             let lrelu_buf = gpu.alloc(n)?;
             gpu.leaky_relu(&h_buf, &lrelu_buf, n, 0.01)?;
@@ -621,40 +626,52 @@ impl Generator {
             let b_buf = upload_weight(gpu, &self.conv_post_bias)?;
             let out_f32 = gpu.alloc_f32(c_out * t_out)?;
             gpu.conv1d_f32(&h_f32, &w_buf, &b_buf, &out_f32, h_c, c_out, h_t, t_out, k, 1, padding, 1)?;
-            let out_data = gpu.download_f32(&out_f32, c_out * t_out)?;
+
+            // iSTFT on GPU: conv_post output [22, t_out] → audio [(t_out-1)*hop]
+            let n_fft = self.istft_n_fft;
+            let hop = self.istft_hop;
+            let n_frames = t_out;
+            let audio_len = (n_frames - 1) * hop; // trimmed output length
+            let audio_buf = gpu.alloc_f32(audio_len)?;
+            gpu.istft_gpu(&out_f32, &audio_buf, n_frames, audio_len)?;
+            let audio_data = gpu.download_f32(&audio_buf, audio_len)?;
+
             if compare {
                 let ch = cpu_h.as_ref().unwrap();
                 let cpu_lrelu = leaky_relu(ch, 0.01)?;
                 let cpu_conv = cpu_lrelu.conv1d(&self.conv_post_weight, 3, 1, 1, 1)?;
                 let cpu_conv = cpu_conv.broadcast_add(&self.conv_post_bias.unsqueeze(0)?.unsqueeze(2)?)?;
-                let cpu_data: Vec<f32> = cpu_conv.flatten_all()?.to_vec1()?;
+                let n_bins = n_fft / 2 + 1;
+                let mag = cpu_conv.narrow(1, 0, n_bins)?.exp()?;
+                let phase = cpu_conv.narrow(1, n_bins, n_bins)?.sin()?;
+                let cpu_audio = istft(&mag, &phase, n_fft, hop)?;
+                let cpu_data: Vec<f32> = cpu_audio.flatten_all()?.to_vec1()?;
                 let mut max_err: f32 = 0.0;
-                let mut max_idx = 0;
-                for i in 0..out_data.len().min(cpu_data.len()) {
-                    let d = (out_data[i] - cpu_data[i]).abs();
-                    if d > max_err { max_err = d; max_idx = i; }
+                for i in 0..audio_data.len().min(cpu_data.len()) {
+                    let d = (audio_data[i] - cpu_data[i]).abs();
+                    if d > max_err { max_err = d; }
                 }
-                eprintln!("  [conv_post f32] n={} max_err={max_err:.4} (gpu={:.4} cpu={:.4} at {max_idx})",
-                    out_data.len(), out_data[max_idx], cpu_data[max_idx]);
-            }
-            Tensor::from_vec(out_data, &[1, c_out, t_out][..], &device)?
-        } else {
-            let (h_buf, h_c, h_t) = buf_conv1d_lrelu001(gpu, &h_buf, &self.conv_post_weight, &self.conv_post_bias, h_c, h_t, 3, 1, 1)?;
-
-            if compare {
-                let ch = cpu_h.as_ref().unwrap();
-                let cpu_lrelu = leaky_relu(ch, 0.01)?;
-                let cpu_conv = cpu_lrelu.conv1d(&self.conv_post_weight, 3, 1, 1, 1)?;
-                let cpu_conv = cpu_conv.broadcast_add(&self.conv_post_bias.unsqueeze(0)?.unsqueeze(2)?)?;
-                compare_gpu_cpu(gpu, &h_buf, &cpu_conv, "conv_post");
+                eprintln!("  [istft gpu] n={} max_err={max_err:.6}", audio_data.len());
             }
 
-            // Download and do iSTFT on CPU
-            #[cfg(feature = "triton-metal")]
-            let _ = self.conv_post_weight.device().as_metal_device().map(|md| md.wait_until_completed());
-            let out_data = gpu.download_f16(&h_buf, h_c * h_t)?;
-            Tensor::from_vec(out_data, &[1, h_c, h_t][..], &device)?.to_dtype(DType::F32)?
-        };
+            return Ok(Tensor::from_vec(audio_data, (1, audio_len), &device)?);
+        }
+
+        // Non-f32 fallback: download and iSTFT on CPU
+        let (h_buf, h_c, h_t) = buf_conv1d_lrelu001(gpu, &h_buf, &self.conv_post_weight, &self.conv_post_bias, h_c, h_t, 3, 1, 1)?;
+
+        if compare {
+            let ch = cpu_h.as_ref().unwrap();
+            let cpu_lrelu = leaky_relu(ch, 0.01)?;
+            let cpu_conv = cpu_lrelu.conv1d(&self.conv_post_weight, 3, 1, 1, 1)?;
+            let cpu_conv = cpu_conv.broadcast_add(&self.conv_post_bias.unsqueeze(0)?.unsqueeze(2)?)?;
+            compare_gpu_cpu(gpu, &h_buf, &cpu_conv, "conv_post");
+        }
+
+        #[cfg(feature = "triton-metal")]
+        let _ = self.conv_post_weight.device().as_metal_device().map(|md| md.wait_until_completed());
+        let out_data = gpu.download_f16(&h_buf, h_c * h_t)?;
+        let h = Tensor::from_vec(out_data, &[1, h_c, h_t][..], &device)?.to_dtype(DType::F32)?;
 
         let n_fft = self.istft_n_fft;
         let n_bins = n_fft / 2 + 1;
