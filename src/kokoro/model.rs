@@ -106,6 +106,56 @@ impl KokoroModel {
         })
     }
 
+    pub fn load_gguf_bytes(data: &[u8], config: KokoroConfig, device: &Device) -> Result<Self> {
+        let mut cursor = std::io::Cursor::new(data);
+        let gguf = gguf_file::Content::read(&mut cursor)?;
+
+        let mut tensors: HashMap<String, Tensor> = HashMap::new();
+        for (name, info) in &gguf.tensor_infos {
+            let qtensor = info.read(&mut cursor, gguf.tensor_data_offset, device)?;
+            let tensor = qtensor.dequantize(device)?;
+            let tensor = Self::maybe_reshape_conv(name, tensor, &config);
+            tensors.insert(name.clone(), tensor);
+        }
+
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
+
+        let albert = Albert::load(vb.pp("bert"), config.plbert.num_hidden_layers)
+            .context("loading ALBERT")?;
+        let bert_encoder = candle_nn::linear(
+            config.plbert.hidden_size, config.hidden_dim,
+            vb.pp("bert_encoder"),
+        ).context("loading bert_encoder")?;
+        let text_encoder = TextEncoder::load(
+            vb.pp("text_encoder"), config.n_token, config.hidden_dim,
+        ).context("loading text_encoder")?;
+        let prosody = ProsodyPredictor::load(
+            vb.pp("predictor"), &config,
+        ).context("loading predictor")?;
+        let decoder = ISTFTNetDecoder::load(
+            vb.pp("decoder"), &config,
+        ).context("loading decoder")?;
+
+        Ok(Self {
+            albert,
+            bert_encoder,
+            text_encoder,
+            prosody,
+            decoder,
+            config,
+            device: device.clone(),
+        })
+    }
+
+    pub fn load_voice_bytes(data: &[u8], seq_len: usize, device: &Device) -> Result<Tensor> {
+        let tensors = candle_core::safetensors::load_buffer(data, device)?;
+        let voice_tensor = tensors.into_values().next()
+            .ok_or_else(|| anyhow::anyhow!("Empty voice pack"))?;
+        let (n, _dim) = voice_tensor.dims2()?;
+        let idx = (seq_len - 1).min(n - 1);
+        voice_tensor.get(idx).map_err(Into::into)
+    }
+
     fn maybe_reshape_conv(name: &str, tensor: Tensor, config: &KokoroConfig) -> Tensor {
         if tensor.rank() != 2 {
             return tensor;

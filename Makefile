@@ -48,6 +48,10 @@ speek:
 	cargo build --release $(BUILD_TARGET) --features $(FEATURES) --example speek
 	ln -sf $(BIN_DIR)/speek ./speek
 
+speek-install: speek
+	mkdir -p ~/bin
+	ln -f $(realpath speek) ~/bin/speek
+
 bench:
 	cargo build --release $(BUILD_TARGET) --features $(FEATURES) --example bench_triton_encoder
 	$(BIN_DIR)/bench_triton_encoder
@@ -80,4 +84,4 @@ module:
 kernels:
 	(cd kernels && python build.py)
 
-.PHONY: build kokoro speek bench win deploy-win test-win bench-win module kernels
+.PHONY: build kokoro speek speek-install bench win deploy-win test-win bench-win module kernels
