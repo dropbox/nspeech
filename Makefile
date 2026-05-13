@@ -24,6 +24,12 @@ else ifeq ($(UNAME_S),Linux)
   WIN_FEATURES := triton-d3d12
   RUSTFLAGS_EXTRA :=
   TARGET :=
+else
+  # Windows (MSYS2/Git Bash): D3D12 GPU backend
+  FEATURES := triton-d3d12
+  WIN_FEATURES := triton-d3d12
+  RUSTFLAGS_EXTRA :=
+  TARGET :=
 endif
 
 ifdef TARGET
