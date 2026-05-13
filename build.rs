@@ -14,7 +14,7 @@ fn main() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let kernels_dir = manifest_dir.join("kernels");
     let triton_dir = manifest_dir.parent().unwrap().join("triton");
-    let triton_metal_dir = triton_dir.join("third_party/metal");
+    let triton_metal_dir = manifest_dir.join("triton_backend");
 
     // Determine which platform(s) to build
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
@@ -81,9 +81,6 @@ fn main() {
         println!("cargo:rerun-if-changed={}", manifest_dir.join("kernels/out/dxil").display());
     }
 
-    // Always run build.py — ninja handles incremental rebuilds efficiently,
-    // and this prevents stale kernel issues when sources change outside cargo's view.
-
     // Find python — venv uses Scripts/ on Windows, bin/ elsewhere.
     // Use host OS (not target), since build.py runs on the build machine.
     let venv_python = if cfg!(windows) {
@@ -91,12 +88,41 @@ fn main() {
     } else {
         triton_dir.join("env/bin/python")
     };
-    let python = if venv_python.exists() { venv_python } else { PathBuf::from("python3") };
+
+    // Check if pre-built kernel archives exist for all requested platforms
+    let out_dir = kernels_dir.join("out");
+    let has_prebuilt = platforms.iter().all(|p| {
+        let tar_name = match *p {
+            "metal" => "kernels_metal.tar.zst",
+            "metal_nosimd" => "kernels_metal_nosimd.tar.zst",
+            "hlsl" => "kernels_dxil.tar.zst",
+            _ => return false,
+        };
+        out_dir.join(tar_name).exists()
+    });
+    let has_generated = out_dir.join("generated").exists()
+        && std::fs::read_dir(out_dir.join("generated"))
+            .map(|d| d.count() > 0)
+            .unwrap_or(false);
+
+    // Skip build if triton venv is not available and we have pre-built outputs
+    if !venv_python.exists() {
+        if has_prebuilt && has_generated {
+            println!("cargo:warning=Triton venv not found, using pre-built kernel archives.");
+            return;
+        } else {
+            panic!(
+                "Triton venv not found at {} and no pre-built kernel archives exist. \
+                 Set up the triton venv or provide pre-built kernels/out/*.tar.zst files.",
+                venv_python.display()
+            );
+        }
+    }
 
     let platform_str = platforms.join(", ");
     println!("cargo:warning=Compiling Triton kernels for [{platform_str}]...");
 
-    let status = Command::new(&python)
+    let status = Command::new(&venv_python)
         .arg("build.py")
         .args(&platforms)
         .current_dir(&kernels_dir)
@@ -106,14 +132,25 @@ fn main() {
         Ok(s) if s.success() => {
             println!("cargo:warning=Triton kernels compiled successfully ({platform_str}).");
         }
-        Ok(s) => {
-            panic!(
-                "Kernel compilation failed (exit {:?}). Fix kernels/build.py output.",
+        Ok(s) if has_prebuilt && has_generated => {
+            println!(
+                "cargo:warning=Kernel build failed (exit {:?}), using pre-built archives.",
                 s.code()
             );
         }
+        Ok(s) => {
+            panic!(
+                "Kernel compilation failed (exit {:?}) and no pre-built archives available.",
+                s.code()
+            );
+        }
+        Err(e) if has_prebuilt && has_generated => {
+            println!("cargo:warning=Could not run kernel build ({e}), using pre-built archives.");
+        }
         Err(e) => {
-            println!("cargo:warning=Could not run kernel build ({e}). Using existing outputs.");
+            panic!(
+                "Could not run kernel build ({e}) and no pre-built archives available."
+            );
         }
     }
 }
