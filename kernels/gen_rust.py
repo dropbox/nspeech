@@ -298,8 +298,151 @@ def gen_d3d12(metadata, metal_kernels, hlsl_extra):
     lines.append("}")
     lines.append("")
 
-    # Note: D3D12 decoder kernels are hand-written in gpu_decoder_d3d12.rs
-    # with their own include_bytes! consts and D3D12Kernels struct.
+    # ── D3D12 Decoder: DXIL constants ──
+    lines.append("// ── Decoder kernels ──")
+    lines.append("")
+    for name in d3d12_decoder:
+        meta = metadata[name]
+        alias = meta["alias"]
+        const_name = f"DXIL_DEC_{alias.upper()}"
+        lines.append(f'const {const_name}: &[u8] = include_bytes!("../dxil/{name}.dxil");')
+    # Decoder also uses the f32-weight matmul for cross-attention KV projection
+    lines.append('const DXIL_DEC_MATMUL_F32W_64: &[u8] = include_bytes!("../dxil/matmul_f16a_f32w_64x64x32.dxil");')
+    lines.append("")
+
+    # ── D3D12DecoderKernels struct ──
+    lines.append("/// All compiled Triton D3D12 kernel pipelines for the Moonshine decoder.")
+    lines.append("pub struct D3D12DecoderKernels {")
+    lines.append("    pub(crate) gpu: Arc<Gpu>,")
+    for name in d3d12_decoder:
+        meta = metadata[name]
+        alias = meta["alias"]
+        lines.append(f"    pub(crate) {alias}: ID3D12PipelineState,")
+    lines.append("    pub(crate) matmul_f32w_64: ID3D12PipelineState,")
+    lines.append("}")
+    lines.append("")
+
+    # ── D3D12DecoderKernels::load() ──
+    lines.append("impl D3D12DecoderKernels {")
+    lines.append("    pub fn load(gpu: &Arc<Gpu>) -> Result<Self> {")
+    lines.append("        let load_pso = |name: &str, dxil: &[u8]| -> Result<ID3D12PipelineState> {")
+    lines.append("            gpu.create_compute_pso(dxil)")
+    lines.append('                .map_err(|e| anyhow::anyhow!("Failed to create PSO for {name}: {e}"))')
+    lines.append("        };")
+    lines.append("")
+    lines.append("        Ok(Self {")
+    lines.append("            gpu: gpu.clone(),")
+    for name in d3d12_decoder:
+        meta = metadata[name]
+        alias = meta["alias"]
+        const_name = f"DXIL_DEC_{alias.upper()}"
+        lines.append(f'            {alias}: load_pso("{name}", {const_name})?,')
+    lines.append('            matmul_f32w_64: load_pso("matmul_f16a_f32w_64x64x32", DXIL_DEC_MATMUL_F32W_64)?,')
+    lines.append("        })")
+    lines.append("    }")
+    lines.append("")
+
+    # ── Generated dispatch methods ──
+    # Each method encodes root constants + UAV bindings from TTIR JSON metadata.
+    lines.append("    #[allow(unused_parens)]")
+    for name in d3d12_decoder:
+        meta = metadata[name]
+        alias = meta["alias"]
+        ttir = read_json(name)
+        if not ttir:
+            continue
+
+        # Separate pointer params (→ UAVs) and scalar params (→ root constants)
+        ptrs = [p for p in ttir["params"] if p["is_pointer"]]
+        scalars = [p for p in ttir["params"] if not p["is_pointer"]]
+
+        # Convert param names to snake_case for Rust
+        def to_snake(name):
+            import re
+            # Insert _ before uppercase letters, then lowercase
+            s1 = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', name)
+            s2 = re.sub(r'([a-z\d])([A-Z])', r'\1_\2', s1)
+            return s2.lower()
+
+        # Build Rust function signature
+        fn_args = []
+        for p in ptrs:
+            sn = to_snake(p['name'])
+            fn_args.append(f"{sn}: &GpuBuffer, {sn}_count: u32")
+        for p in scalars:
+            sn = to_snake(p['name'])
+            if p["type"] == "fp32":
+                fn_args.append(f"{sn}: f32")
+            else:
+                fn_args.append(f"{sn}: i32")
+
+        lines.append(f"    pub fn dispatch_{alias}(&self, {', '.join(fn_args)}) -> Result<()> {{")
+
+        # Grid computation
+        grid_exprs = ttir["grid"]
+        for i, expr in enumerate(grid_exprs):
+            axis = ["x", "y", "z"][i]
+            rust_expr = expr
+            if "cdiv(" in rust_expr:
+                import re
+                rust_expr = re.sub(
+                    r'cdiv\((\w+),\s*(\d+)\)',
+                    lambda m: f"({to_snake(m.group(1))} as u32 + {int(m.group(2))-1}) / {m.group(2)}",
+                    rust_expr
+                )
+            else:
+                rust_expr = f"{to_snake(rust_expr)} as u32"
+            lines.append(f"        let grid_{axis} = {rust_expr};")
+
+        # Root constants: scalars first, then grid dims
+        lines.append("        let rc: Vec<u32> = vec![")
+        for p in scalars:
+            sn = to_snake(p['name'])
+            if p["type"] == "fp32":
+                lines.append(f"            {sn}.to_bits(),")
+            else:
+                lines.append(f"            {sn} as u32,")
+        lines.append("            grid_x, grid_y, grid_z,")
+        lines.append("        ];")
+
+        # UAV bindings
+        lines.append("        let uavs = [")
+        for p in ptrs:
+            sn = to_snake(p['name'])
+            if "fp32" in p["type"] or "f32" in p["type"]:
+                lines.append(f"            BufferBinding::structured_f32({sn}, {sn}_count),")
+            else:
+                lines.append(f"            BufferBinding::structured_f16({sn}, {sn}_count),")
+        lines.append("        ];")
+
+        lines.append(f'        self.gpu.record_dispatch(&self.{alias}, &rc, &uavs, [grid_x, grid_y, grid_z])')
+        lines.append(f'            .map_err(|e| anyhow::anyhow!("{alias}: {{e}}"))')
+        lines.append("    }")
+        lines.append("")
+
+    # Add matmul_f32w dispatch (not in decoder metadata, hand-add)
+    lines.append("    pub fn dispatch_matmul_f32w(&self, a: &GpuBuffer, a_count: u32,")
+    lines.append("                                b: &GpuBuffer, b_count: u32,")
+    lines.append("                                out: &GpuBuffer, out_count: u32,")
+    lines.append("                                m: i32, n: i32, k: i32) -> Result<()> {")
+    lines.append("        let grid_x = (m as u32 + 63) / 64;")
+    lines.append("        let grid_y = (n as u32 + 63) / 64;")
+    lines.append("        let rc: Vec<u32> = vec![")
+    lines.append("            m as u32, n as u32, k as u32,")
+    lines.append("            k as u32, 1, n as u32, 1,")
+    lines.append("            n as u32, 1, grid_x, grid_y, 1,")
+    lines.append("        ];")
+    lines.append("        let uavs = [")
+    lines.append("            BufferBinding::structured_f16(a, a_count),")
+    lines.append("            BufferBinding::structured_f32(b, b_count),")
+    lines.append("            BufferBinding::structured_f16(out, out_count),")
+    lines.append("        ];")
+    lines.append('        self.gpu.record_dispatch(&self.matmul_f32w_64, &rc, &uavs, [grid_x, grid_y, 1])')
+    lines.append('            .map_err(|e| anyhow::anyhow!("matmul_f32w: {e}"))')
+    lines.append("    }")
+
+    lines.append("}")
+    lines.append("")
 
     return "\n".join(lines) + "\n"
 
@@ -484,8 +627,9 @@ def main():
     metal_enc = sum(1 for m in metadata.values() if m.get("group") == "encoder" and not m.get("d3d12_only"))
     metal_dec = sum(1 for m in metadata.values() if m.get("group") == "decoder" and not m.get("d3d12_only"))
     d3d12_enc = sum(1 for m in metadata.values() if m.get("d3d12") and m.get("group") == "encoder")
+    d3d12_dec = sum(1 for m in metadata.values() if m.get("d3d12") and m.get("group") == "decoder")
     kokoro_n = sum(1 for m in metadata.values() if m.get("group") == "kokoro")
-    print(f"gen_rust: Metal {metal_enc} enc + {metal_dec} dec, D3D12 {d3d12_enc} enc, Kokoro {kokoro_n}")
+    print(f"gen_rust: Metal {metal_enc} enc + {metal_dec} dec, D3D12 {d3d12_enc} enc + {d3d12_dec} dec, Kokoro {kokoro_n}")
 
 
 if __name__ == "__main__":
