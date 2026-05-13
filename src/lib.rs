@@ -12,5 +12,7 @@ pub mod fast_ops;
 pub mod triton_kernels;
 #[cfg(feature = "triton-d3d12")]
 pub mod triton_d3d12_kernels;
+#[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
+pub mod kernel_archive;
 
 mod napi;

@@ -82,6 +82,6 @@ module:
 
 # Kernel compilation (Triton → Metal/DXIL)
 kernels:
-	(cd kernels && python build.py)
+	cd kernels && python build.py
 
 .PHONY: build kokoro speek speek-install bench win deploy-win test-win bench-win module kernels

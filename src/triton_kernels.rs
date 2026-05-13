@@ -1338,7 +1338,7 @@ pub fn enc_flash_attention(
 pub fn load_kernel_pipeline(device: &MetalDevice, name: &str, func_name: &str) -> Result<ComputePipeline> {
     let data = kernel_data::load_kernel(name)
         .ok_or_else(|| anyhow::anyhow!("No embedded kernel for {name}"))?;
-    Ok(device.load_pipeline_from_data(data, func_name)?)
+    Ok(device.load_pipeline_from_data(&data, func_name)?)
 }
 
 /// Dispatch f32→f16 element-wise conversion on GPU.

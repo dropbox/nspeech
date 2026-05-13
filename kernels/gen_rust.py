@@ -72,34 +72,19 @@ def gen_metal(metadata, metal_kernels):
         else:
             encoder_kernels.append(name)
 
-    # include_bytes! paths are relative to the file containing the macro,
-    # which is kernels/out/generated/triton_metal_gen.rs.
-    # So ../metal/ means kernels/out/metal/.
-
-    # ── kernel_data module (aarch64) ──
-    lines.append("#[cfg(target_arch = \"aarch64\")]")
+    # ── kernel_data module: tar archive lookup ──
     lines.append("mod kernel_data {")
-    lines.append("    pub fn load_kernel(name: &str) -> Option<&'static [u8]> {")
-    lines.append("        match name {")
-    for name in metal_names:
-        path = f"../metal/{name}.metallib"
-        lines.append(f'            "{name}" => Some(include_bytes!("{path}")),')
-    lines.append("            _ => None,")
-    lines.append("        }")
-    lines.append("    }")
-    lines.append("}")
+    lines.append("    use std::borrow::Cow;")
+    lines.append("    use std::sync::OnceLock;")
     lines.append("")
-
-    # ── kernel_data module (x86_64) ──
-    lines.append("#[cfg(target_arch = \"x86_64\")]")
-    lines.append("mod kernel_data {")
-    lines.append("    pub fn load_kernel(name: &str) -> Option<&'static [u8]> {")
-    lines.append("        match name {")
-    for name in metal_names:
-        path = f"../metal_nosimd/{name}.metallib"
-        lines.append(f'            "{name}" => Some(include_bytes!("{path}")),')
-    lines.append("            _ => None,")
-    lines.append("        }")
+    lines.append('    #[cfg(target_arch = "aarch64")]')
+    lines.append('    static TAR_ZST: &[u8] = include_bytes!("../kernels_metal.tar.zst");')
+    lines.append('    #[cfg(target_arch = "x86_64")]')
+    lines.append('    static TAR_ZST: &[u8] = include_bytes!("../kernels_metal_nosimd.tar.zst");')
+    lines.append("    static CACHE: OnceLock<Vec<u8>> = OnceLock::new();")
+    lines.append("")
+    lines.append("    pub fn load_kernel(name: &str) -> Option<Cow<'static, [u8]>> {")
+    lines.append('        crate::kernel_archive::load_kernel(name, "metallib", TAR_ZST, &CACHE)')
     lines.append("    }")
     lines.append("}")
     lines.append("")
@@ -125,7 +110,7 @@ def gen_metal(metadata, metal_kernels):
     lines.append("            eprint!(\"    {name}...\");")
     lines.append("            let data = kernel_data::load_kernel(name)")
     lines.append("                .ok_or_else(|| anyhow::anyhow!(\"No embedded kernel for {name}\"))?;")
-    lines.append("            let lib = device.new_library_with_data(data)")
+    lines.append("            let lib = device.new_library_with_data(&data)")
     lines.append("                .map_err(|e| anyhow::anyhow!(\"Failed to load metallib {name}: {e}\"))?;")
     lines.append("            let func = lib")
     lines.append("                .get_function(func_name, None)")
@@ -181,7 +166,7 @@ def gen_metal(metadata, metal_kernels):
     lines.append("            eprint!(\"    {name}...\");")
     lines.append("            let data = kernel_data::load_kernel(name)")
     lines.append("                .ok_or_else(|| anyhow::anyhow!(\"No embedded kernel for {name}\"))?;")
-    lines.append("            let lib = device.new_library_with_data(data)")
+    lines.append("            let lib = device.new_library_with_data(&data)")
     lines.append("                .map_err(|e| anyhow::anyhow!(\"Failed to load metallib {name}: {e}\"))?;")
     lines.append("            let func = lib")
     lines.append("                .get_function(func_name, None)")
@@ -244,13 +229,18 @@ def gen_d3d12(metadata, metal_kernels, hlsl_extra):
     d3d12_encoder = [n for n in d3d12_kernels if metadata[n].get("group") == "encoder"]
     d3d12_decoder = [n for n in d3d12_kernels if metadata[n].get("group") == "decoder"]
 
-    # ── DXIL constants (encoder only; decoder has hand-written consts) ──
-    # Paths relative to kernels/out/generated/triton_d3d12_gen.rs
-    for name in d3d12_encoder:
-        meta = metadata[name]
-        alias = meta["alias"]
-        const_name = f"DXIL_{alias.upper()}"
-        lines.append(f'const {const_name}: &[u8] = include_bytes!("../dxil/{name}.dxil");')
+    # ── kernel_data module: tar archive lookup ──
+    lines.append("mod kernel_data {")
+    lines.append("    use std::borrow::Cow;")
+    lines.append("    use std::sync::OnceLock;")
+    lines.append("")
+    lines.append('    static TAR_ZST: &[u8] = include_bytes!("../kernels_dxil.tar.zst");')
+    lines.append("    static CACHE: OnceLock<Vec<u8>> = OnceLock::new();")
+    lines.append("")
+    lines.append("    pub fn load_kernel(name: &str) -> Option<Cow<'static, [u8]>> {")
+    lines.append('        crate::kernel_archive::load_kernel(name, "dxil", TAR_ZST, &CACHE)')
+    lines.append("    }")
+    lines.append("}")
     lines.append("")
 
     # ── TritonD3D12Kernels struct ──
@@ -270,8 +260,10 @@ def gen_d3d12(metadata, metal_kernels, hlsl_extra):
     # ── TritonD3D12Kernels::load() ──
     lines.append("impl TritonD3D12Kernels {")
     lines.append("    pub fn load(gpu: &Arc<Gpu>, use_fp16_acc: bool) -> Result<Self> {")
-    lines.append("        let load_pso = |name: &str, dxil: &[u8]| -> Result<ID3D12PipelineState> {")
-    lines.append("            gpu.create_compute_pso(dxil)")
+    lines.append("        let load_pso = |name: &str| -> Result<ID3D12PipelineState> {")
+    lines.append("            let dxil = kernel_data::load_kernel(name)")
+    lines.append("                .ok_or_else(|| anyhow::anyhow!(\"No embedded DXIL for {name}\"))?;")
+    lines.append("            gpu.create_compute_pso(&dxil)")
     lines.append("                .map_err(|e| anyhow::anyhow!(\"Failed to create PSO for {name}: {e}\"))")
     lines.append("        };")
     lines.append("")
@@ -281,36 +273,24 @@ def gen_d3d12(metadata, metal_kernels, hlsl_extra):
         meta = metadata[name]
         alias = meta["alias"]
         optional = meta.get("optional", False)
-        const_name = f"DXIL_{alias.upper()}"
         if optional:
-            # Some optional kernels are conditional on fp16_acc
             if "acc16" in alias:
                 lines.append(f'            {alias}: if use_fp16_acc {{')
-                lines.append(f'                load_pso("{name}", {const_name}).ok()')
+                lines.append(f'                load_pso("{name}").ok()')
                 lines.append(f'            }} else {{ None }},')
             else:
-                lines.append(f'            {alias}: load_pso("{name}", {const_name}).ok(),')
+                lines.append(f'            {alias}: load_pso("{name}").ok(),')
         else:
-            lines.append(f'            {alias}: load_pso("{name}", {const_name})?,')
+            lines.append(f'            {alias}: load_pso("{name}")?,')
     lines.append("            prefer_fp16_acc: use_fp16_acc,")
     lines.append("        })")
     lines.append("    }")
     lines.append("}")
     lines.append("")
 
-    # ── D3D12 Decoder: DXIL constants ──
+    # ── D3D12DecoderKernels struct ──
     lines.append("// ── Decoder kernels ──")
     lines.append("")
-    for name in d3d12_decoder:
-        meta = metadata[name]
-        alias = meta["alias"]
-        const_name = f"DXIL_DEC_{alias.upper()}"
-        lines.append(f'const {const_name}: &[u8] = include_bytes!("../dxil/{name}.dxil");')
-    # Decoder also uses the f32-weight matmul for cross-attention KV projection
-    lines.append('const DXIL_DEC_MATMUL_F32W_64: &[u8] = include_bytes!("../dxil/matmul_f16a_f32w_64x64x32.dxil");')
-    lines.append("")
-
-    # ── D3D12DecoderKernels struct ──
     lines.append("/// All compiled Triton D3D12 kernel pipelines for the Moonshine decoder.")
     lines.append("pub struct D3D12DecoderKernels {")
     lines.append("    pub(crate) gpu: Arc<Gpu>,")
@@ -325,8 +305,10 @@ def gen_d3d12(metadata, metal_kernels, hlsl_extra):
     # ── D3D12DecoderKernels::load() ──
     lines.append("impl D3D12DecoderKernels {")
     lines.append("    pub fn load(gpu: &Arc<Gpu>) -> Result<Self> {")
-    lines.append("        let load_pso = |name: &str, dxil: &[u8]| -> Result<ID3D12PipelineState> {")
-    lines.append("            gpu.create_compute_pso(dxil)")
+    lines.append("        let load_pso = |name: &str| -> Result<ID3D12PipelineState> {")
+    lines.append("            let dxil = kernel_data::load_kernel(name)")
+    lines.append('                .ok_or_else(|| anyhow::anyhow!("No embedded DXIL for {name}"))?;')
+    lines.append("            gpu.create_compute_pso(&dxil)")
     lines.append('                .map_err(|e| anyhow::anyhow!("Failed to create PSO for {name}: {e}"))')
     lines.append("        };")
     lines.append("")
@@ -335,9 +317,8 @@ def gen_d3d12(metadata, metal_kernels, hlsl_extra):
     for name in d3d12_decoder:
         meta = metadata[name]
         alias = meta["alias"]
-        const_name = f"DXIL_DEC_{alias.upper()}"
-        lines.append(f'            {alias}: load_pso("{name}", {const_name})?,')
-    lines.append('            matmul_f32w_64: load_pso("matmul_f16a_f32w_64x64x32", DXIL_DEC_MATMUL_F32W_64)?,')
+        lines.append(f'            {alias}: load_pso("{name}")?,')
+    lines.append('            matmul_f32w_64: load_pso("matmul_f16a_f32w_64x64x32")?,')
     lines.append("        })")
     lines.append("    }")
     lines.append("")
@@ -463,35 +444,20 @@ def gen_kokoro_metal(metadata, kokoro_kernels):
     lines.append("")
 
     kokoro_names = [cfg[0] for cfg in kokoro_kernels]
-    # Include shared matmul kernel needed by kokoro (plain matmul, no bias)
-    shared_kernels = ["matmul_fp16_64x64x32"]
 
-    # kernel_data — aarch64
-    lines.append('#[cfg(target_arch = "aarch64")]')
+    # ── kernel_data module: tar archive lookup ──
     lines.append("mod kernel_data {")
-    lines.append("    pub fn load_kernel(name: &str) -> Option<&'static [u8]> {")
-    lines.append("        match name {")
-    for name in kokoro_names:
-        lines.append(f'            "{name}" => Some(include_bytes!("../metal/{name}.metallib")),')
-    for name in shared_kernels:
-        lines.append(f'            "{name}" => Some(include_bytes!("../metal/{name}.metallib")),')
-    lines.append("            _ => None,")
-    lines.append("        }")
-    lines.append("    }")
-    lines.append("}")
+    lines.append("    use std::borrow::Cow;")
+    lines.append("    use std::sync::OnceLock;")
     lines.append("")
-
-    # kernel_data — x86_64
-    lines.append('#[cfg(target_arch = "x86_64")]')
-    lines.append("mod kernel_data {")
-    lines.append("    pub fn load_kernel(name: &str) -> Option<&'static [u8]> {")
-    lines.append("        match name {")
-    for name in kokoro_names:
-        lines.append(f'            "{name}" => Some(include_bytes!("../metal_nosimd/{name}.metallib")),')
-    for name in shared_kernels:
-        lines.append(f'            "{name}" => Some(include_bytes!("../metal_nosimd/{name}.metallib")),')
-    lines.append("            _ => None,")
-    lines.append("        }")
+    lines.append('    #[cfg(target_arch = "aarch64")]')
+    lines.append('    static TAR_ZST: &[u8] = include_bytes!("../kernels_metal.tar.zst");')
+    lines.append('    #[cfg(target_arch = "x86_64")]')
+    lines.append('    static TAR_ZST: &[u8] = include_bytes!("../kernels_metal_nosimd.tar.zst");')
+    lines.append("    static CACHE: OnceLock<Vec<u8>> = OnceLock::new();")
+    lines.append("")
+    lines.append("    pub fn load_kernel(name: &str) -> Option<Cow<'static, [u8]>> {")
+    lines.append('        crate::kernel_archive::load_kernel(name, "metallib", TAR_ZST, &CACHE)')
     lines.append("    }")
     lines.append("}")
     lines.append("")
@@ -515,7 +481,7 @@ def gen_kokoro_metal(metadata, kokoro_kernels):
     lines.append("        let load = |name: &str, func_name: &str| -> Result<ComputePipeline> {")
     lines.append("            let data = kernel_data::load_kernel(name)")
     lines.append("                .ok_or_else(|| anyhow::anyhow!(\"No embedded kernel for {name}\"))?;")
-    lines.append("            let lib = device.new_library_with_data(data)")
+    lines.append("            let lib = device.new_library_with_data(&data)")
     lines.append("                .map_err(|e| anyhow::anyhow!(\"Failed to load metallib {name}: {e}\"))?;")
     lines.append("            let func = lib")
     lines.append("                .get_function(func_name, None)")
@@ -543,25 +509,24 @@ def gen_kokoro_metal(metadata, kokoro_kernels):
 
 
 def gen_kokoro_d3d12(metadata, kokoro_kernels):
-    """Generate kokoro_d3d12_gen.rs: DXIL consts + KokoroD3D12Kernels + load."""
+    """Generate kokoro_d3d12_gen.rs: KokoroD3D12Kernels + load (tar-based)."""
     dxil_dir = OUT / "dxil"
     lines = []
     lines.append("// Auto-generated by gen_rust.py -- do not edit")
     lines.append("")
 
-    # DXIL constants
-    for cfg in kokoro_kernels:
-        name = cfg[0]
-        meta = metadata.get(name)
-        if not meta or not meta.get("d3d12"):
-            continue
-        if not (dxil_dir / f"{name}.dxil").exists():
-            continue
-        const_name = f"DXIL_KOKORO_{meta['alias'].upper()}"
-        lines.append(f'const {const_name}: &[u8] = include_bytes!("../dxil/{name}.dxil");')
-    # Shared matmul kernel (plain, no bias — used with row_bias_add for conv1d)
-    if (dxil_dir / "matmul_fp16_64x64x32.dxil").exists():
-        lines.append(f'const DXIL_MATMUL_64X64: &[u8] = include_bytes!("../dxil/matmul_fp16_64x64x32.dxil");')
+    # ── kernel_data module: tar archive lookup ──
+    lines.append("mod kernel_data {")
+    lines.append("    use std::borrow::Cow;")
+    lines.append("    use std::sync::OnceLock;")
+    lines.append("")
+    lines.append('    static TAR_ZST: &[u8] = include_bytes!("../kernels_dxil.tar.zst");')
+    lines.append("    static CACHE: OnceLock<Vec<u8>> = OnceLock::new();")
+    lines.append("")
+    lines.append("    pub fn load_kernel(name: &str) -> Option<Cow<'static, [u8]>> {")
+    lines.append('        crate::kernel_archive::load_kernel(name, "dxil", TAR_ZST, &CACHE)')
+    lines.append("    }")
+    lines.append("}")
     lines.append("")
 
     # KokoroD3D12Kernels struct
@@ -581,8 +546,10 @@ def gen_kokoro_d3d12(metadata, kokoro_kernels):
     # load()
     lines.append("impl KokoroD3D12Kernels {")
     lines.append("    pub fn load(gpu: &Arc<Gpu>) -> Result<Self> {")
-    lines.append("        let load_pso = |name: &str, dxil: &[u8]| -> Result<ID3D12PipelineState> {")
-    lines.append("            gpu.create_compute_pso(dxil)")
+    lines.append("        let load_pso = |name: &str| -> Result<ID3D12PipelineState> {")
+    lines.append("            let dxil = kernel_data::load_kernel(name)")
+    lines.append('                .ok_or_else(|| anyhow::anyhow!("No embedded DXIL for {name}"))?;')
+    lines.append("            gpu.create_compute_pso(&dxil)")
     lines.append('                .map_err(|e| anyhow::anyhow!("Failed to create PSO for {name}: {e}"))')
     lines.append("        };")
     lines.append("")
@@ -594,9 +561,8 @@ def gen_kokoro_d3d12(metadata, kokoro_kernels):
             continue
         if not (dxil_dir / f"{name}.dxil").exists():
             continue
-        const_name = f"DXIL_KOKORO_{meta['alias'].upper()}"
-        lines.append(f'            {meta["alias"]}: load_pso("{name}", {const_name})?,')
-    lines.append(f'            matmul: load_pso("matmul_fp16_64x64x32", DXIL_MATMUL_64X64)?,')
+        lines.append(f'            {meta["alias"]}: load_pso("{name}")?,')
+    lines.append(f'            matmul: load_pso("matmul_fp16_64x64x32")?,')
     lines.append("        })")
     lines.append("    }")
     lines.append("}")

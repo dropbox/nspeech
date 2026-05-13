@@ -11,11 +11,26 @@ Output: out/{metal,metal_nosimd}/*.metallib, out/hlsl/*.hlsl
     python build.py metal hlsl         # multiple platforms
 """
 import json
-import os
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+
+def _load_env():
+    """Load .env from the project root (parent of kernels/) if present."""
+    env_file = Path(__file__).resolve().parent.parent / ".env"
+    if env_file.exists():
+        import os
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+
+_load_env()
 
 
 def write_if_changed(path: Path, content: str) -> bool:
@@ -37,7 +52,7 @@ def write_if_changed(path: Path, content: str) -> bool:
 SCRIPT_DIR = Path(__file__).resolve().parent
 OUT = SCRIPT_DIR / "out"
 TRITON = SCRIPT_DIR.parent.parent / "triton"
-TRITON_METAL = TRITON / "third_party" / "metal"
+TRITON_METAL = SCRIPT_DIR.parent / "triton_backend"
 _VENV = TRITON / "env"
 _BIN = _VENV / "Scripts" if sys.platform == "win32" else _VENV / "bin"
 PYTHON = str(_BIN / "python")
@@ -120,6 +135,15 @@ def _ninja_preamble():
     ], implicit
 
 
+def _pack_tar_zst_rule():
+    """Ninja rule: tar + zstd compress, no-op if output unchanged."""
+    return ("rule pack_tar_zst\n"
+            "  command = COPYFILE_DISABLE=1 tar --format ustar -cf - -C $dir $names "
+            "| zstd -19 -f -o $out.tmp - && if cmp -s $out.tmp $out; then rm $out.tmp; else mv $out.tmp $out; fi\n"
+            "  restat = 1\n"
+            "  description = TAR+ZST $out")
+
+
 def gen_ninja_metal():
     """Write build_metal.ninja for TTIR → Apple Silicon metallib (simdgroup_matrix)."""
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -133,6 +157,7 @@ def gen_ninja_metal():
     w, implicit = _ninja_preamble()
     w.append("rule msl_metal\n  command = $python $step msl_metal $in $out\n  restat = 1\n  description = MSL(metal) $out")
     w.append("rule metallib_metal\n  command = xcrun metal -std=metal3.1 -O3 -ffast-math -w -o $out $in\n  description = METALLIB(metal) $out")
+    w.append(_pack_tar_zst_rule())
     w.append("")
 
     libs = []
@@ -147,8 +172,14 @@ def gen_ninja_metal():
         w.append(f"build {al}: metallib_metal {am}")
         libs.append(str(al))
 
+    tar_path = OUT / "kernels_metal.tar.zst"
+    names = " ".join(Path(l).name for l in libs)
     w.append("")
-    w.append(f"build metal: phony {' '.join(libs)}")
+    w.append(f"build {tar_path}: pack_tar_zst {' '.join(libs)}")
+    w.append(f"  dir = {metal}")
+    w.append(f"  names = {names}")
+    w.append("")
+    w.append(f"build metal: phony {tar_path}")
     w.append(f"default metal")
     w.append("")
 
@@ -169,6 +200,7 @@ def gen_ninja_metal_nosimd():
     w, implicit = _ninja_preamble()
     w.append("rule msl_metal_nosimd\n  command = $python $step msl_metal_nosimd $in $out\n  restat = 1\n  description = MSL(metal_nosimd) $out")
     w.append("rule metallib_metal_nosimd\n  command = xcrun metal -std=macos-metal2.4 -mmacosx-version-min=14.0 -O3 -ffast-math -w -o $out $in\n  description = METALLIB(metal_nosimd) $out")
+    w.append(_pack_tar_zst_rule())
     w.append("")
 
     libs = []
@@ -183,8 +215,14 @@ def gen_ninja_metal_nosimd():
         w.append(f"build {il}: metallib_metal_nosimd {im}")
         libs.append(str(il))
 
+    tar_path = OUT / "kernels_metal_nosimd.tar.zst"
+    names = " ".join(Path(l).name for l in libs)
     w.append("")
-    w.append(f"build metal_nosimd: phony {' '.join(libs)}")
+    w.append(f"build {tar_path}: pack_tar_zst {' '.join(libs)}")
+    w.append(f"  dir = {metal_nosimd}")
+    w.append(f"  names = {names}")
+    w.append("")
+    w.append(f"build metal_nosimd: phony {tar_path}")
     w.append(f"default metal_nosimd")
     w.append("")
 
@@ -193,20 +231,44 @@ def gen_ninja_metal_nosimd():
 
 
 def gen_ninja_hlsl():
-    """Write build_hlsl.ninja for TTIR → HLSL."""
+    """Write build_hlsl.ninja for TTIR → HLSL → DXIL → tar."""
     sys.path.insert(0, str(SCRIPT_DIR))
     from kernel_configs import get_hlsl_kernels, KERNEL_METADATA
     from kokoro_configs import KOKORO_KERNELS
 
     ttir = OUT / "ttir"
     hlsl = OUT / "hlsl"
+    dxil = OUT / "dxil"
     hlsl.mkdir(parents=True, exist_ok=True)
+    dxil.mkdir(parents=True, exist_ok=True)
+
+    import os
+    dxc_host = os.environ.get("DXC_HOST", "")
+    dxc_path = os.environ.get("DXC_PATH",
+        "C:/Program Files (x86)/Windows Kits/10/bin/10.0.22621.0/x64/dxc.exe")
+    dxc_flags = "-T cs_6_2 -enable-16bit-types -O3 -Wno-for-redefinition"
 
     w, implicit = _ninja_preamble()
     w.append("rule hlsl\n  command = $python $step hlsl $in $out\n  restat = 1\n  description = HLSL $out")
+    if dxc_host:
+        remote_dir = "dxil_build"
+        # Single-quote the ssh command so parens in the Windows path don't get interpreted locally.
+        # Inside single quotes, the remote shell sees: "C:/Program Files (x86)/..." with double quotes.
+        remote_cmd = f'"{dxc_path}" {dxc_flags} -E $entry -Fo {remote_dir}/$out_name {remote_dir}/$in_name'
+        dxil_cmd = (f"scp -q $in {dxc_host}:{remote_dir}/$in_name "
+                    f"&& ssh {dxc_host} '{remote_cmd}' "
+                    f"&& scp -q {dxc_host}:{remote_dir}/$out_name $out")
+        w.append("pool dxc_pool\n  depth = 4")
+        w.append(f"rule dxil\n  command = {dxil_cmd}\n  pool = dxc_pool\n  description = DXIL $out")
+    else:
+        local_dxc = SCRIPT_DIR / "dxc" / "dxc"
+        dxil_cmd = f'DYLD_LIBRARY_PATH={SCRIPT_DIR / "dxc"} {local_dxc} {dxc_flags} -E $entry -Fo $out $in'
+        w.append(f"rule dxil\n  command = {dxil_cmd}\n  description = DXIL $out")
+    w.append(_pack_tar_zst_rule())
     w.append("")
 
     hlsl_files = []
+    dxil_files = []
     hlsl_seen = set()
     for cfg in get_hlsl_kernels():
         name = cfg[0]
@@ -219,6 +281,14 @@ def gen_ninja_hlsl():
         h = hlsl / f"{name}.hlsl"
         w.append(f"build {h}: hlsl {t} {implicit}")
         hlsl_files.append(str(h))
+        # DXIL compilation
+        d = dxil / f"{name}.dxil"
+        entry = _get_entry_point(name)
+        w.append(f"build {d}: dxil {h}")
+        w.append(f"  entry = {entry}")
+        w.append(f"  in_name = {name}.hlsl")
+        w.append(f"  out_name = {name}.dxil")
+        dxil_files.append(str(d))
     # Kokoro D3D12 kernels
     for cfg in KOKORO_KERNELS:
         name = cfg[0]
@@ -234,14 +304,36 @@ def gen_ninja_hlsl():
         h = hlsl / f"{name}.hlsl"
         w.append(f"build {h}: hlsl {t} {implicit}")
         hlsl_files.append(str(h))
+        # DXIL compilation
+        d = dxil / f"{name}.dxil"
+        entry = _get_entry_point(name)
+        w.append(f"build {d}: dxil {h}")
+        w.append(f"  entry = {entry}")
+        w.append(f"  in_name = {name}.hlsl")
+        w.append(f"  out_name = {name}.dxil")
+        dxil_files.append(str(d))
 
+    tar_path = OUT / "kernels_dxil.tar.zst"
+    names = " ".join(Path(d).name for d in dxil_files)
     w.append("")
-    w.append(f"build hlsl_all: phony {' '.join(hlsl_files)}")
-    w.append(f"default hlsl_all")
+    w.append(f"build {tar_path}: pack_tar_zst {' '.join(dxil_files)}")
+    w.append(f"  dir = {dxil}")
+    w.append(f"  names = {names}")
+    w.append("")
+    w.append(f"build hlsl: phony {tar_path}")
+    w.append(f"default hlsl")
     w.append("")
 
     write_if_changed(OUT / "build_hlsl.ninja", "\n".join(w))
-    print(f"build_hlsl.ninja: {len(hlsl_files)} hlsl")
+    print(f"build_hlsl.ninja: {len(hlsl_files)} hlsl, {len(dxil_files)} dxil")
+
+
+def _get_entry_point(name):
+    """Get the DXIL entry point for a kernel from its TTIR JSON."""
+    json_path = OUT / "ttir" / f"{name}.json"
+    if json_path.exists():
+        return json.loads(json_path.read_text()).get("kernel_name", name)
+    return name
 
 
 def run_ninja(platform):
@@ -268,138 +360,6 @@ def run_ninja(platform):
     return True
 
 
-def compile_dxil():
-    """Compile HLSL → DXIL, preferring Windows DXC via SSH for optimal Intel GPU code.
-
-    Falls back to local Mac DXC if Windows is unreachable.
-    """
-    sys.path.insert(0, str(SCRIPT_DIR))
-    from kernel_configs import KERNEL_METADATA
-
-    hlsl_dir = OUT / "hlsl"
-    ttir_dir = OUT / "ttir"
-    dxil_dir = OUT / "dxil"
-    dxil_dir.mkdir(parents=True, exist_ok=True)
-
-    # Collect HLSL → entry point mapping for d3d12-capable kernels
-    kernels = {}
-    for name, meta in KERNEL_METADATA.items():
-        if not meta.get("d3d12"):
-            continue
-        hlsl_path = hlsl_dir / f"{name}.hlsl"
-        if not hlsl_path.exists():
-            continue
-        json_path = ttir_dir / f"{name}.json"
-        if json_path.exists():
-            entry = json.loads(json_path.read_text()).get("kernel_name", name)
-        else:
-            entry = name
-        kernels[name] = entry
-
-    if not kernels:
-        return
-
-    # On Windows, use the local Windows SDK DXC directly
-    if sys.platform == "win32":
-        dxc_win = Path(r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\dxc.exe")
-        if dxc_win.exists():
-            _compile_dxil_local(kernels, hlsl_dir, dxil_dir, dxc_win)
-            return
-        print("DXIL: Windows SDK DXC not found, skipping")
-        return
-
-    # From Mac: try Windows DXC via SSH (produces optimal code for Intel GPUs)
-    if _compile_dxil_remote(kernels, hlsl_dir, dxil_dir):
-        return
-
-    # Fall back to local Mac DXC
-    dxc_bin = SCRIPT_DIR / "dxc" / "dxc"
-    if dxc_bin.exists():
-        print("DXIL: using local Mac DXC (fallback)")
-        _compile_dxil_local(kernels, hlsl_dir, dxil_dir, dxc_bin)
-    else:
-        print("DXIL: no DXC available, skipping")
-
-
-def _compile_dxil_remote(kernels, hlsl_dir, dxil_dir):
-    """Compile DXIL on Windows via SSH. Returns True on success."""
-    # Check if Windows host is reachable
-    try:
-        r = subprocess.run(["ssh", "-o", "ConnectTimeout=3", "windows", "echo ok"],
-                           capture_output=True, text=True, timeout=10)
-        if r.returncode != 0:
-            return False
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return False
-
-    t0 = time.time()
-    remote_dir = "candle/dxil_build"
-
-    # Copy HLSL files to Windows
-    hlsl_files = [hlsl_dir / f"{name}.hlsl" for name in kernels]
-    subprocess.run(["ssh", "windows", f"mkdir -p {remote_dir}"], check=True)
-    subprocess.run(["scp", "-q"] + [str(f) for f in hlsl_files] +
-                   [f"windows:{remote_dir}/"], check=True)
-
-    # Build PowerShell compile script
-    dxc = r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\dxc.exe"
-    ps_lines = [f'$DXC = "{dxc}"']
-    ps_lines.append(f'cd {remote_dir}')
-    ps_lines.append(f'if (-not (Test-Path dxil)) {{ New-Item -ItemType Directory dxil | Out-Null }}')
-    for name, entry in sorted(kernels.items()):
-        ps_lines.append(
-            f'& $DXC -T cs_6_2 -E {entry} -enable-16bit-types -O3 '
-            f'-Fo "dxil\\{name}.dxil" "{name}.hlsl" 2>&1 | Out-Null'
-        )
-    ps_lines.append('Write-Host "done"')
-    ps_script = "\n".join(ps_lines)
-
-    # Write and run script
-    script_path = Path("/tmp/dxil_build.ps1")
-    script_path.write_text(ps_script)
-    subprocess.run(["scp", "-q", str(script_path), f"windows:{remote_dir}/build.ps1"], check=True)
-
-    r = subprocess.run(
-        ["ssh", "windows", f"powershell -ExecutionPolicy Bypass -File {remote_dir}/build.ps1"],
-        capture_output=True, text=True, timeout=120
-    )
-    if r.returncode != 0:
-        print(f"DXIL: Windows DXC failed: {r.stderr[:200]}")
-        return False
-
-    # Copy DXIL files back
-    subprocess.run(
-        ["scp", "-q", f"windows:{remote_dir}/dxil/*.dxil", str(dxil_dir) + "/"],
-        check=True
-    )
-
-    # Verify
-    compiled = sum(1 for name in kernels if (dxil_dir / f"{name}.dxil").exists()
-                   and (dxil_dir / f"{name}.dxil").stat().st_size > 0)
-    dt = time.time() - t0
-    print(f"DXIL: {compiled}/{len(kernels)} compiled on Windows in {dt:.1f}s")
-    return compiled > 0
-
-
-def _compile_dxil_local(kernels, hlsl_dir, dxil_dir, dxc_bin):
-    """Compile DXIL with local DXC."""
-    env = os.environ.copy()
-    if sys.platform == "darwin":
-        env["DYLD_LIBRARY_PATH"] = str(SCRIPT_DIR / "dxc")
-    ok = 0
-    for name, entry in sorted(kernels.items()):
-        hlsl_path = hlsl_dir / f"{name}.hlsl"
-        dxil_path = dxil_dir / f"{name}.dxil"
-        r = subprocess.run(
-            [str(dxc_bin), "-T", "cs_6_2", "-E", entry,
-             "-enable-16bit-types", "-O3", "-Fo", str(dxil_path), str(hlsl_path)],
-            env=env, capture_output=True, text=True
-        )
-        if r.returncode == 0 and dxil_path.exists() and dxil_path.stat().st_size > 0:
-            ok += 1
-    print(f"DXIL: {ok}/{len(kernels)} compiled locally")
-
-
 def gen_rust():
     """Generate Rust kernel embedding code from metadata."""
     from gen_rust import main as gen_rust_main
@@ -421,6 +381,4 @@ if __name__ == "__main__":
     for p in platforms:
         if not run_ninja(p):
             sys.exit(1)
-    if "hlsl" in platforms:
-        compile_dxil()
     gen_rust()

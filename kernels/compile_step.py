@@ -13,7 +13,7 @@ import json
 import sys
 from pathlib import Path
 
-TRITON_METAL_DIR = Path(__file__).resolve().parent.parent.parent / "triton" / "third_party" / "metal"
+TRITON_METAL_DIR = Path(__file__).resolve().parent.parent / "triton_backend"
 sys.path.insert(0, str(TRITON_METAL_DIR))
 
 
