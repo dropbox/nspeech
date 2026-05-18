@@ -86,8 +86,29 @@ bench-win: deploy-win
 module:
 	cargo build --release $(BUILD_TARGET) --lib --features $(FEATURES)
 
+# Download and quantize Kokoro TTS model → assets/
+assets/kokoro_q8_0.gguf: hf_kokoro/kokoro-v1_0.safetensors
+	cargo build --release $(BUILD_TARGET) --example quantize_kokoro
+	$(BIN_DIR)/quantize_kokoro
+
+hf_kokoro/kokoro-v1_0.safetensors: hf_kokoro/kokoro-v1_0.pth
+	python scripts/convert_kokoro_safetensors.py
+
+hf_kokoro/kokoro-v1_0.pth:
+	python scripts/download_kokoro.py
+
+assets/kokoro-config.json: hf_kokoro/config.json
+	cp $< $@
+
+assets/kokoro-af_heart.safetensors: hf_kokoro/voices/af_heart.safetensors
+	cp $< $@
+
+hf_kokoro/config.json hf_kokoro/voices/af_heart.safetensors: hf_kokoro/kokoro-v1_0.pth
+
+assets: assets/kokoro_q8_0.gguf assets/kokoro-config.json assets/kokoro-af_heart.safetensors
+
 # Kernel compilation (Triton → Metal/DXIL)
 kernels:
 	cd kernels && python build.py
 
-.PHONY: build kokoro speek speek-install bench win deploy-win test-win bench-win module kernels
+.PHONY: build kokoro speek speek-install bench win deploy-win test-win bench-win module kernels assets
