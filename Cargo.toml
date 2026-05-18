@@ -55,7 +55,7 @@ once_cell = "1.21.3"
 
 # CPU-optimized matmul (optional)
 rayon = { version = "1", optional = true }
-fbgemm-rs = { git = "https://github.com/jhansen_dbx/fbgemm-rs", optional = true, features = ["rayon"] }
+fbgemm-rs = { git = "https://github.com/jacobgorm/fbgemm-rs", branch = "main", optional = true, features = ["rayon"] }
 
 # Triton-compiled Metal kernels (optional, macOS only)
 candle-metal-kernels = { git = "https://github.com/jacobgorm/candle", branch = "windows", optional = true }
