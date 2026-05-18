@@ -316,9 +316,10 @@ pub fn get_device() -> Result<Device> {
     // Triton encoder/decoder create their own Metal device internally.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        match Device::new_metal(0) {
-            Ok(device) => return Ok(device),
-            Err(_) => {}
+        // catch_unwind: candle panics if no Metal devices exist (e.g. sandbox)
+        let result = std::panic::catch_unwind(|| Device::new_metal(0));
+        if let Ok(Ok(device)) = result {
+            return Ok(device);
         }
     }
 
