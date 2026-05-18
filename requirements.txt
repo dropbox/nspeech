@@ -1,4 +1,5 @@
 huggingface_hub>=0.24
+misaki
 moonshine-voice
 numpy
 onnx

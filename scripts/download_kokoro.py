@@ -36,6 +36,25 @@ def main():
     else:
         print(f"  Already exists: {dest}")
 
+    # Extract phonemizer dictionaries from misaki package
+    try:
+        import misaki
+        misaki_data = Path(misaki.__file__).parent / "data"
+        for name in ["us_gold.json", "us_silver.json"]:
+            src = misaki_data / name
+            dest = output_dir / name
+            if dest.exists():
+                print(f"  Already exists: {dest}")
+            elif src.exists():
+                import shutil
+                shutil.copy2(src, dest)
+                print(f"  Copied {name} from misaki package")
+            else:
+                print(f"  WARNING: {name} not found in misaki package")
+    except ImportError:
+        print("  WARNING: misaki not installed, skipping phonemizer dicts")
+        print("  Install with: pip install misaki")
+
     print(f"\nModel files in {output_dir}/")
     print("\nNote: The model is in PyTorch .pth format.")
     print("Convert to safetensors with:")
