@@ -44,7 +44,7 @@ export RUSTFLAGS += $(RUSTFLAGS_EXTRA)
 
 # === Build targets ===
 
-build:
+build: assets
 	cargo build --release $(BUILD_TARGET) --features $(FEATURES) --example synthesize_kokoro
 
 kokoro: build
@@ -97,14 +97,24 @@ hf_kokoro/kokoro-v1_0.pth:
 	python scripts/download_kokoro.py
 
 assets/kokoro-config.json: hf_kokoro/config.json
+	@mkdir -p assets
 	cp $< $@
 
 assets/kokoro-af_heart.safetensors: hf_kokoro/voices/af_heart.safetensors
+	@mkdir -p assets
 	cp $< $@
 
-hf_kokoro/config.json hf_kokoro/voices/af_heart.safetensors: hf_kokoro/kokoro-v1_0.pth
+assets/us_gold.json: hf_kokoro/us_gold.json
+	@mkdir -p assets
+	cp $< $@
 
-assets: assets/kokoro_q8_0.gguf assets/kokoro-config.json assets/kokoro-af_heart.safetensors
+assets/us_silver.json: hf_kokoro/us_silver.json
+	@mkdir -p assets
+	cp $< $@
+
+hf_kokoro/config.json hf_kokoro/voices/af_heart.safetensors hf_kokoro/us_gold.json hf_kokoro/us_silver.json: hf_kokoro/kokoro-v1_0.pth
+
+assets: assets/kokoro_q8_0.gguf assets/kokoro-config.json assets/kokoro-af_heart.safetensors assets/us_gold.json assets/us_silver.json
 
 # Kernel compilation (Triton → Metal/DXIL)
 kernels:

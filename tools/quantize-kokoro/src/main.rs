@@ -95,6 +95,9 @@ fn main() -> Result<()> {
 
     eprintln!("Quantized: {}, kept F32: {}", quantized, kept_f32);
 
+    if let Some(parent) = std::path::Path::new(&out_path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let mut out = std::fs::File::create(&out_path)?;
     let qtensor_refs: Vec<(&str, &QTensor)> = qtensors.iter()
         .map(|(n, q)| (n.as_str(), q))
