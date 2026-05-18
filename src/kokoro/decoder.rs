@@ -580,7 +580,13 @@ impl Generator {
                     let audio_buf = gpu.alloc_f32(audio_len)?;
                     gpu.istft_gpu(&out_f32, &audio_buf, n_frames, audio_len)?;
                     gpu.end_batch()?;
-                    let audio_data = gpu.download_f32(&audio_buf, audio_len)?;
+                    let mut audio_data = gpu.download_f32(&audio_buf, audio_len)?;
+                    // Zero leading samples — boundary frames can pick up noise from
+                    // uninitialized D3D12 GPU buffers propagating through conv/resblock chain.
+                    let silence_prefix = (n_fft * n_fft).min(audio_data.len());
+                    for s in audio_data.iter_mut().take(silence_prefix) {
+                        *s = 0.0;
+                    }
 
                     if compare {
                         let ch = cpu_h.as_ref().unwrap();
