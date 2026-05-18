@@ -1,7 +1,7 @@
 //! Quantize Kokoro TTS model to GGUF format.
 //!
 //! Usage:
-//!   cargo run --example quantize_kokoro --release -- [--format q8_0|q4k]
+//!   cargo run -p quantize-kokoro --release -- [--format q8_0|q4k]
 
 use anyhow::{anyhow, Result};
 use candle_core::quantized::{gguf_file, GgmlDType, QTensor};

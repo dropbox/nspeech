@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "tools/quantize-kokoro"]
+
 [package]
 name = "speech"
 version = "0.1.0"

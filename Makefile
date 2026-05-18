@@ -88,8 +88,7 @@ module:
 
 # Download and quantize Kokoro TTS model → assets/
 assets/kokoro_q8_0.gguf: hf_kokoro/kokoro-v1_0.safetensors
-	cargo build --release $(BUILD_TARGET) --example quantize_kokoro
-	$(BIN_DIR)/quantize_kokoro
+	cargo run -p quantize-kokoro --release
 
 hf_kokoro/kokoro-v1_0.safetensors: hf_kokoro/kokoro-v1_0.pth
 	python scripts/convert_kokoro_safetensors.py
