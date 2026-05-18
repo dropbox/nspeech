@@ -122,16 +122,24 @@ impl ISTFTNetDecoder {
     }
 
     pub fn forward(&self, asr: &Tensor, f0: &Tensor, n: &Tensor, style: &Tensor) -> Result<Tensor> {
-        #[cfg(feature = "triton-metal")]
-        {
-            if let Ok(Some(gpu)) = KokoroGpuDecoder::try_new(asr.device()) {
-                return self.forward_gpu(asr, f0, n, style, &gpu);
+        if std::env::var("PARAKEET_DEVICE").as_deref() != Ok("cpu") {
+            #[cfg(feature = "triton-metal")]
+            {
+                if let Ok(Some(gpu)) = KokoroGpuDecoder::try_new(asr.device()) {
+                    match self.forward_gpu(asr, f0, n, style, &gpu) {
+                        Ok(audio) => return Ok(audio),
+                        Err(e) => eprintln!("    GPU decode failed, falling back to CPU: {e}"),
+                    }
+                }
             }
-        }
-        #[cfg(feature = "triton-d3d12")]
-        {
-            if let Ok(Some(gpu)) = KokoroGpuDecoderD3D12::try_new() {
-                return self.forward_gpu(asr, f0, n, style, &gpu);
+            #[cfg(feature = "triton-d3d12")]
+            {
+                if let Ok(Some(gpu)) = KokoroGpuDecoderD3D12::try_new() {
+                    match self.forward_gpu(asr, f0, n, style, &gpu) {
+                        Ok(audio) => return Ok(audio),
+                        Err(e) => eprintln!("    GPU decode failed, falling back to CPU: {e}"),
+                    }
+                }
             }
         }
         self.forward_inner(asr, f0, n, style)
