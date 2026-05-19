@@ -681,22 +681,37 @@ impl MoonshineModel {
                 break;
             }
 
-            // Search backwards from the limit for the best silence point.
-            // Look in the last 20s of the window for a silence frame.
+            // Search backwards from the limit for silence. Strategy:
+            // 1. Look in last 20s of the 60s window at strict threshold
+            // 2. If nothing, retry with relaxed threshold (any dip below 0.5)
+            // 3. If still nothing, extend up to 90s looking for any silence
+            // 4. Hard-cut at 90s as absolute last resort
             let search_start_sample = seg_start + max_chunk_samples.saturating_sub(20 * 16000);
             let search_start_idx = search_start_sample / chunk_size;
             let search_end_idx = seg_end_limit / chunk_size;
 
-            let best_split_idx = (search_start_idx..search_end_idx)
+            let split_sample = if let Some(idx) = (search_start_idx..search_end_idx)
                 .rev()
-                .find(|&idx| idx < probs.len() && probs[idx] < silence_threshold);
-
-            let split_sample = if let Some(idx) = best_split_idx {
-                // Split at the end of this silence frame
+                .find(|&idx| idx < probs.len() && probs[idx] < silence_threshold)
+            {
+                ((idx + 1) * chunk_size).min(total_samples)
+            } else if let Some(idx) = (search_start_idx..search_end_idx)
+                .rev()
+                .find(|&idx| idx < probs.len() && probs[idx] < 0.5)
+            {
                 ((idx + 1) * chunk_size).min(total_samples)
             } else {
-                // No silence found — fall back to hard boundary
-                seg_end_limit
+                // Extend search up to 90s (extra 30s beyond target)
+                let extended_limit = (seg_start + 90 * 16000).min(total_samples);
+                let extended_end_idx = extended_limit / chunk_size;
+                if let Some(idx) = (search_end_idx..extended_end_idx)
+                    .find(|&idx| idx < probs.len() && probs[idx] < 0.5)
+                {
+                    ((idx + 1) * chunk_size).min(total_samples)
+                } else {
+                    // Truly no silence — hard cut at extended limit
+                    extended_limit
+                }
             };
 
             segments.push((seg_start, split_sample));
