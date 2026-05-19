@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "tools/quantize-kokoro"]
+members = [".", "tools/quantize-kokoro", "tools/quantize-parakeet", "tools/quantize-moonshine", "tools/quantize-vad"]
 
 [package]
 name = "speech"

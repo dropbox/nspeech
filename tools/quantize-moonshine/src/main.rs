@@ -1,26 +1,8 @@
-/// Quantize Silero VAD model to GGUF format (uncompressed for mmap)
-///
-/// This tool quantizes the VAD safetensors model to GGUF Q8_0 format without compression.
-/// The uncompressed GGUF file is used with memory-mapping for efficient loading.
-///
-/// **Important**: This provides **quantized storage** (6.2x smaller than FP32) but the model
-/// performs **FP32 inference** by dequantizing weights on load. True quantized inference is not
-/// implemented because Candle does not support quantized Conv1d/LSTM operations.
-///
-/// Benefits:
-/// - 6.2x smaller than FP32 safetensors (948 KB → 152 KB)
-/// - Zero-copy memory mapping (faster loading)
-/// - No decompression overhead
-/// - Identical inference accuracy
-///
-/// Limitations:
-/// - Runtime memory usage same as FP32 (weights dequantized on load)
-/// - Inference speed same as FP32 (no quantized operations)
+/// Quantize Moonshine V2 model to GGUF format (uncompressed for mmap).
 ///
 /// Usage:
-///   cargo run --example quantize_vad_gguf --release -- \
-///     assets/vad16.safetensors \
-///     assets/vad16_q8_0.gguf
+///   cargo run -p quantize-moonshine --release -- \
+///     hf_moonshine/model.safetensors assets/moonshine_q8_0.gguf
 
 use anyhow::Result;
 use candle_core::quantized::{gguf_file, GgmlDType, QTensor};
@@ -28,28 +10,19 @@ use candle_core::{Device, Tensor};
 use std::io::Write;
 use std::path::PathBuf;
 
-/// Determine if a VAD tensor should be quantized
+/// Determine if a Moonshine tensor should be quantized
 fn should_quantize_tensor(name: &str, tensor: &Tensor) -> bool {
-    // Don't quantize:
-    // - Biases (1D)
-    // - STFT basis (sensitive signal processing)
-    // - Small tensors
-
+    // Don't quantize biases (1D)
     if name.contains("bias") {
         return false;
     }
 
-    if name.contains("stft.forward_basis_buffer") {
-        // STFT basis is sensitive to quantization, keep FP32
+    // Don't quantize scalars (rank 0), e.g. comp.log_k
+    if tensor.rank() == 0 {
         return false;
     }
 
-    if name.contains("head.weight") {
-        // Head conv is very small [1,128,1], keep FP32
-        return false;
-    }
-
-    // Don't quantize 1D tensors
+    // Don't quantize 1D tensors (norms, etc.)
     if tensor.rank() == 1 {
         return false;
     }
@@ -59,9 +32,7 @@ fn should_quantize_tensor(name: &str, tensor: &Tensor) -> bool {
         return false;
     }
 
-    // Quantize weight matrices (conv weights, RNN weights)
-    // Supports both 2D (RNN) and 3D (Conv1d) tensors
-    name.contains("weight")
+    true
 }
 
 fn main() -> Result<()> {
@@ -69,26 +40,29 @@ fn main() -> Result<()> {
     if args.len() < 3 {
         eprintln!("Usage: {} <input.safetensors> <output.gguf>", args[0]);
         eprintln!("\nExample:");
-        eprintln!("  {} assets/vad16.safetensors assets/vad16_q8_0.gguf", args[0]);
+        eprintln!(
+            "  {} hf_moonshine/model.safetensors assets/moonshine_q8_0.gguf",
+            args[0]
+        );
         std::process::exit(1);
     }
 
     let in_file = PathBuf::from(&args[1]);
     let out_file = PathBuf::from(&args[2]);
 
-    println!("Quantizing VAD Model to GGUF Q8_0 (uncompressed for mmap)");
-    println!("=========================================================");
+    println!("Quantizing Moonshine V2 Model to GGUF Q8_0 (uncompressed for mmap)");
+    println!("===================================================================");
     println!("Input:  {:?}", in_file);
     println!("Output: {:?}\n", out_file);
 
-    quantize_vad(&in_file, &out_file)?;
+    quantize_moonshine(&in_file, &out_file)?;
 
     Ok(())
 }
 
-fn quantize_vad(in_file: &PathBuf, out_file: &PathBuf) -> Result<()> {
+fn quantize_moonshine(in_file: &PathBuf, out_file: &PathBuf) -> Result<()> {
     // Load safetensors on CPU
-    println!("Loading VAD model from safetensors...");
+    println!("Loading Moonshine model from safetensors...");
     let tensors = candle_core::safetensors::load(in_file, &Device::Cpu)?;
     println!("Loaded {} tensors\n", tensors.len());
 
@@ -96,7 +70,7 @@ fn quantize_vad(in_file: &PathBuf, out_file: &PathBuf) -> Result<()> {
 
     let mut quantized_count = 0;
     let mut fp32_count = 0;
-    let mut excluded_count = 0;
+    let excluded_count = 0;
     let mut total_original_size = 0u64;
 
     println!("Quantizing tensors:");
@@ -109,12 +83,18 @@ fn quantize_vad(in_file: &PathBuf, out_file: &PathBuf) -> Result<()> {
             let original_bytes = tensor.elem_count() * tensor.dtype().size_in_bytes();
             total_original_size += original_bytes as u64;
 
-            // Skip scalar tensors entirely
-            if tensor.rank() == 0 {
-                excluded_count += 1;
-                println!("  - Excluding {} [] (scalar, not needed)", name);
-                return None;
-            }
+            // Reshape scalar tensors to [1] so GGUF can store them (e.g. comp.log_k)
+            let tensor = if tensor.rank() == 0 {
+                print!("  {} [] -> FP32 [1]... ", name);
+                std::io::stdout().flush().ok();
+                let reshaped = tensor.reshape((1,)).ok()?;
+                let qtensor = QTensor::quantize(&reshaped, GgmlDType::F32).ok()?;
+                fp32_count += 1;
+                println!("OK");
+                return Some(Ok((name, qtensor)));
+            } else {
+                tensor
+            };
 
             let should_quantize = should_quantize_tensor(&name, &tensor);
 
@@ -140,10 +120,8 @@ fn quantize_vad(in_file: &PathBuf, out_file: &PathBuf) -> Result<()> {
 
                 match QTensor::quantize(&tensor_to_quantize, quant_format) {
                     Ok(qtensor) => {
-                        // Note: For 3D conv weights, we keep the flattened shape in GGUF
-                        // The loader will need to reshape back to 3D when loading
                         quantized_count += 1;
-                        println!("✓");
+                        println!("OK");
                         Some(Ok((name, qtensor)))
                     }
                     Err(e) => {
@@ -152,7 +130,7 @@ fn quantize_vad(in_file: &PathBuf, out_file: &PathBuf) -> Result<()> {
                         print!("    Falling back to FP32... ");
                         let qtensor = QTensor::quantize(&tensor, GgmlDType::F32).ok()?;
                         fp32_count += 1;
-                        println!("✓");
+                        println!("OK");
                         Some(Ok((name, qtensor)))
                     }
                 }
@@ -162,7 +140,7 @@ fn quantize_vad(in_file: &PathBuf, out_file: &PathBuf) -> Result<()> {
 
                 let qtensor = QTensor::quantize(&tensor, GgmlDType::F32).ok()?;
                 fp32_count += 1;
-                println!("✓");
+                println!("OK");
                 Some(Ok((name, qtensor)))
             }
         })
@@ -183,7 +161,7 @@ fn quantize_vad(in_file: &PathBuf, out_file: &PathBuf) -> Result<()> {
         .map(|(name, qtensor)| (name.as_str(), qtensor))
         .collect();
 
-    // Write GGUF (no metadata for VAD)
+    // Write GGUF (no metadata)
     let metadata: Vec<(&str, &gguf_file::Value)> = vec![];
     gguf_file::write(&mut out, &metadata, &qtensor_refs)?;
     out.flush()?;
@@ -192,11 +170,20 @@ fn quantize_vad(in_file: &PathBuf, out_file: &PathBuf) -> Result<()> {
     let gguf_size = std::fs::metadata(out_file)?.len();
 
     // Statistics
-    println!("\n✓ Quantization complete!");
+    println!("\nQuantization complete!");
     println!("\nSize Comparison:");
-    println!("  Original (safetensors): {:.2} MB", total_original_size as f64 / 1_000_000.0);
-    println!("  GGUF Q8_0 (uncompressed): {:.2} MB", gguf_size as f64 / 1_000_000.0);
-    println!("  Size reduction: {:.2}x", total_original_size as f64 / gguf_size as f64);
+    println!(
+        "  Original (safetensors): {:.2} MB",
+        total_original_size as f64 / 1_000_000.0
+    );
+    println!(
+        "  GGUF Q8_0 (uncompressed): {:.2} MB",
+        gguf_size as f64 / 1_000_000.0
+    );
+    println!(
+        "  Size reduction: {:.2}x",
+        total_original_size as f64 / gguf_size as f64
+    );
 
     Ok(())
 }

@@ -1,18 +1,8 @@
-/// Quantize Parakeet model to GGUF format (uncompressed for mmap)
-///
-/// This tool quantizes a safetensors model to GGUF format without compression.
-/// The uncompressed GGUF file is used with memory-mapping for efficient loading.
+/// Quantize Parakeet model to GGUF format (uncompressed for mmap).
 ///
 /// Usage:
-///   cargo run --example quantize_gguf --release -- \
-///     assets/model.safetensors \
-///     assets/model_q8_0.gguf \
-///     --format q8_0
-///
-///   cargo run --example quantize_gguf --release -- \
-///     assets/model.safetensors \
-///     assets/model_q4k.gguf \
-///     --format q4k
+///   cargo run -p quantize-parakeet --release -- \
+///     assets/model.safetensors assets/model_q8_0.gguf --format q8_0
 
 use anyhow::{anyhow, Result};
 use candle_core::quantized::{gguf_file, GgmlDType, QTensor};
