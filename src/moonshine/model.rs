@@ -619,29 +619,91 @@ impl MoonshineModel {
     /// Input: raw 16kHz mono audio samples.
     /// Output: transcribed text.
     ///
-    /// For audio longer than 60s, automatically chunks and transcribes each
-    /// segment independently to avoid GPU memory exhaustion.
+    /// For audio longer than 60s, uses VAD to find silence boundaries and splits
+    /// there to avoid GPU memory exhaustion and mid-word cuts.
     pub fn transcribe(&self, audio_samples: &[f32], device: &Device) -> Result<String> {
-        // 60s chunks (must be a multiple of frame_len for alignment)
-        let max_chunk_samples = (60 * self.cfg.sample_rate as usize
-            / self.cfg.frame_len) * self.cfg.frame_len;
+        let max_chunk_samples = 60 * self.cfg.sample_rate as usize;
 
         if audio_samples.len() <= max_chunk_samples {
             return self.transcribe_chunk(audio_samples, device);
         }
 
+        let segments = Self::vad_split(audio_samples, max_chunk_samples, device)?;
+
         let mut texts = Vec::new();
-        let mut offset = 0;
-        while offset < audio_samples.len() {
-            let end = (offset + max_chunk_samples).min(audio_samples.len());
-            let chunk = &audio_samples[offset..end];
+        for (start, end) in &segments {
+            let chunk = &audio_samples[*start..*end];
             let text = self.transcribe_chunk(chunk, device)?;
             if !text.is_empty() {
                 texts.push(text);
             }
-            offset = end;
         }
         Ok(texts.join(" "))
+    }
+
+    /// Use VAD to find silence-aligned split points for long audio.
+    ///
+    /// Returns a list of (start, end) sample ranges, each <= max_chunk_samples,
+    /// split at silence boundaries detected by the VAD.
+    fn vad_split(
+        audio: &[f32],
+        max_chunk_samples: usize,
+        device: &Device,
+    ) -> Result<Vec<(usize, usize)>> {
+        use crate::silero::{SileroVad, VadStream};
+
+        let vad = SileroVad::load("assets", device)?;
+        let mut stream = VadStream::new(vad, device)?;
+
+        // Run VAD over entire audio to get per-chunk speech probabilities.
+        // Each probability corresponds to one VAD chunk (512 samples = 32ms).
+        let chunk_size = 512usize;
+        let mut probs = Vec::new();
+        for frame_start in (0..audio.len()).step_by(chunk_size) {
+            let frame_end = (frame_start + chunk_size).min(audio.len());
+            let frame = &audio[frame_start..frame_end];
+            let p = stream.push(frame)?;
+            probs.extend(p);
+        }
+
+        // Find split points: scan for silence regions within each window.
+        // Each prob entry covers `chunk_size` samples.
+        let silence_threshold = 0.3;
+        let total_samples = audio.len();
+        let mut segments = Vec::new();
+        let mut seg_start = 0;
+
+        while seg_start < total_samples {
+            let seg_end_limit = (seg_start + max_chunk_samples).min(total_samples);
+
+            if seg_end_limit >= total_samples {
+                segments.push((seg_start, total_samples));
+                break;
+            }
+
+            // Search backwards from the limit for the best silence point.
+            // Look in the last 20s of the window for a silence frame.
+            let search_start_sample = seg_start + max_chunk_samples.saturating_sub(20 * 16000);
+            let search_start_idx = search_start_sample / chunk_size;
+            let search_end_idx = seg_end_limit / chunk_size;
+
+            let best_split_idx = (search_start_idx..search_end_idx)
+                .rev()
+                .find(|&idx| idx < probs.len() && probs[idx] < silence_threshold);
+
+            let split_sample = if let Some(idx) = best_split_idx {
+                // Split at the end of this silence frame
+                ((idx + 1) * chunk_size).min(total_samples)
+            } else {
+                // No silence found — fall back to hard boundary
+                seg_end_limit
+            };
+
+            segments.push((seg_start, split_sample));
+            seg_start = split_sample;
+        }
+
+        Ok(segments)
     }
 
     fn transcribe_chunk(&self, audio_samples: &[f32], device: &Device) -> Result<String> {
