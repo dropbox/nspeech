@@ -159,7 +159,7 @@ def quantize_gguf(hf_dir: str, assets_dir: str):
     # Build the quantizer
     print("  Building quantizer...")
     result = subprocess.run(
-        ["cargo", "build", "--example", "quantize_moonshine_gguf", "--release"],
+        ["cargo", "build", "-p", "quantize-moonshine", "--release"],
         capture_output=True,
         text=True,
     )
@@ -171,7 +171,7 @@ def quantize_gguf(hf_dir: str, assets_dir: str):
     print(f"  Quantizing {safetensors_path} -> {gguf_path}...")
     result = subprocess.run(
         [
-            "cargo", "run", "--example", "quantize_moonshine_gguf", "--release",
+            "cargo", "run", "-p", "quantize-moonshine", "--release",
             "--", safetensors_path, gguf_path,
         ],
     )

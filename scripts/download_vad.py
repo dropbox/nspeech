@@ -250,7 +250,7 @@ def main() -> int:
     try:
         # Run the Rust quantization tool
         result = subprocess.run(
-            ["cargo", "run", "--example", "quantize_vad_gguf", "--release", "--",
+            ["cargo", "run", "-p", "quantize-vad", "--release", "--",
              str(model_path), str(gguf_path)],
             cwd=project_root,
             capture_output=True,

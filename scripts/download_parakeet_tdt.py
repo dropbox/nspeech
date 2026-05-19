@@ -199,7 +199,7 @@ def quantize_tdt_model(cache_dir: pathlib.Path, safetensors_path: pathlib.Path) 
 
     try:
         subprocess.run(
-            ["cargo", "build", "--example", "quantize_gguf", "--release"],
+            ["cargo", "build", "-p", "quantize-parakeet", "--release"],
             check=True,
             cwd=project_root,
             capture_output=True,
@@ -220,7 +220,7 @@ def quantize_tdt_model(cache_dir: pathlib.Path, safetensors_path: pathlib.Path) 
     try:
         subprocess.run(
             [
-                "cargo", "run", "--example", "quantize_gguf", "--release", "--",
+                "cargo", "run", "-p", "quantize-parakeet", "--release", "--",
                 str(safetensors_path),
                 str(gguf_path),
                 "--format", "q8_0",
