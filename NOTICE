@@ -1,0 +1,42 @@
+Speech
+Copyright 2025 Jacob Gorm Hansen
+
+This product includes software and model weights from the following projects:
+
+---
+
+Candle (Deep Learning Framework)
+https://github.com/huggingface/candle
+Licensed under MIT / Apache-2.0
+
+---
+
+NVIDIA Parakeet TDT (Speech Recognition Model)
+https://huggingface.co/nvidia/parakeet-tdt-1.1b
+Licensed under CC-BY-4.0
+Copyright NVIDIA Corporation
+
+---
+
+Moonshine V2 (Speech Recognition Model)
+https://huggingface.co/usefulsensors/moonshine
+Licensed under MIT
+Copyright Useful Sensors, Inc.
+
+---
+
+Kokoro TTS (Text-to-Speech Model)
+https://huggingface.co/hexgrad/Kokoro-82M
+Licensed under Apache-2.0
+
+---
+
+Silero VAD (Voice Activity Detection)
+https://github.com/snakers4/silero-vad
+Licensed under MIT
+
+---
+
+fbgemm-rs (CPU GEMM kernels)
+https://github.com/jacobgorm/fbgemm-rs
+Licensed under BSD-3-Clause (derived from Meta's FBGEMM)

@@ -20,6 +20,7 @@ chat.txt
 d
 d2
 
+
 # Audio files (keep small test files if needed, but exclude large ones)
 *.wav
 debug_input.wav
