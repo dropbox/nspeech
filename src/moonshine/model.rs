@@ -618,8 +618,33 @@ impl MoonshineModel {
     ///
     /// Input: raw 16kHz mono audio samples.
     /// Output: transcribed text.
+    ///
+    /// For audio longer than 60s, automatically chunks and transcribes each
+    /// segment independently to avoid GPU memory exhaustion.
     pub fn transcribe(&self, audio_samples: &[f32], device: &Device) -> Result<String> {
-        // Pad to multiple of frame_len
+        // 60s chunks (must be a multiple of frame_len for alignment)
+        let max_chunk_samples = (60 * self.cfg.sample_rate as usize
+            / self.cfg.frame_len) * self.cfg.frame_len;
+
+        if audio_samples.len() <= max_chunk_samples {
+            return self.transcribe_chunk(audio_samples, device);
+        }
+
+        let mut texts = Vec::new();
+        let mut offset = 0;
+        while offset < audio_samples.len() {
+            let end = (offset + max_chunk_samples).min(audio_samples.len());
+            let chunk = &audio_samples[offset..end];
+            let text = self.transcribe_chunk(chunk, device)?;
+            if !text.is_empty() {
+                texts.push(text);
+            }
+            offset = end;
+        }
+        Ok(texts.join(" "))
+    }
+
+    fn transcribe_chunk(&self, audio_samples: &[f32], device: &Device) -> Result<String> {
         let frame_len = self.cfg.frame_len;
         let pad_len = (frame_len - audio_samples.len() % frame_len) % frame_len;
         let mut padded = audio_samples.to_vec();
@@ -634,7 +659,7 @@ impl MoonshineModel {
 
         // Compute max tokens based on audio duration
         let duration_sec = audio_samples.len() as f64 / self.cfg.sample_rate as f64;
-        let max_tokens = (duration_sec * 6.5).ceil() as usize + 10; // 6.5 tokens/sec + margin
+        let max_tokens = (duration_sec * 6.5).ceil() as usize + 10;
 
         // Decode
         let t_dec = std::time::Instant::now();
