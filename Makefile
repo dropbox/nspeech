@@ -76,6 +76,13 @@ speek-install: speek
 	cp skills/speek-claude/SKILL.md ~/.claude/skills/speek/.SKILL.md.tmp && mv ~/.claude/skills/speek/.SKILL.md.tmp ~/.claude/skills/speek/SKILL.md
 	cp skills/speek-codex/SKILL.md ~/.codex/skills/speek/.SKILL.md.tmp && mv ~/.codex/skills/speek/.SKILL.md.tmp ~/.codex/skills/speek/SKILL.md
 
+listen-install: listen
+	mkdir -p ~/bin ~/.claude/skills/listen ~/.codex/skills/listen
+	ln -f $(realpath listen) ~/bin/listen
+	rm -f ~/.claude/skills/listen/skill.md ~/.codex/skills/listen/skill.md
+	cp skills/listen-claude/SKILL.md ~/.claude/skills/listen/.SKILL.md.tmp && mv ~/.claude/skills/listen/.SKILL.md.tmp ~/.claude/skills/listen/SKILL.md
+	cp skills/listen-codex/SKILL.md ~/.codex/skills/listen/.SKILL.md.tmp && mv ~/.codex/skills/listen/.SKILL.md.tmp ~/.codex/skills/listen/SKILL.md
+
 bench:
 	cargo build --release $(BUILD_TARGET) --features $(FEATURES) --example bench_triton_encoder
 	$(BIN_DIR)/bench_triton_encoder
@@ -152,4 +159,4 @@ assets: assets/kokoro_q8_0.gguf assets/kokoro-config.json assets/kokoro-af_heart
 kernels:
 	cd kernels && python build.py
 
-.PHONY: build kokoro speek listen speek-install bench win deploy-win test-win bench-win module kernels assets
+.PHONY: build kokoro speek listen speek-install listen-install bench win deploy-win test-win bench-win module kernels assets
