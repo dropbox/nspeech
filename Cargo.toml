@@ -68,6 +68,7 @@ half = "2.5"
 
 # Audio input (for mic example)
 cpal = "0.15"
+crossterm = "0.28"
 
 [build-dependencies]
 napi-build = "2.2.3"

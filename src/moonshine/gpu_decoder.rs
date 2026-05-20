@@ -589,18 +589,12 @@ impl<B: DecoderBackend> GpuDecoder<B> {
         generated.push(next_token);
         if next_token == self.d.eos_id { return Ok(generated); }
 
-        let decode_start = std::time::Instant::now();
         for _step in 0..max_tokens - 1 {
             self.forward_one_token(next_token, &mut cache)?;
             next_token = self.backend.argmax_logits(&self.d.scratch.f16_logits, self.d.vocab_size)?;
             generated.push(next_token);
             if next_token == self.d.eos_id { break; }
         }
-        let decode_elapsed = decode_start.elapsed();
-        let n_tokens = generated.len().saturating_sub(1).max(1);
-        eprintln!("\n  [perf] {} tokens in {:.1}ms = {:.2}ms/token",
-            n_tokens, decode_elapsed.as_secs_f64() * 1000.0,
-            decode_elapsed.as_secs_f64() * 1000.0 / n_tokens as f64);
 
         Ok(generated)
     }

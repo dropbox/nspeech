@@ -142,22 +142,15 @@ impl MoonshineModel {
         })?;
         let cfg: MoonshineConfig = serde_json::from_slice(cfg_bytes)?;
 
-        println!(
-            "Moonshine config: encoder_dim={}, decoder_dim={}, depth={}, vocab_size={}",
-            cfg.encoder_dim, cfg.decoder_dim, cfg.encoder_num_layers, cfg.vocab_size
-        );
 
         // Load tokenizer from embedded/file asset
         let tok_bytes = MOONSHINE_TOKENIZER.bytes(&assets).map_err(|_| {
             anyhow::anyhow!("failed to load Moonshine tokenizer from assets")
         })?;
         let tokenizer = match tokenizers::Tokenizer::from_bytes(tok_bytes) {
-            Ok(t) => {
-                println!("Loaded tokenizer from assets");
-                Some(t)
-            }
+            Ok(t) => Some(t),
             Err(e) => {
-                println!("Warning: Failed to load tokenizer: {}", e);
+                eprintln!("Warning: Failed to load tokenizer: {}", e);
                 None
             }
         };
@@ -173,7 +166,6 @@ impl MoonshineModel {
             device,
         )?;
 
-        println!("Building model (quantized weights stay in Q8_0 format)...");
 
         // Build model components
         let frontend = MoonshineFrontend::new(&cfg, vb.pp("model.encoder.embedder"))?;
@@ -196,18 +188,15 @@ impl MoonshineModel {
                 let backend = match MetalEncoderBackend::new(md) {
                     Ok(b) => b,
                     Err(e) => {
-                        println!("  Metal encoder backend unavailable: {e}");
+                        eprintln!("  Metal encoder backend unavailable: {e}");
                         return None;
                     }
                 };
                 // Max seq len: 2048 is generous for Moonshine encoder
                 match GpuEnc::new(backend, &cfg, vb.pp("model.encoder"), 2048) {
-                    Ok(enc) => {
-                        println!("  Triton encoder loaded");
-                        Some(enc)
-                    }
+                    Ok(enc) => Some(enc),
                     Err(e) => {
-                        println!("  Triton encoder unavailable: {e}");
+                        eprintln!("  Triton encoder unavailable: {e}");
                         None
                     }
                 }
@@ -219,17 +208,14 @@ impl MoonshineModel {
                     cfg.vocab_size, cfg.decoder_dim) {
                     Ok(b) => b,
                     Err(e) => {
-                        println!("  Metal backend unavailable: {e}");
+                        eprintln!("  Metal backend unavailable: {e}");
                         return None;
                     }
                 };
                 match GpuDec::new(backend, &cfg, vb.pp("model.decoder"), vb.pp("proj_out")) {
-                    Ok(dec) => {
-                        println!("  Triton Metal decoder loaded");
-                        Some(dec)
-                    }
+                    Ok(dec) => Some(dec),
                     Err(e) => {
-                        println!("  Triton Metal decoder unavailable: {e}");
+                        eprintln!("  Triton Metal decoder unavailable: {e}");
                         None
                     }
                 }
@@ -246,22 +232,18 @@ impl MoonshineModel {
                     let enc = {
                         use super::gpu_encoder_d3d12::D3D12EncoderBackend;
                         let use_fp16_acc = std::env::var("USE_FP16_ACC").map_or(false, |v| v == "1");
-                        println!("  Loading Triton DXIL kernels (fp16_acc={})...", use_fp16_acc);
                         match D3D12EncoderBackend::new(&gpu, use_fp16_acc, cfg.encoder_dim) {
                             Ok(backend) => {
                                 match GpuEnc::new(backend, &cfg, vb.pp("model.encoder"), 2048) {
-                                    Ok(enc) => {
-                                        println!("  Triton D3D12 encoder loaded");
-                                        Some(enc)
-                                    }
+                                    Ok(enc) => Some(enc),
                                     Err(e) => {
-                                        println!("  Triton D3D12 encoder unavailable: {e}");
+                                        eprintln!("  Triton D3D12 encoder unavailable: {e}");
                                         None
                                     }
                                 }
                             }
                             Err(e) => {
-                                println!("  D3D12 encoder backend unavailable: {e}");
+                                eprintln!("  D3D12 encoder backend unavailable: {e}");
                                 None
                             }
                         }
@@ -271,18 +253,15 @@ impl MoonshineModel {
                         match D3D12Backend::new(&gpu, cfg.vocab_size, cfg.decoder_dim) {
                             Ok(backend) => {
                                 match GpuDec::new(backend, &cfg, vb.pp("model.decoder"), vb.pp("proj_out")) {
-                                    Ok(dec) => {
-                                        println!("  Triton D3D12 decoder loaded");
-                                        Some(dec)
-                                    }
+                                    Ok(dec) => Some(dec),
                                     Err(e) => {
-                                        println!("  Triton D3D12 decoder unavailable: {e}");
+                                        eprintln!("  Triton D3D12 decoder unavailable: {e}");
                                         None
                                     }
                                 }
                             }
                             Err(e) => {
-                                println!("  D3D12 backend unavailable: {e}");
+                                eprintln!("  D3D12 backend unavailable: {e}");
                                 None
                             }
                         }
@@ -290,7 +269,7 @@ impl MoonshineModel {
                     (enc, dec)
                 }
                 Err(e) => {
-                    println!("  D3D12 GPU unavailable: {e}");
+                    eprintln!("  D3D12 GPU unavailable: {e}");
                     (None, None)
                 }
             }
@@ -356,21 +335,10 @@ impl MoonshineModel {
         let logits = self.proj_out.forward(&hidden)?;
 
         // Get first token
-        {
-            let l = logits.i((0, 0))?.to_device(&candle_core::Device::Cpu)?.to_vec1::<f32>()?;
-            let top5: Vec<(usize, f32)> = {
-                let mut indexed: Vec<(usize, f32)> = l.iter().copied().enumerate().collect();
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-                indexed.into_iter().take(5).collect()
-            };
-            eprintln!("  [cpu-dec] step0 logits first5={:.4?} top5={:?}", &l[..5], top5);
-        }
         let mut next_token = logits.i((0, 0))?.argmax(0)?.to_scalar::<u32>()?;
         generated.push(next_token);
-        eprint!("  [cpu-dec] tokens: {}", next_token);
 
         if next_token == self.cfg.eos_id as u32 {
-            eprintln!();
             return Ok(generated);
         }
 
@@ -380,25 +348,13 @@ impl MoonshineModel {
             let hidden = self.decoder.forward(&input_ids, encoder_hidden, &mut cache)?;
             let logits = self.proj_out.forward(&hidden)?;
 
-            if _step < 5 {
-                let l = logits.i((0, 0))?.to_device(&candle_core::Device::Cpu)?.to_vec1::<f32>()?;
-                let top5: Vec<(usize, f32)> = {
-                    let mut indexed: Vec<(usize, f32)> = l.iter().copied().enumerate().collect();
-                    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-                    indexed.into_iter().take(5).collect()
-                };
-                eprintln!("  [cpu-dec] step{} top5={:?}", _step + 1, top5);
-            }
-
             next_token = logits.i((0, 0))?.argmax(0)?.to_scalar::<u32>()?;
             generated.push(next_token);
-            eprint!(" {}", next_token);
 
             if next_token == self.cfg.eos_id as u32 {
                 break;
             }
         }
-        eprintln!();
 
         Ok(generated)
     }
@@ -729,21 +685,13 @@ impl MoonshineModel {
 
         let audio = Tensor::from_vec(padded, (1, audio_samples.len() + pad_len), device)?;
 
-        // Encode
-        let t_enc = std::time::Instant::now();
         let encoder_hidden = self.encode(&audio)?;
-        let enc_ms = t_enc.elapsed().as_millis();
 
         // Compute max tokens based on audio duration
         let duration_sec = audio_samples.len() as f64 / self.cfg.sample_rate as f64;
         let max_tokens = (duration_sec * 6.5).ceil() as usize + 10;
 
-        // Decode
-        let t_dec = std::time::Instant::now();
         let tokens = self.greedy_decode(&encoder_hidden, max_tokens)?;
-        let dec_ms = t_dec.elapsed().as_millis();
-        eprintln!("  Encoder: {enc_ms}ms, Decoder: {dec_ms}ms ({} tokens, {:.0}ms/token)",
-            tokens.len(), dec_ms as f64 / tokens.len().max(1) as f64);
 
         // Remove EOS token if present
         let tokens: Vec<u32> = tokens

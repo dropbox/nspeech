@@ -256,6 +256,21 @@ impl StreamingTranscriber {
         Ok(result)
     }
 
+    /// Discard all buffered audio and state without finalizing.
+    pub fn reset(&mut self) -> Result<()> {
+        self.current_segment.clear();
+        self.current_segment_start = None;
+        self.pre_buffer.clear();
+        self.in_speech = false;
+        self.silence_frames = 0;
+        self.last_partial_text.clear();
+        self.audio_buf.clear();
+        self.moonshine_stream.reset();
+        self.vad_stream.reset()?;
+        self.total_samples_processed = 0;
+        Ok(())
+    }
+
     /// Access the current segment index.
     pub fn segment_index(&self) -> u32 {
         self.segment_index

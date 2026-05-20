@@ -35,7 +35,6 @@ pub struct MetalBackend {
 impl MetalBackend {
     pub fn new(device: &MetalDevice, n_q_heads: usize, intermediate_size: usize,
                _vocab_size: usize, _decoder_dim: usize) -> Result<Self> {
-        println!("  Loading decoder Metal kernels...");
         let kernels = DecoderKernels::load(device)?;
         let encoder_kernels = TritonKernels::load(device)?;
 

@@ -65,6 +65,10 @@ speek:
 	cargo build --release $(BUILD_TARGET) --features $(FEATURES) --example speek
 	ln -sf $(BIN_DIR)/speek ./speek
 
+listen:
+	cargo build --release $(BUILD_TARGET) --features $(FEATURES) --example listen
+	ln -sf $(BIN_DIR)/listen ./listen
+
 speek-install: speek
 	mkdir -p ~/bin ~/.claude/skills/speek ~/.codex/skills/speek
 	ln -f $(realpath speek) ~/bin/speek
@@ -148,4 +152,4 @@ assets: assets/kokoro_q8_0.gguf assets/kokoro-config.json assets/kokoro-af_heart
 kernels:
 	cd kernels && python build.py
 
-.PHONY: build kokoro speek speek-install bench win deploy-win test-win bench-win module kernels assets
+.PHONY: build kokoro speek listen speek-install bench win deploy-win test-win bench-win module kernels assets

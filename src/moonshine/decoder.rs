@@ -550,8 +550,10 @@ impl MoonshineDecoder {
         let encoder_proj = if let Some(cached) = &cache.encoder_proj {
             cached.clone()
         } else {
+            let embed_device = self.pos_emb.embeddings().device().clone();
+            let encoder_hidden = encoder_hidden.to_device(&embed_device)?;
             let enc_len = encoder_hidden.dim(1)?;
-            let pos_ids = Tensor::arange(0u32, enc_len as u32, encoder_hidden.device())?;
+            let pos_ids = Tensor::arange(0u32, enc_len as u32, &embed_device)?;
             let pos_emb = self.pos_emb.forward(&pos_ids)?;
             let encoder_with_pos = encoder_hidden.broadcast_add(&pos_emb)?;
             let proj = if let Some(proj) = &self.proj {
