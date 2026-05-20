@@ -20,13 +20,31 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("listen: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let model_dir = args.get(1).map(|s| s.as_str()).unwrap_or("assets");
 
+    // Probe audio device first — fail fast before loading models
+    let host = cpal::default_host();
+    let input_device = host
+        .default_input_device()
+        .ok_or_else(|| anyhow::anyhow!("no microphone found — grant access in System Settings > Privacy > Microphone"))?;
+
+    let default_config = input_device.default_input_config()
+        .map_err(|e| anyhow::anyhow!("cannot access microphone ({e}) — grant access in System Settings > Privacy > Microphone"))?;
+    let native_rate = default_config.sample_rate().0;
+    let native_channels = default_config.channels();
+
+    // Load models
     let device = get_device()?;
     let assets = PathBuf::from(model_dir);
-
     let vad = SileroVad::load_from_gguf_mmap(&assets, &device)?;
     let vad_stream = VadStream::new(vad, &device)?;
     let model = MoonshineModel::load_from_gguf_mmap(model_dir, &device)?;
@@ -38,17 +56,7 @@ fn main() -> Result<()> {
         StreamingConfig::default(),
     );
 
-    // Set up audio input
-    let host = cpal::default_host();
-    let input_device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow::anyhow!("no input device — grant microphone access in System Settings"))?;
-
-    let default_config = input_device.default_input_config()
-        .map_err(|e| anyhow::anyhow!("microphone unavailable (grant access in System Settings): {e}"))?;
-    let native_rate = default_config.sample_rate().0;
-    let native_channels = default_config.channels();
-
+    // Start audio capture
     let config = cpal::StreamConfig {
         channels: native_channels,
         sample_rate: cpal::SampleRate(native_rate),
@@ -67,8 +75,9 @@ fn main() -> Result<()> {
         },
         |err| eprintln!("Audio error: {}", err),
         None,
-    )?;
-    stream.play()?;
+    ).map_err(|e| anyhow::anyhow!("cannot open microphone ({e}) — grant access in System Settings > Privacy > Microphone"))?;
+    stream.play()
+        .map_err(|e| anyhow::anyhow!("cannot start audio capture: {e}"))?;
 
     let resample_ratio = if need_resample {
         16000.0 / native_rate as f64
