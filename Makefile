@@ -66,11 +66,11 @@ speek:
 	ln -sf $(BIN_DIR)/speek ./speek
 
 speek-install: speek
-	mkdir -p ~/bin
+	mkdir -p ~/bin ~/.claude/skills/speek ~/.codex/skills/speek
 	ln -f $(realpath speek) ~/bin/speek
 	rm -f ~/.claude/skills/speek/skill.md ~/.codex/skills/speek/skill.md
-	cp skills/speek-claude/SKILL.md ~/.claude/skills/speek/SKILL.md
-	cp skills/speek-codex/SKILL.md ~/.codex/skills/speek/SKILL.md
+	cp skills/speek-claude/SKILL.md ~/.claude/skills/speek/.SKILL.md.tmp && mv ~/.claude/skills/speek/.SKILL.md.tmp ~/.claude/skills/speek/SKILL.md
+	cp skills/speek-codex/SKILL.md ~/.codex/skills/speek/.SKILL.md.tmp && mv ~/.codex/skills/speek/.SKILL.md.tmp ~/.codex/skills/speek/SKILL.md
 
 bench:
 	cargo build --release $(BUILD_TARGET) --features $(FEATURES) --example bench_triton_encoder
