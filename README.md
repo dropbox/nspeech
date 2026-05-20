@@ -1,272 +1,146 @@
-# Parakeet Speech Recognition - Rust Implementation
+# Speech
 
-Pure Rust implementation of NVIDIA Parakeet TDT (Transducer) ASR using Candle, with GGUF quantization support and Silero VAD integration.
+Pure Rust speech processing: ASR (speech-to-text) and TTS (text-to-speech) using the Candle deep learning framework. No Python dependencies at runtime.
+
+## Models
+
+| Model | Task | Parameters | Quantized Size |
+|-------|------|-----------|---------------|
+| **Parakeet TDT v3** | ASR (transducer, punctuation) | 600M | 620 MB |
+| **Moonshine V2** | ASR (streaming encoder-decoder) | 195M | 200 MB |
+| **Kokoro** | TTS (text-to-speech) | 82M | 85 MB |
+| **Silero VAD** | Voice activity detection | 1M | 194 KB |
+
+All models use GGUF Q8_0 quantization for compact storage with memory-mapped loading.
 
 ## Features
 
-- ✅ **Pure Rust** - No Python dependencies for inference
-- ✅ **GGUF Quantization** - Q8_0 format for smaller models and faster loading
-- ✅ **Silero VAD** - Intelligent speech detection with automatic segmentation
-- ✅ **Parakeet TDT v3** - State-of-the-art transducer model with punctuation
-- ✅ **Node.js Module** - Use from JavaScript/TypeScript applications
-- ✅ **Metal/GPU Support** - Hardware acceleration on macOS
-
-## What's Included
-
-**Models:**
-- **Parakeet TDT v3** - 600M parameter transducer model (620MB quantized)
-- **Silero VAD** - Voice activity detection (194KB quantized)
-
-**Examples:**
-- `transcribe_tdt_with_vad.rs` - VAD-based segmentation + TDT transcription
-
-**Tools:**
-- `quantize_vad_gguf.rs` - Quantize VAD model to GGUF Q8_0
-- `quantize_gguf.rs` - Quantize TDT model to GGUF Q8_0
-- `inspect_gguf.rs` - Inspect GGUF file contents
-
-**Python Scripts:**
-- `scripts/download_vad.py` - Download and quantize Silero VAD
-- `scripts/download_parakeet_tdt.py` - Download and quantize Parakeet TDT
-- `scripts/compress.py` - Compression utility
-
-## Prerequisites
-
-### System Requirements
-- Rust 1.70+ (install from [rustup.rs](https://rustup.rs))
-- Python 3.8+ with pip (only needed for downloading models)
-- ~800MB disk space for quantized models
-
-### Install Dependencies
-
-**macOS:**
-```bash
-brew install zstd  # For model compression
-```
-
-**Ubuntu/Debian:**
-```bash
-sudo apt install zstd python3-venv python3-pip
-```
-
-**Cargo dependencies are handled automatically**
+- Pure Rust inference with no Python runtime dependency
+- GGUF Q8_0 quantized models (memory-mapped, fast cold start)
+- Silero VAD for intelligent speech segmentation
+- GPU acceleration via Triton-compiled kernels (Metal on macOS, D3D12 on Windows)
+- CPU-optimized path with fbgemm packed GEMM (Linux/x86)
+- Node.js native module (NAPI bindings)
+- Streaming ASR with Moonshine V2
+- VAD-based chunking for arbitrarily long audio files
 
 ## Quick Start
 
-**Complete setup in 3 commands:**
+### 1. Prepare Models
 
 ```bash
-# 1. Install Python dependencies
-pip install huggingface_hub safetensors torch zstd
+pip install huggingface_hub safetensors torch pyyaml sentencepiece tokenizers misaki
 
-# 2. Download and setup both models (~800MB total)
-python scripts/download_vad.py
-python scripts/download_parakeet_tdt.py
+# Download, quantize, and install all models to assets/
+make assets
+```
 
-# 3. Run transcription with VAD
+This downloads weights from HuggingFace, runs the Rust quantizers (GGUF Q8_0), and places everything in `assets/`. Each model is idempotent — existing files are skipped.
+
+### 2. Build and Run
+
+```bash
+# Transcribe with Parakeet TDT + VAD segmentation
 cargo run --example transcribe_tdt_with_vad --release -- audio.wav
+
+# Transcribe with Moonshine V2 + VAD
+cargo run --example transcribe_moonshine_with_vad --release -- audio.wav
+
+# Streaming transcription (Moonshine)
+cargo run --example transcribe_moonshine_streaming --release -- audio.wav
+
+# Text-to-speech (Kokoro)
+cargo run --example synthesize_kokoro --release -- "Hello world" output.wav
 ```
 
-**Example output:**
-```
-Loading Silero VAD...
-✓ VAD loaded
+### 3. The `speek` CLI
 
-Loading Parakeet TDT model...
-✓ TDT model loaded
+A single binary combining TTS + audio playback:
 
-=== STREAMING TRANSCRIPTION ===
-
-[Segment 1] Transcribing 0.00s - 35.33s (final)
-  Text: Of course, it was impossible to connect the dots looking forward...
-
-✓ Quality matches baseline!
+```bash
+make speek
+echo "Hello from the GPU" | ./speek
 ```
 
-## Node.js Usage
+## Building
 
-The Rust library is exported as a Node.js native module using NAPI:
+The Makefile auto-detects platform and selects appropriate features:
+
+```bash
+make build          # Build Kokoro TTS (default target)
+make speek          # Build the speek CLI
+make module         # Build Node.js native module
+make bench          # Build and run encoder benchmark
+make win            # Cross-compile for Windows (D3D12)
+```
+
+### Feature Flags
+
+| Feature | Description |
+|---------|-------------|
+| `triton-metal` | Triton-compiled Metal GPU kernels (macOS) |
+| `triton-d3d12` | Triton-compiled HLSL kernels (Windows D3D12) |
+| `fbgemm-bf16` | CPU-optimized bf16 packed GEMM (Linux default) |
+| `fast-cpu` | Pre-dequantize to F32 + BLAS with rayon parallelism |
+| `use-moonshine` | NAPI binding uses Moonshine instead of Parakeet |
+| `auto-transcribe-on-pause` | Auto-transcribe when silence detected in stream |
+| `embed-assets` | Bake model assets into the binary |
+
+Platform defaults (set by Makefile):
+- **Apple Silicon**: `triton-metal`
+- **Intel Mac**: `triton-metal`
+- **Linux**: `fbgemm-bf16`
+- **Windows**: `triton-d3d12`
+
+### Manual Build
+
+```bash
+# macOS with Metal GPU
+cargo build --release --features triton-metal --example transcribe_tdt_with_vad
+
+# Linux CPU
+cargo build --release --features fbgemm-bf16 --example transcribe_moonshine_with_vad
+
+# Force CPU at runtime
+PARAKEET_DEVICE=cpu cargo run --example transcribe_tdt_with_vad --release -- audio.wav
+```
+
+## Node.js Module
+
+The library exports NAPI bindings for use from JavaScript/TypeScript:
 
 ```javascript
 const { Speech, setLogCallback } = require('./index.node');
 
-// Optional: capture logs
-setLogCallback((level, message) => {
-  console.log(`[${level}] ${message}`);
-});
-
-// Create transcriber (loads models on first use)
 const transcriber = new Speech('assets', (transcription) => {
-  console.log('Transcription:', transcription.text);
-  console.log('Timestamp:', transcription.start_time, '-', transcription.end_time);
+  console.log(transcription.text);
 });
 
-// Feed audio samples (16kHz, mono, float32 in range [-1, 1])
-const samples = new Float32Array(/* your audio data */);
-transcriber.input(samples);
-
-// Flush to get final transcription
+// Feed 16kHz mono float32 audio
+transcriber.input(new Float32Array(samples));
 transcriber.flush();
-
-// Shutdown when done
 transcriber.shutdown();
 ```
 
-**Building the Node module:**
+Build the module:
 ```bash
-cargo build --lib --release
+make module
 cp target/release/libspeech.dylib index.node  # macOS
-# or
-cp target/release/libspeech.so index.node  # Linux
 ```
 
-## Architecture
+## Audio Requirements
 
-### Quantization Approach
-
-See [QUANTIZATION.md](QUANTIZATION.md) for detailed explanation of quantized storage vs. quantized inference.
-
-**Summary:**
-- **Parakeet TDT**: Partial quantized inference (QLinear for encoder/joint, FP32 for LSTM)
-- **Silero VAD**: Quantized storage only (FP32 inference)
-
-Both models use GGUF Q8_0 format for storage, providing significant disk/download savings while maintaining quality.
-
-### Silero VAD Integration
-
-The VAD (Voice Activity Detection) automatically:
-1. Detects speech vs. silence in audio stream
-2. Segments audio at natural pauses
-3. Buffers context before speech starts
-4. Triggers transcription after silence threshold
-
-This approach:
-- ✅ Processes only speech (saves compute)
-- ✅ Natural segmentation at sentence boundaries
-- ✅ Handles long audio files efficiently
-- ✅ Provides timestamped output
-
-## Development
-
-### Project Structure
-
-```
-src/
-├── lib.rs              # Node.js module and main API
-├── silero.rs           # Silero VAD implementation
-└── parakeet/           # Parakeet TDT model
-    ├── mod.rs          # Module exports
-    ├── transducer.rs   # TDT model implementation
-    ├── fast_conformer.rs # Conformer encoder
-    ├── features.rs     # Audio feature extraction
-    ├── quantized_layers.rs # Quantized operations
-    └── quantized_builder.rs # Model builder
-
-examples/
-├── transcribe_tdt_with_vad.rs  # Main transcription example
-├── quantize_vad_gguf.rs        # VAD quantization tool
-├── quantize_gguf.rs            # TDT quantization tool
-└── inspect_gguf.rs             # GGUF inspection utility
-
-scripts/
-├── download_vad.py             # Download & quantize VAD
-├── download_parakeet_tdt.py    # Download & quantize TDT
-└── compress.py                 # Compression utility
-
-assets/
-├── vad16.config.json.zst       # VAD configuration
-├── vad16_q8_0.gguf.zst         # VAD quantized model (194KB)
-├── parakeet-tdt-config.json.zst
-├── parakeet-tdt-tokenizer.json.zst
-└── parakeet-tdt-model_q8_0.gguf.zst  # TDT quantized model (620MB)
-```
-
-### Building
-
-```bash
-# Library only (Node module)
-cargo build --lib --release
-
-# Example
-cargo build --example transcribe_tdt_with_vad --release
-
-# All (no warnings)
-cargo build --all --release
-```
-
-### Testing
-
-```bash
-# Test transcription
-cargo run --example transcribe_tdt_with_vad --release -- test.wav
-
-# Test Node module
-node test-load.js test.wav
-```
-
-## Model Details
-
-### Parakeet TDT v3
-- **Architecture**: FastConformer-RNNT transducer
-- **Parameters**: ~600M
-- **Quantized size**: 620MB (GGUF Q8_0)
-- **Features**: Built-in punctuation and capitalization
-- **Sample rate**: 16kHz
-- **Source**: `nvidia/parakeet-tdt-1.1b` (v3 checkpoint)
-
-### Silero VAD v4.0
-- **Architecture**: Conv1d + LSTM
-- **Parameters**: ~1M
-- **Quantized size**: 194KB (GGUF Q8_0)
-- **Sample rate**: 16kHz
-- **Chunk size**: 512 samples (32ms)
-- **Source**: `snakers4/silero-vad`
-
-## Performance
-
-### Quantization Results
-
-| Model | Original | Quantized (Q8_0) | Compression | Quality |
-|-------|----------|------------------|-------------|---------|
-| Parakeet TDT | 2.3 GB | 620 MB | 3.7x | Identical |
-| Silero VAD | 948 KB | 194 KB | 6.2x | Identical |
-
-### Runtime Performance
-- **RTF (Real-Time Factor)**: ~1.0 on Metal GPU (M1/M2)
-- **Memory**: ~1.5GB peak (TDT + VAD loaded)
-- **Latency**: Depends on VAD segmentation (typically 1-3s)
-
-## Troubleshooting
-
-### Metal GPU Errors
-If you see Metal-related errors, force CPU:
-```bash
-PARAKEET_DEVICE=cpu cargo run --example transcribe_tdt_with_vad --release -- audio.wav
-```
-
-### Missing Models
-Run the download scripts:
-```bash
-python scripts/download_vad.py
-python scripts/download_parakeet_tdt.py
-```
-
-### Audio Format
-Models expect:
-- 16kHz sample rate
+All models expect:
+- 16 kHz sample rate
 - Mono (single channel)
-- 16-bit PCM or float32 in [-1, 1]
+- 16-bit PCM WAV or float32 samples in [-1, 1]
 
 ## License
 
-This project uses:
-- **Candle** (Apache 2.0 / MIT)
-- **NVIDIA Parakeet** (CC-BY-4.0)
-- **Silero VAD** (MIT)
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE) for details.
 
-## References
-
-- [Parakeet Models](https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/asr/models.html)
-- [Silero VAD](https://github.com/snakers4/silero-vad)
-- [GGUF Format](https://github.com/ggerganov/ggml/blob/master/docs/gguf.md)
-- [Candle Framework](https://github.com/huggingface/candle)
+Model weights have their own licenses:
+- Parakeet TDT: CC-BY-4.0 (NVIDIA)
+- Moonshine V2: MIT (Useful Sensors)
+- Kokoro: Apache-2.0 (Hexgrad)
+- Silero VAD: MIT (Silero)

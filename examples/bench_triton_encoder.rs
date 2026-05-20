@@ -131,18 +131,24 @@ fn main() -> Result<()> {
     } // skip_candle
     // Drop Candle encoder before Triton encoder to free GPU memory
 
-    // ── Triton encoder ──
+    // ── GPU encoder ──
     #[cfg(feature = "triton-metal")]
     {
-        println!("\n--- Triton Encoder ---");
-        use speech::moonshine::triton_encoder::TritonEncoder;
+        println!("\n--- GPU Encoder (Metal) ---");
+        use speech::moonshine::gpu_encoder::GpuEncoder;
+        use speech::moonshine::gpu_encoder_metal::MetalEncoderBackend;
 
         let t0 = Instant::now();
-        let triton_encoder = TritonEncoder::new(&cfg, vb.pp("model.encoder"), &device)?;
+        let metal_device = match &device {
+            Device::Metal(md) => md,
+            _ => anyhow::bail!("triton-metal requires a Metal device"),
+        };
+        let backend = MetalEncoderBackend::new(metal_device)?;
+        let gpu_encoder = GpuEncoder::new(backend, &cfg, vb.pp("model.encoder"), seq_len)?;
         println!("  Load: {:.0}ms", t0.elapsed().as_millis());
 
         // Warmup
-        let _ = triton_encoder.forward(&features)?;
+        let _ = gpu_encoder.forward(&features)?;
         if let Device::Metal(md) = &device {
             md.wait_until_completed()?;
         }
@@ -151,7 +157,7 @@ fn main() -> Result<()> {
         let n_iters = 5;
         let t1 = Instant::now();
         for _ in 0..n_iters {
-            let _ = triton_encoder.forward(&features)?;
+            let _ = gpu_encoder.forward(&features)?;
         }
         if let Device::Metal(md) = &device {
             md.wait_until_completed()?;
@@ -161,7 +167,7 @@ fn main() -> Result<()> {
         println!("  {:.2}x realtime", elapsed / duration_sec);
 
         // Compare output against saved Candle reference
-        let triton_output = triton_encoder.forward(&features)?;
+        let triton_output = gpu_encoder.forward(&features)?;
         if let Device::Metal(md) = &device {
             md.wait_until_completed()?;
         }
@@ -170,10 +176,10 @@ fn main() -> Result<()> {
 
         if !ref_flat.is_empty() {
             let max_err = ref_flat.iter().zip(tri_flat.iter())
-                .map(|(a, b)| (a - b).abs())
+                .map(|(a, b): (&f32, &f32)| (a - b).abs())
                 .fold(0.0f32, f32::max);
             let mean_err = ref_flat.iter().zip(tri_flat.iter())
-                .map(|(a, b)| (a - b).abs())
+                .map(|(a, b): (&f32, &f32)| (a - b).abs())
                 .sum::<f32>() / ref_flat.len() as f32;
 
             println!("\n--- Comparison ---");
@@ -183,7 +189,7 @@ fn main() -> Result<()> {
     }
 
     #[cfg(not(feature = "triton-metal"))]
-    println!("\nTriton encoder not available. Build with --features triton-metal");
+    println!("\nGPU encoder not available. Build with --features triton-metal");
 
     Ok(())
 }

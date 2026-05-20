@@ -45,7 +45,7 @@ export RUSTFLAGS += $(RUSTFLAGS_EXTRA)
 # === Build targets ===
 
 build: assets
-	cargo build --release $(BUILD_TARGET) --features $(FEATURES) --example synthesize_kokoro
+	cargo build --release $(BUILD_TARGET) --features $(FEATURES) --examples
 
 kokoro: build
 	ln -sf $(BIN_DIR)/synthesize_kokoro ./synthesize_kokoro
@@ -117,7 +117,19 @@ assets/us_silver.json: hf_kokoro/us_silver.json
 
 hf_kokoro/config.json hf_kokoro/voices/af_heart.safetensors hf_kokoro/us_gold.json hf_kokoro/us_silver.json: hf_kokoro/kokoro-v1_0.pth
 
-assets: assets/kokoro_q8_0.gguf assets/kokoro-config.json assets/kokoro-af_heart.safetensors assets/us_gold.json assets/us_silver.json
+# Download and quantize Moonshine V2 → assets/
+assets/moonshine_q8_0.gguf:
+	python scripts/prepare_moonshine.py
+
+# Download and quantize Parakeet TDT → assets/
+assets/parakeet-tdt-model_q8_0.gguf:
+	python scripts/download_parakeet_tdt.py
+
+# Download and quantize Silero VAD → assets/
+assets/vad16_q8_0.gguf:
+	python scripts/download_vad.py
+
+assets: assets/kokoro_q8_0.gguf assets/kokoro-config.json assets/kokoro-af_heart.safetensors assets/us_gold.json assets/us_silver.json assets/moonshine_q8_0.gguf assets/parakeet-tdt-model_q8_0.gguf assets/vad16_q8_0.gguf
 
 # Kernel compilation (Triton → Metal/DXIL)
 kernels:

@@ -4,7 +4,9 @@
 ///   bench_triton_d3d12.exe dots.wav [assets_dir]
 
 use anyhow::Result;
-use candle_core::{DType, Device, Tensor};
+#[cfg(feature = "triton-d3d12")]
+use candle_core::DType;
+use candle_core::{Device, Tensor};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -80,7 +82,7 @@ fn main() -> Result<()> {
     let (_, seq_len, enc_dim) = features.dims3()?;
     println!("Frontend: [1, {seq_len}, {enc_dim}] in {:.0}ms\n", t0.elapsed().as_millis());
 
-    // Helper to compare two flat vectors
+    #[allow(dead_code)]
     fn compare_vecs(name: &str, cpu: &[f32], gpu: &[f32]) {
         let n = cpu.len().min(gpu.len());
         let mut max_diff = 0.0f32;
