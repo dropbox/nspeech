@@ -24,20 +24,20 @@ All models use GGUF Q8_0 quantization for compact storage with memory-mapped loa
 - Streaming ASR with Moonshine V2
 - VAD-based chunking for arbitrarily long audio files
 
+## Prerequisites
+
+- Rust toolchain ([rustup.rs](https://rustup.rs))
+- [uv](https://docs.astral.sh/uv/) (Python package manager)
+
 ## Quick Start
 
-### 1. Prepare Models
-
 ```bash
-pip install huggingface_hub safetensors torch pyyaml sentencepiece tokenizers misaki
-
-# Download, quantize, and install all models to assets/
-make assets
+make build
 ```
 
-This downloads weights from HuggingFace, runs the Rust quantizers (GGUF Q8_0), and places everything in `assets/`. Each model is idempotent — existing files are skipped.
+This creates a Python venv via uv, installs dependencies, downloads model weights from HuggingFace, runs the Rust quantizers (GGUF Q8_0), and builds all examples. Each step is idempotent.
 
-### 2. Build and Run
+### Usage
 
 ```bash
 # Transcribe with Parakeet TDT + VAD segmentation
@@ -53,21 +53,30 @@ cargo run --example transcribe_moonshine_streaming --release -- audio.wav
 cargo run --example synthesize_kokoro --release -- "Hello world" output.wav
 ```
 
-### 3. The `speek` CLI
+### The `speek` CLI
 
 A single binary combining TTS + audio playback:
 
 ```bash
 make speek
 echo "Hello from the GPU" | ./speek
+speek "Ninety five point three percent accuracy"
 ```
+
+Install to `~/bin` and register AI coding assistant skills:
+
+```bash
+make speek-install
+```
+
+This installs skills for Claude Code and Codex that cause them to proactively speak a one-sentence summary aloud at the end of each completed task.
 
 ## Building
 
 The Makefile auto-detects platform and selects appropriate features:
 
 ```bash
-make build          # Build Kokoro TTS (default target)
+make build          # Download models + build all examples (default)
 make speek          # Build the speek CLI
 make module         # Build Node.js native module
 make bench          # Build and run encoder benchmark
@@ -127,6 +136,18 @@ Build the module:
 make module
 cp target/release/libspeech.dylib index.node  # macOS
 ```
+
+## GPU Kernels
+
+The `triton-metal` and `triton-d3d12` features use pre-compiled GPU kernels (Metal AIR / DXIL bytecode) that are checked into the repo under `kernels/out/*.tar.zst`. These are embedded into the binary at build time — no runtime kernel compilation occurs.
+
+The kernels are compiled from Triton Python sources (`kernels/*.py`) using a custom Triton compiler fork that targets Metal and D3D12. This compiler is not publicly available. If you need to modify the kernels, you can:
+
+1. Edit the Triton Python sources in `kernels/`
+2. Compile with `cd kernels && python build.py` (requires the Triton venv with the custom fork)
+3. The build system detects if the venv is missing and falls back to pre-built archives
+
+For users without the custom compiler, the pre-built kernel archives work out of the box on all supported hardware. The `fbgemm-bf16` feature (Linux default) uses CPU-only code paths and does not require GPU kernels.
 
 ## Audio Requirements
 

@@ -42,6 +42,15 @@ endif
 
 export RUSTFLAGS += $(RUSTFLAGS_EXTRA)
 
+# === Python environment ===
+
+env/pyvenv.cfg:
+	uv venv env
+
+env/.requirements.stamp: env/pyvenv.cfg requirements.txt
+	(source env/*/activate && uv pip install -r requirements.txt)
+	touch env/.requirements.stamp
+
 # === Build targets ===
 
 build: assets
@@ -89,15 +98,17 @@ bench-win: deploy-win
 module:
 	cargo build --release $(BUILD_TARGET) --lib --features $(FEATURES)
 
+# === Model assets ===
+
 # Download and quantize Kokoro TTS model → assets/
 assets/kokoro_q8_0.gguf: hf_kokoro/kokoro-v1_0.safetensors
 	cargo run -p quantize-kokoro --release
 
 hf_kokoro/kokoro-v1_0.safetensors: hf_kokoro/kokoro-v1_0.pth
-	python scripts/convert_kokoro_safetensors.py
+	(source env/*/activate && python scripts/convert_kokoro_safetensors.py)
 
-hf_kokoro/kokoro-v1_0.pth:
-	python scripts/download_kokoro.py
+hf_kokoro/kokoro-v1_0.pth: env/.requirements.stamp
+	(source env/*/activate && python scripts/download_kokoro.py)
 
 assets/kokoro-config.json: hf_kokoro/config.json
 	@mkdir -p assets
@@ -118,16 +129,16 @@ assets/us_silver.json: hf_kokoro/us_silver.json
 hf_kokoro/config.json hf_kokoro/voices/af_heart.safetensors hf_kokoro/us_gold.json hf_kokoro/us_silver.json: hf_kokoro/kokoro-v1_0.pth
 
 # Download and quantize Moonshine V2 → assets/
-assets/moonshine_q8_0.gguf:
-	python scripts/prepare_moonshine.py
+assets/moonshine_q8_0.gguf: env/.requirements.stamp
+	(source env/*/activate && python scripts/prepare_moonshine.py)
 
 # Download and quantize Parakeet TDT → assets/
-assets/parakeet-tdt-model_q8_0.gguf:
-	python scripts/download_parakeet_tdt.py
+assets/parakeet-tdt-model_q8_0.gguf: env/.requirements.stamp
+	(source env/*/activate && python scripts/download_parakeet_tdt.py)
 
 # Download and quantize Silero VAD → assets/
-assets/vad16_q8_0.gguf:
-	python scripts/download_vad.py
+assets/vad16_q8_0.gguf: env/.requirements.stamp
+	(source env/*/activate && python scripts/download_vad.py)
 
 assets: assets/kokoro_q8_0.gguf assets/kokoro-config.json assets/kokoro-af_heart.safetensors assets/us_gold.json assets/us_silver.json assets/moonshine_q8_0.gguf assets/parakeet-tdt-model_q8_0.gguf assets/vad16_q8_0.gguf
 
