@@ -1,6 +1,6 @@
-# Speech
+# nspeech: Native Speech processing on local GPU in Rust
 
-Pure Rust speech processing: ASR (speech-to-text) and TTS (text-to-speech) using the Candle deep learning framework. No Python dependencies at runtime.
+Pure Rust speech processing: ASR (speech-to-text) and TTS (text-to-speech) with hardware GPU acceleration on macOS (Metal) and Windows (D3D12). Built on the Candle deep learning framework with no Python dependencies at runtime.
 
 ## Models
 
@@ -15,14 +15,14 @@ All models use GGUF Q8_0 quantization for compact storage with memory-mapped loa
 
 ## Features
 
-- Pure Rust inference with no Python runtime dependency
+- **Metal GPU** (macOS) and **D3D12 GPU** (Windows) acceleration via Triton-compiled kernels
+- CPU-optimized fallback with fbgemm packed GEMM (Linux/x86)
+- Pure Rust inference — no Python, CUDA, or ONNX runtime needed
 - GGUF Q8_0 quantized models (memory-mapped, fast cold start)
 - Silero VAD for intelligent speech segmentation
-- GPU acceleration via Triton-compiled kernels (Metal on macOS, D3D12 on Windows)
-- CPU-optimized path with fbgemm packed GEMM (Linux/x86)
-- Node.js native module (NAPI bindings)
 - Streaming ASR with Moonshine V2
 - VAD-based chunking for arbitrarily long audio files
+- Node.js native module (NAPI bindings)
 
 ## Prerequisites
 
@@ -141,20 +141,17 @@ cp target/release/libspeech.dylib index.node  # macOS
 
 The `triton-metal` and `triton-d3d12` features use pre-compiled GPU kernels (Metal AIR / DXIL bytecode) that are checked into the repo under `kernels/out/*.tar.zst`. These are embedded into the binary at build time — no runtime kernel compilation occurs.
 
-The kernels are compiled from Triton Python sources (`kernels/*.py`) using a custom Triton compiler fork that targets Metal and D3D12. This compiler is not publicly available. If you need to modify the kernels, you can:
-
-1. Edit the Triton Python sources in `kernels/`
-2. Compile with `cd kernels && python build.py` (requires the Triton venv with the custom fork)
-3. The build system detects if the venv is missing and falls back to pre-built archives
-
-For users without the custom compiler, the pre-built kernel archives work out of the box on all supported hardware. The `fbgemm-bf16` feature (Linux default) uses CPU-only code paths and does not require GPU kernels.
+The kernels are compiled from Triton Python sources (`kernels/*.py`) using a custom Triton compiler fork that targets Metal and D3D12, as well as the appropriate shader compiler for each hardware platform ("xcrun metal" for MacOS and "dxc" for Windows.
+Our Triton compiler-backed is not yet publicly available, but we expect it to be in the near future. We currently do not include iOS kernels, but expect this to be a fairly trivial change, please file an issue on interest.
 
 ## Audio Requirements
 
-All models expect:
+ASR models expect:
 - 16 kHz sample rate
 - Mono (single channel)
 - 16-bit PCM WAV or float32 samples in [-1, 1]
+
+Kokoro TTS produces 24 kHz mono output
 
 ## License
 
