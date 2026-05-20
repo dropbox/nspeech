@@ -42,6 +42,8 @@ endif
 
 export RUSTFLAGS += $(RUSTFLAGS_EXTRA)
 
+.DEFAULT_GOAL := build
+
 # === Python environment ===
 
 env/pyvenv.cfg:
