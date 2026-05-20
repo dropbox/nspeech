@@ -114,10 +114,13 @@ impl Phonemizer {
             return (ipa_parts.join(" "), any_spelled);
         }
 
-        // All-uppercase: check dictionary first (NASA), else spell out
+        // All-uppercase: short (2-3 chars) always spell out as acronym,
+        // longer ones check dictionary first (e.g. NASA)
         if word.len() > 1 && word.chars().all(|c| c.is_ascii_uppercase()) {
-            if let Some(ipa) = self.dict.get(&lower) {
-                return (ipa.clone(), false);
+            if word.len() > 3 {
+                if let Some(ipa) = self.dict.get(&lower) {
+                    return (ipa.clone(), false);
+                }
             }
             return (spell_out(word), true);
         }
