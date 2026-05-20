@@ -421,7 +421,33 @@ fn normalize_text(text: &str) -> String {
                         break;
                     }
                 }
-                out.push_str(&number_to_words(&num_str));
+                // Check for decimal point followed by more digits
+                if chars.peek() == Some(&'.') {
+                    let mut lookahead = chars.clone();
+                    lookahead.next(); // consume '.'
+                    if lookahead.peek().is_some_and(|c| c.is_ascii_digit()) {
+                        chars.next(); // consume '.'
+                        let mut frac_str = String::new();
+                        while let Some(&next) = chars.peek() {
+                            if next.is_ascii_digit() {
+                                frac_str.push(next);
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
+                        out.push_str(&number_to_words(&num_str));
+                        out.push_str(" point");
+                        for d in frac_str.chars() {
+                            out.push(' ');
+                            out.push_str(&number_to_words(&d.to_string()));
+                        }
+                    } else {
+                        out.push_str(&number_to_words(&num_str));
+                    }
+                } else {
+                    out.push_str(&number_to_words(&num_str));
+                }
             }
             _ => out.push(ch),
         }
