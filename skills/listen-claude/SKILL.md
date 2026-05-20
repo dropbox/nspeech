@@ -15,15 +15,17 @@ Transcribe speech from the microphone using the `listen` command (GPU-accelerate
 
 ## Usage
 
-```bash
-listen
+This command requires microphone access and cannot run inside the sandbox.
+Ask the user to run it from the CLI prompt with `!`:
+
+```
+! listen
 ```
 
 The user speaks, sees their words in yellow on the terminal, then presses ENTER to emit the final text to stdout and exit. ESC clears the buffer, ESC on empty quits without output.
 
 ## Guidelines
 
-- Capture the output: `text=$(listen)` to use the transcription in further processing
+- Always tell the user to run `! listen` — do NOT call it via Bash (sandbox blocks mic access)
 - The command blocks until the user presses ENTER or ESC
-- Do not run in background — you need the stdout result
 - Model loads on first invocation (~1s warmup)

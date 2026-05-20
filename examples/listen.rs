@@ -42,9 +42,10 @@ fn main() -> Result<()> {
     let host = cpal::default_host();
     let input_device = host
         .default_input_device()
-        .ok_or_else(|| anyhow::anyhow!("no input device found"))?;
+        .ok_or_else(|| anyhow::anyhow!("no input device — grant microphone access in System Settings"))?;
 
-    let default_config = input_device.default_input_config()?;
+    let default_config = input_device.default_input_config()
+        .map_err(|e| anyhow::anyhow!("microphone unavailable (grant access in System Settings): {e}"))?;
     let native_rate = default_config.sample_rate().0;
     let native_channels = default_config.channels();
 
