@@ -78,7 +78,11 @@ impl Phonemizer {
                     }
                 }
                 Segment::Punct(ch) => {
-                    result.push(*ch);
+                    match ch {
+                        '%' => result.push_str("pəɹsˈɛnt"),
+                        '\u{00B7}' => result.push_str("pˈYnt"),
+                        _ => result.push(*ch),
+                    }
                 }
                 Segment::Space => {
                     if !result.is_empty() && !result.ends_with(' ') {
@@ -437,22 +441,98 @@ fn normalize_text(text: &str) -> String {
                             }
                         }
                         out.push_str(&number_to_words(&num_str));
-                        out.push_str(" point");
-                        for d in frac_str.chars() {
-                            out.push(' ');
-                            out.push_str(&number_to_words(&d.to_string()));
-                        }
+                        out.push('\u{00B7}'); // middle dot as decimal point marker
+                        let frac_words: Vec<String> = frac_str.chars()
+                            .map(|d| number_to_words(&d.to_string()))
+                            .collect();
+                        out.push_str(&frac_words.join(" "));
                     } else {
                         out.push_str(&number_to_words(&num_str));
                     }
                 } else {
                     out.push_str(&number_to_words(&num_str));
                 }
+                // Expand trailing unit suffixes
+                if let Some(suffix) = consume_unit_suffix(&mut chars) {
+                    out.push_str(&suffix);
+                }
             }
             _ => out.push(ch),
         }
     }
     out
+}
+
+fn consume_unit_suffix(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<String> {
+    let next = *chars.peek()?;
+    match next {
+        '%' => { chars.next(); Some("%".into()) }
+        'k' | 'K' => {
+            chars.next();
+            Some(expand_data_unit(chars, "kilo", "K").into())
+        }
+        'M' => {
+            chars.next();
+            Some(expand_data_unit(chars, "mega", "mega").into())
+        }
+        'G' => {
+            chars.next();
+            Some(expand_data_unit(chars, "giga", "giga").into())
+        }
+        'T' => {
+            chars.next();
+            Some(expand_data_unit(chars, "tera", "tera").into())
+        }
+        'm' => {
+            let mut lookahead = chars.clone();
+            lookahead.next();
+            if lookahead.peek() == Some(&'s') {
+                chars.next(); chars.next();
+                Some(" milliseconds".into())
+            } else {
+                None
+            }
+        }
+        'H' => {
+            let mut lookahead = chars.clone();
+            lookahead.next();
+            if lookahead.peek() == Some(&'z') {
+                chars.next(); chars.next();
+                Some(" hertz".into())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn expand_data_unit(chars: &mut std::iter::Peekable<std::str::Chars>, prefix: &str, bare: &str) -> String {
+    let unit = match chars.peek() {
+        Some(&'B') => { chars.next(); format!(" {prefix}byte") }
+        Some(&'b') => { chars.next(); format!(" {prefix}bit") }
+        Some(&'H') => {
+            let mut lookahead = chars.clone();
+            lookahead.next();
+            if lookahead.peek() == Some(&'z') {
+                chars.next(); chars.next();
+                return format!(" {prefix}hertz");
+            } else {
+                return format!(" {bare}");
+            }
+        }
+        _ => return format!(" {bare}"),
+    };
+    // Check for /s (per second) rate suffix
+    if chars.peek() == Some(&'/') {
+        let mut lookahead = chars.clone();
+        lookahead.next();
+        if lookahead.peek() == Some(&'s') {
+            chars.next(); chars.next();
+            return format!("{unit}s per second");
+        }
+    }
+    format!("{unit}s")
 }
 
 fn number_to_words(s: &str) -> String {
