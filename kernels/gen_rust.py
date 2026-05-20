@@ -107,7 +107,7 @@ def gen_metal(metadata, metal_kernels):
     lines.append("        let device = metal_device.device();")
     lines.append("")
     lines.append("        let load = |name: &str, func_name: &str| -> Result<ComputePipeline> {")
-    lines.append("            eprint!(\"    {name}...\");")
+
     lines.append("            let data = kernel_data::load_kernel(name)")
     lines.append("                .ok_or_else(|| anyhow::anyhow!(\"No embedded kernel for {name}\"))?;")
     lines.append("            let lib = device.new_library_with_data(&data)")
@@ -118,7 +118,7 @@ def gen_metal(metadata, metal_kernels):
     lines.append("            let pipeline = device")
     lines.append("                .new_compute_pipeline_state_with_function(&func)")
     lines.append("                .map_err(|e| anyhow::anyhow!(\"Pipeline failed for {name}: {e}\"))?;")
-    lines.append("            eprintln!(\" ok (max_threads={})\", pipeline.max_total_threads_per_threadgroup());")
+
     lines.append("            Ok(pipeline)")
     lines.append("        };")
     lines.append("")
@@ -163,7 +163,7 @@ def gen_metal(metadata, metal_kernels):
     lines.append("        let device = metal_device.device();")
     lines.append("")
     lines.append("        let load = |name: &str, func_name: &str| -> Result<ComputePipeline> {")
-    lines.append("            eprint!(\"    {name}...\");")
+
     lines.append("            let data = kernel_data::load_kernel(name)")
     lines.append("                .ok_or_else(|| anyhow::anyhow!(\"No embedded kernel for {name}\"))?;")
     lines.append("            let lib = device.new_library_with_data(&data)")
@@ -174,7 +174,7 @@ def gen_metal(metadata, metal_kernels):
     lines.append("            let pipeline = device")
     lines.append("                .new_compute_pipeline_state_with_function(&func)")
     lines.append("                .map_err(|e| anyhow::anyhow!(\"Pipeline failed for {name}: {e}\"))?;")
-    lines.append("            eprintln!(\" ok (max_threads={})\", pipeline.max_total_threads_per_threadgroup());")
+
     lines.append("            Ok(pipeline)")
     lines.append("        };")
     lines.append("")

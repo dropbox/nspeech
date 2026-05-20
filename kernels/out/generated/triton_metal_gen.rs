@@ -41,7 +41,6 @@ impl TritonKernels {
         let device = metal_device.device();
 
         let load = |name: &str, func_name: &str| -> Result<ComputePipeline> {
-            eprint!("    {name}...");
             let data = kernel_data::load_kernel(name)
                 .ok_or_else(|| anyhow::anyhow!("No embedded kernel for {name}"))?;
             let lib = device.new_library_with_data(&data)
@@ -52,7 +51,6 @@ impl TritonKernels {
             let pipeline = device
                 .new_compute_pipeline_state_with_function(&func)
                 .map_err(|e| anyhow::anyhow!("Pipeline failed for {name}: {e}"))?;
-            eprintln!(" ok (max_threads={})", pipeline.max_total_threads_per_threadgroup());
             Ok(pipeline)
         };
 
@@ -138,7 +136,6 @@ impl DecoderKernels {
         let device = metal_device.device();
 
         let load = |name: &str, func_name: &str| -> Result<ComputePipeline> {
-            eprint!("    {name}...");
             let data = kernel_data::load_kernel(name)
                 .ok_or_else(|| anyhow::anyhow!("No embedded kernel for {name}"))?;
             let lib = device.new_library_with_data(&data)
@@ -149,7 +146,6 @@ impl DecoderKernels {
             let pipeline = device
                 .new_compute_pipeline_state_with_function(&func)
                 .map_err(|e| anyhow::anyhow!("Pipeline failed for {name}: {e}"))?;
-            eprintln!(" ok (max_threads={})", pipeline.max_total_threads_per_threadgroup());
             Ok(pipeline)
         };
 
