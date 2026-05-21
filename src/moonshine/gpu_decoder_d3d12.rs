@@ -22,7 +22,6 @@ pub struct D3D12Backend {
 
 impl D3D12Backend {
     pub fn new(gpu: &Arc<Gpu>, vocab_size: usize, dim: usize) -> Result<Self> {
-        println!("  Loading decoder DXIL kernels...");
         let kernels = D3D12DecoderKernels::load(gpu)?;
         let logits_readback = gpu.create_readback_buffer((vocab_size * 2) as u64)
             .map_err(|e| anyhow::anyhow!("create readback: {e}"))?;
