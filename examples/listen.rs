@@ -18,7 +18,7 @@ use speech::streaming::{StreamingConfig, StreamingTranscriber};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn main() {
     if let Err(e) = run() {
@@ -39,10 +39,10 @@ fn run() -> Result<()> {
     let host = cpal::default_host();
     let input_device = host
         .default_input_device()
-        .ok_or_else(|| anyhow::anyhow!("no microphone found — grant access in System Settings > Privacy > Microphone"))?;
+        .ok_or_else(|| anyhow::anyhow!("no microphone found — check audio input settings"))?;
 
     let default_config = input_device.default_input_config()
-        .map_err(|e| anyhow::anyhow!("cannot access microphone ({e}) — grant access in System Settings > Privacy > Microphone"))?;
+        .map_err(|e| anyhow::anyhow!("cannot access microphone ({e}) — check audio privacy settings"))?;
     let native_rate = default_config.sample_rate().0;
     let native_channels = default_config.channels();
 
@@ -79,7 +79,7 @@ fn run() -> Result<()> {
         },
         |err| eprintln!("Audio error: {}", err),
         None,
-    ).map_err(|e| anyhow::anyhow!("cannot open microphone ({e}) — grant access in System Settings > Privacy > Microphone"))?;
+    ).map_err(|e| anyhow::anyhow!("cannot open microphone ({e}) — check audio privacy settings"))?;
     stream.play()
         .map_err(|e| anyhow::anyhow!("cannot start audio capture: {e}"))?;
 
@@ -99,6 +99,9 @@ fn run() -> Result<()> {
     let mut audio_buf: Vec<f32> = Vec::new();
     let mut text_buf = String::new();
     let mut partial = String::new();
+    let start = Instant::now();
+    let mut total_samples: usize = 0;
+    let mut any_nonzero = false;
 
     let output = loop {
         // Check for key events
@@ -162,7 +165,18 @@ fn run() -> Result<()> {
         }
 
         if audio_buf.is_empty() {
+            if !any_nonzero && total_samples > 32000 && start.elapsed() > Duration::from_secs(2) {
+                eprint!("\r\x1b[K");
+                anyhow::bail!("microphone is silent — check audio privacy settings");
+            }
             continue;
+        }
+
+        if !any_nonzero {
+            total_samples += audio_buf.len();
+            if audio_buf.iter().any(|&s| s != 0.0) {
+                any_nonzero = true;
+            }
         }
 
         // Feed audio to transcriber
