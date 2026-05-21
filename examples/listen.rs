@@ -31,7 +31,11 @@ fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let model_dir = args.get(1).map(|s| s.as_str()).unwrap_or("assets");
 
-    // Probe audio device first — fail fast before loading models
+    // Probe terminal and audio device first — fail fast before loading models
+    terminal::enable_raw_mode()
+        .map_err(|e| anyhow::anyhow!("terminal unavailable ({e}) — must run in an interactive terminal"))?;
+    let _ = terminal::disable_raw_mode();
+
     let host = cpal::default_host();
     let input_device = host
         .default_input_device()

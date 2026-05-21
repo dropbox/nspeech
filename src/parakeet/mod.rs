@@ -311,17 +311,42 @@ pub fn get_device() -> Result<Device> {
         return Ok(Device::Cpu);
     }
 
-    // Metal on Apple Silicon — Candle's Metal kernels are fast here.
-    // On Intel Macs, Candle Metal is slow; CPU + fbgemm is better.
-    // Triton encoder/decoder create their own Metal device internally.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        // catch_unwind: candle panics if no Metal devices exist (e.g. sandbox)
-        let result = std::panic::catch_unwind(|| Device::new_metal(0));
-        if let Ok(Ok(device)) = result {
-            return Ok(device);
+        if metal_devices_available() {
+            let result = std::panic::catch_unwind(|| Device::new_metal(0));
+            if let Ok(Ok(device)) = result {
+                return Ok(device);
+            }
         }
     }
 
     Ok(Device::Cpu)
+}
+
+/// Check if any Metal GPU devices are accessible (false inside sandboxes that deny iokit-open).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn metal_devices_available() -> bool {
+    #[link(name = "Metal", kind = "framework")]
+    unsafe extern "C" {
+        fn MTLCopyAllDevices() -> *const std::ffi::c_void;
+    }
+    #[link(name = "Foundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRelease(cf: *const std::ffi::c_void);
+    }
+    // CFArray count
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFArrayGetCount(arr: *const std::ffi::c_void) -> isize;
+    }
+    unsafe {
+        let arr = MTLCopyAllDevices();
+        if arr.is_null() {
+            return false;
+        }
+        let count = CFArrayGetCount(arr);
+        CFRelease(arr);
+        count > 0
+    }
 }

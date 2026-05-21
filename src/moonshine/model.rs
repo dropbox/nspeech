@@ -173,13 +173,7 @@ impl MoonshineModel {
 
         #[cfg(feature = "triton-metal")]
         let (gpu_encoder, gpu_decoder): (Option<GpuEnc>, Option<GpuDec>) = {
-            // Get the Metal device
-            let metal_candle_dev = match device {
-                Device::Metal(_) => device.clone(),
-                _ => Device::new_metal(0)
-                    .unwrap_or_else(|_| device.clone()),
-            };
-            let metal_dev: Option<candle_core::MetalDevice> = match &metal_candle_dev {
+            let metal_dev: Option<candle_core::MetalDevice> = match device {
                 Device::Metal(md) => Some(md.clone()),
                 _ => None,
             };
