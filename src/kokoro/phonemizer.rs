@@ -61,21 +61,14 @@ impl Phonemizer {
         let normalized = normalize_text(text);
         let segments = split_segments(&normalized);
 
-        for (idx, segment) in segments.iter().enumerate() {
+        for segment in &segments {
             match segment {
                 Segment::Word(w) => {
                     if !result.is_empty() && !result.ends_with(' ') {
                         result.push(' ');
                     }
-                    let (ipa, is_acronym) = self.word_to_ipa_tagged(w);
+                    let (ipa, _is_acronym) = self.word_to_ipa_tagged(w);
                     result.push_str(&ipa);
-                    if is_acronym {
-                        let next_is_punct = segments.get(idx + 1)
-                            .is_some_and(|s| matches!(s, Segment::Punct(_)));
-                        if !next_is_punct {
-                            result.push(',');
-                        }
-                    }
                 }
                 Segment::Punct(ch) => {
                     match ch {
