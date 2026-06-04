@@ -38,7 +38,6 @@ fn main() -> Result<()> {
     let config = speech::kokoro::KokoroConfig::from_json(CONFIG_JSON)?;
     let device = speech::parakeet::get_device()?;
 
-    eprintln!("Loading model...");
     let model = speech::kokoro::KokoroModel::load_gguf_bytes(GGUF_DATA, config.clone(), &device)?;
 
     let phonemizer = speech::kokoro::Phonemizer::new(GOLD_JSON, SILVER_JSON, &config.vocab)?;

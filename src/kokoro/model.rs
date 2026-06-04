@@ -232,16 +232,11 @@ impl KokoroModel {
         let acoustic_style = style.narrow(0, 0, self.config.style_dim)?.unsqueeze(0)?;
         let prosody_style = style.narrow(0, self.config.style_dim, self.config.style_dim)?.unsqueeze(0)?;
 
-        let t0 = std::time::Instant::now();
         let bert_out = self.albert.forward(&tokens)?;
         let d_en = self.bert_encoder.forward(&bert_out)?.transpose(1, 2)?;
-        eprintln!("    ALBERT: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
 
-        let t0 = std::time::Instant::now();
         let text_enc = self.text_encoder.forward(&tokens)?;
-        eprintln!("    TextEncoder: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
 
-        let t0 = std::time::Instant::now();
         let (durations_raw, dur_enc_out) = self.prosody.predict_duration(&d_en, &prosody_style)?;
         let durations_raw = durations_raw.squeeze(0)?;
         let dur_vec: Vec<f32> = durations_raw.to_vec1()?;
@@ -259,12 +254,9 @@ impl KokoroModel {
         let expanded_text = prosody::duration_expand(&text_enc, &durations)?;
 
         let (f0, n) = self.prosody.predict_f0_n(&expanded_enc, &prosody_style)?;
-        eprintln!("    Prosody: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
 
-        let t0 = std::time::Instant::now();
         let audio = self.decoder.forward(&expanded_text, &f0, &n, &acoustic_style)?;
         let audio = audio.squeeze(0)?;
-        eprintln!("    Decoder: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
 
         audio.to_vec1().map_err(Into::into)
     }
