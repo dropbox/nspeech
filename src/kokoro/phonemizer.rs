@@ -214,6 +214,15 @@ impl Phonemizer {
             }
         }
 
+        // -ied (y→i): verified → verify
+        if let Some(base) = word.strip_suffix("ied") {
+            let with_y = format!("{}y", base);
+            if let Some(ipa) = self.dict.get(&with_y) {
+                let suffix = if ends_alveolar_stop(ipa) { "ᵻd" } else if ends_voiced(ipa) { "d" } else { "t" };
+                return Some(format!("{}{}", ipa, suffix));
+            }
+        }
+
         // -ed: try base
         if let Some(base) = word.strip_suffix("ed") {
             if let Some(ipa) = self.dict.get(base) {
