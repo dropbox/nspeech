@@ -91,6 +91,12 @@ impl Phonemizer {
     fn word_to_ipa_tagged(&self, word: &str) -> (String, bool) {
         let lower = word.to_lowercase();
 
+        // Uppercase letter+digit identifiers are read character-by-character:
+        // R2D2, V2, R2, R3000, etc.
+        if is_spelled_alphanumeric(word) {
+            return (spell_out(word), true);
+        }
+
         // Mixed case: split at case boundaries (e.g. macOS→"mac"+"OS", DBApp→"DB"+"App")
         if word.chars().any(|c| c.is_ascii_uppercase()) && word.chars().any(|c| c.is_ascii_lowercase()) {
             let parts = split_camel_case(word);
@@ -285,7 +291,7 @@ impl Phonemizer {
 
 fn spell_out(word: &str) -> String {
     let letters: Vec<&'static str> = word.chars()
-        .filter_map(letter_ipa)
+        .filter_map(spelled_char_ipa)
         .collect();
     let n = letters.len();
     if n <= 2 {
@@ -300,6 +306,26 @@ fn spell_out(word: &str) -> String {
         }
     }
     parts.join("-")
+}
+
+fn is_spelled_alphanumeric(word: &str) -> bool {
+    let mut has_alpha = false;
+    let mut has_digit = false;
+
+    for ch in word.chars() {
+        if ch.is_ascii_digit() {
+            has_digit = true;
+        } else if ch.is_ascii_alphabetic() {
+            has_alpha = true;
+            if ch.is_ascii_lowercase() {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+
+    has_alpha && has_digit
 }
 
 /// Split a mixed-case word at case boundaries.
@@ -329,6 +355,10 @@ fn split_camel_case(word: &str) -> Vec<String> {
         parts.push(current);
     }
     parts
+}
+
+fn spelled_char_ipa(ch: char) -> Option<&'static str> {
+    letter_ipa(ch).or_else(|| digit_ipa(ch))
 }
 
 fn letter_ipa(ch: char) -> Option<&'static str> {
@@ -363,6 +393,22 @@ fn letter_ipa(ch: char) -> Option<&'static str> {
     }
 }
 
+fn digit_ipa(ch: char) -> Option<&'static str> {
+    match ch {
+        '0' => Some("zˈɪɹO"),
+        '1' => Some("wˈʌn"),
+        '2' => Some("tˈu"),
+        '3' => Some("θɹˈi"),
+        '4' => Some("fˈɔɹ"),
+        '5' => Some("fˈIv"),
+        '6' => Some("sˈɪks"),
+        '7' => Some("sˈɛvən"),
+        '8' => Some("ˈAt"),
+        '9' => Some("nˈIn"),
+        _ => None,
+    }
+}
+
 fn strip_trailing_stress(ipa: &str) -> &str {
     ipa.trim_end_matches('ˈ').trim_end_matches('ˌ')
 }
@@ -391,7 +437,7 @@ fn split_segments(text: &str) -> Vec<Segment> {
     let mut current_word = String::new();
 
     for ch in text.chars() {
-        if ch.is_alphabetic() || ch == '\'' {
+        if ch.is_alphanumeric() || ch == '\'' {
             current_word.push(ch);
         } else {
             if !current_word.is_empty() {
@@ -413,12 +459,25 @@ fn split_segments(text: &str) -> Vec<Segment> {
 fn normalize_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
+    let mut prev_input = None;
     while let Some(ch) = chars.next() {
         match ch {
-            '\u{2018}' | '\u{2019}' => out.push('\''),
-            '\u{201C}' | '\u{201D}' => out.push('"'),
-            '\u{2014}' => out.push('—'),
-            '\u{2026}' => out.push('…'),
+            '\u{2018}' | '\u{2019}' => {
+                out.push('\'');
+                prev_input = Some(ch);
+            }
+            '\u{201C}' | '\u{201D}' => {
+                out.push('"');
+                prev_input = Some(ch);
+            }
+            '\u{2014}' => {
+                out.push('—');
+                prev_input = Some(ch);
+            }
+            '\u{2026}' => {
+                out.push('…');
+                prev_input = Some(ch);
+            }
             '0'..='9' => {
                 let mut num_str = String::new();
                 num_str.push(ch);
@@ -429,6 +488,11 @@ fn normalize_text(text: &str) -> String {
                     } else {
                         break;
                     }
+                }
+                if prev_input.is_some_and(|prev: char| prev.is_ascii_uppercase()) {
+                    out.push_str(&num_str);
+                    prev_input = num_str.chars().last();
+                    continue;
                 }
                 // Check for decimal point followed by more digits
                 if chars.peek() == Some(&'.') {
@@ -461,8 +525,12 @@ fn normalize_text(text: &str) -> String {
                 if let Some(suffix) = consume_unit_suffix(&mut chars) {
                     out.push_str(&suffix);
                 }
+                prev_input = num_str.chars().last();
             }
-            _ => out.push(ch),
+            _ => {
+                out.push(ch);
+                prev_input = Some(ch);
+            }
         }
     }
     out
@@ -623,4 +691,42 @@ pub fn tokenize_ipa(ipa: &str, vocab: &HashMap<String, usize>) -> Vec<u32> {
 pub fn phonemize(text: &str, vocab: &HashMap<String, usize>) -> Vec<u32> {
     // Without dictionaries, fall back to character-level tokenization
     tokenize_ipa(&text.to_lowercase(), vocab)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_phonemizer() -> Phonemizer {
+        Phonemizer {
+            dict: HashMap::new(),
+            vocab: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn spells_uppercase_alphanumeric_sequences() {
+        let phonemizer = empty_phonemizer();
+
+        assert_eq!(
+            phonemizer.to_ipa("R2D2 V2 R2 R3000"),
+            "ˌɑɹ-tˌu-dˌi-tˈu vˈi-tˈu ˈɑɹ-tˈu ˌɑɹ-θɹˌi-zˌɪɹO-zˌɪɹO-zˈɪɹO"
+        );
+    }
+
+    #[test]
+    fn normalizer_preserves_uppercase_alphanumeric_digits() {
+        assert_eq!(
+            normalize_text("R2D2 V2 R2 R3000"),
+            "R2D2 V2 R2 R3000"
+        );
+    }
+
+    #[test]
+    fn normalizer_still_expands_plain_numbers_and_units() {
+        assert_eq!(
+            normalize_text("12 10ms 5GB"),
+            "twelve ten milliseconds five gigabytes"
+        );
+    }
 }
