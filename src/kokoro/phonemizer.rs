@@ -478,6 +478,21 @@ fn normalize_text(text: &str) -> String {
                 out.push('…');
                 prev_input = Some(ch);
             }
+            '.' if prev_input.is_some_and(|prev| prev.is_alphanumeric())
+                && chars.peek().is_some_and(|next| next.is_alphanumeric())
+                && (prev_input.is_some_and(|prev| prev.is_alphabetic())
+                    || chars.peek().is_some_and(|next| next.is_alphabetic())) =>
+            {
+                // Read periods inside dotted names (llama.cpp, example.com) aloud,
+                // while leaving sentence punctuation and numeric decimals alone.
+                out.push_str(" dot ");
+                if let Some(suffix) = consume_three_char_dotted_suffix(&mut chars) {
+                    out.push_str(&suffix);
+                    prev_input = suffix.chars().last();
+                } else {
+                    prev_input = Some(ch);
+                }
+            }
             '0'..='9' => {
                 let mut num_str = String::new();
                 num_str.push(ch);
@@ -534,6 +549,23 @@ fn normalize_text(text: &str) -> String {
         }
     }
     out
+}
+
+fn consume_three_char_dotted_suffix(
+    chars: &mut std::iter::Peekable<std::str::Chars>,
+) -> Option<String> {
+    let suffix: String = chars
+        .clone()
+        .take_while(|ch| ch.is_alphanumeric())
+        .collect();
+    if !suffix.is_ascii() || suffix.len() != 3 {
+        return None;
+    }
+
+    for _ in 0..3 {
+        chars.next();
+    }
+    Some(suffix.to_ascii_uppercase())
 }
 
 fn consume_unit_suffix(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<String> {
@@ -727,6 +759,32 @@ mod tests {
         assert_eq!(
             normalize_text("12 10ms 5GB"),
             "twelve ten milliseconds five gigabytes"
+        );
+    }
+
+    #[test]
+    fn normalizer_reads_periods_inside_dotted_names_as_dot() {
+        assert_eq!(
+            normalize_text("llama.cpp app.exe song.mp3 archive.html example.com."),
+            "llama dot CPP app dot EXE song dot MP3 archive dot html example dot COM."
+        );
+    }
+
+    #[test]
+    fn phonemizer_reads_periods_inside_dotted_names_as_dot() {
+        let phonemizer = Phonemizer {
+            dict: HashMap::from([
+                ("llama".into(), "LLAMA".into()),
+                ("dot".into(), "DOT".into()),
+                ("app".into(), "APP".into()),
+                ("song".into(), "SONG".into()),
+            ]),
+            vocab: HashMap::new(),
+        };
+
+        assert_eq!(
+            phonemizer.to_ipa("llama.cpp app.exe song.mp3"),
+            "LLAMA DOT sˌi-pˌi-pˈi APP DOT ˌi-ˌɛks-ˈi SONG DOT ˌɛm-pˌi-θɹˈi"
         );
     }
 }
