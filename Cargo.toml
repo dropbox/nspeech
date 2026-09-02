@@ -11,9 +11,30 @@ license = "Apache-2.0"
 crate-type = ["lib", "cdylib"]
 path = "src/lib.rs"
 
+[[example]]
+name = "listen"
+required-features = ["audio"]
+
+[[example]]
+name = "mic_streaming"
+required-features = ["audio"]
+
+[[example]]
+name = "speek"
+required-features = ["audio"]
+
+[[example]]
+name = "bench_triton_encoder"
+required-features = ["triton-metal"]
+
+[[example]]
+name = "bench_triton_d3d12"
+required-features = ["triton-d3d12"]
+
 
 [features]
 default = ["fbgemm-bf16"]  # CPU-optimized bf16 GEMM for all non-Metal configurations
+audio = ["dep:cpal"]       # Microphone and speaker I/O; requires the platform audio development libraries
 quantized = []            # Use quantized inference (QMatMul with Q8_0/Q4K weights)
 embed-assets = []         # Embed model assets in binary
 qwen = []                 # Enable Qwen3 text correction model (adds ~400MB to assets)
@@ -67,7 +88,7 @@ candle-d3d12-kernels = { git = "https://github.com/jacobgorm/candle", branch = "
 half = "2.5"
 
 # Audio input (for mic example)
-cpal = "0.15"
+cpal = { version = "0.15", optional = true }
 crossterm = "0.28"
 
 [build-dependencies]
@@ -91,4 +112,3 @@ candle-nn = { git = "https://github.com/jacobgorm/candle", branch = "windows" }
 #candle-nn = { path = "../candle/windows/candle-nn" }
 #candle-transformers = { path = "../candle/windows/candle-transformers" }
 #candle-metal-kernels = { path = "../candle/windows/candle-metal-kernels" }
-

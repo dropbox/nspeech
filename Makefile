@@ -46,11 +46,13 @@ export RUSTFLAGS += $(RUSTFLAGS_EXTRA)
 
 # === Python environment ===
 
+UV_PYPI_INDEX ?= https://pypi.org/simple
+
 env/pyvenv.cfg:
 	uv venv env
 
 env/.requirements.stamp: env/pyvenv.cfg requirements.txt
-	(source env/*/activate && uv pip install -r requirements.txt)
+	(source env/*/activate && uv pip install --default-index $(UV_PYPI_INDEX) -r requirements.txt)
 	touch env/.requirements.stamp
 
 # === Build targets ===
@@ -61,12 +63,26 @@ build: assets
 kokoro: build
 	ln -sf $(BIN_DIR)/synthesize_kokoro ./synthesize_kokoro
 
-speek:
-	cargo build --release $(BUILD_TARGET) --features $(FEATURES) --example speek
+audio-check:
+ifeq ($(UNAME_S),Linux)
+	@command -v pkg-config >/dev/null 2>&1 || { \
+		echo "Audio support is unavailable: pkg-config is not installed." >&2; \
+		echo "The normal build does not require ALSA; install pkg-config and ALSA development files only to build audio examples." >&2; \
+		exit 1; \
+	}
+	@pkg-config --exists alsa || { \
+		echo "Audio support is unavailable: ALSA development files were not found." >&2; \
+		echo "The normal build does not require ALSA; install libasound2-dev (Debian/Ubuntu) only to build audio examples." >&2; \
+		exit 1; \
+	}
+endif
+
+speek: audio-check
+	cargo build --release $(BUILD_TARGET) --features $(FEATURES),audio --example speek
 	ln -sf $(BIN_DIR)/speek ./speek
 
-listen:
-	cargo build --release $(BUILD_TARGET) --features $(FEATURES) --example listen
+listen: audio-check
+	cargo build --release $(BUILD_TARGET) --features $(FEATURES),audio --example listen
 	ln -sf $(BIN_DIR)/listen ./listen
 
 speek-install: speek
@@ -159,4 +175,4 @@ assets: assets/kokoro_q8_0.gguf assets/kokoro-config.json assets/kokoro-af_heart
 kernels:
 	cd kernels && python build.py
 
-.PHONY: build kokoro speek listen speek-install listen-install bench win deploy-win test-win bench-win module kernels assets
+.PHONY: build kokoro audio-check speek listen speek-install listen-install bench win deploy-win test-win bench-win module kernels assets
