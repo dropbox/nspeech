@@ -11,6 +11,7 @@ Output: out/{metal,metal_nosimd}/*.metallib, out/hlsl/*.hlsl
     python build.py metal hlsl         # multiple platforms
 """
 import json
+import os
 import subprocess
 import sys
 import time
@@ -33,6 +34,23 @@ def _load_env():
 _load_env()
 
 
+def _select_full_xcode_for_metal():
+    """Use the standard full Xcode install when xcode-select points at CLT."""
+    if sys.platform != "darwin" or "DEVELOPER_DIR" in os.environ:
+        return
+    selected_has_metal = subprocess.run(
+        ["xcrun", "--find", "metal"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
+    full_xcode = Path("/Applications/Xcode.app/Contents/Developer")
+    if not selected_has_metal and full_xcode.is_dir():
+        os.environ["DEVELOPER_DIR"] = str(full_xcode)
+
+
+_select_full_xcode_for_metal()
+
+
 def write_if_changed(path: Path, content: str) -> bool:
     """Write content to path only if it differs from existing content.
 
@@ -51,8 +69,8 @@ def write_if_changed(path: Path, content: str) -> bool:
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 OUT = SCRIPT_DIR / "out"
-TRITON = SCRIPT_DIR.parent.parent / "triton"
-TRITON_METAL = SCRIPT_DIR.parent / "triton_backend"
+TRITON = Path(os.environ.get("TRITON_DIR", SCRIPT_DIR.parent.parent / "triton")).resolve()
+TRITON_METAL = TRITON / "third_party" / "metal"
 _VENV = TRITON / "env"
 _BIN = _VENV / "Scripts" if sys.platform == "win32" else _VENV / "bin"
 PYTHON = str(_BIN / "python")
@@ -66,10 +84,27 @@ def gen_ttir():
     sys.path.insert(0, str(SCRIPT_DIR))
 
     from aot_compile import compile_kernel
+    import triton
     import moonshine_kernels as K
     import kokoro_kernels as KK
     from kernel_configs import METAL_KERNELS, HLSL_EXTRA_KERNELS
     from kokoro_configs import KOKORO_KERNELS
+
+    # AOT compilation does not need a live GPU, but JITFunction.create_binder()
+    # asks Triton's runtime for one before aot_compile.py selects its offline
+    # Metal target. Let the sibling checkout compile on hosts whose venv does
+    # not include the optional PyObjC Metal driver.
+    try:
+        triton.runtime.driver.active
+    except RuntimeError:
+        from triton.compiler import ASTSource
+
+        def prepare_for_offline_aot(fn):
+            fn.ASTSource = ASTSource
+            fn.create_binder = lambda: None
+    else:
+        def prepare_for_offline_aot(fn):
+            pass
 
     ttir_dir = OUT / "ttir"
     ttir_dir.mkdir(parents=True, exist_ok=True)
@@ -95,6 +130,7 @@ def gen_ttir():
             print(f"  {name}: SKIP (no {func_name})")
             continue
         try:
+            prepare_for_offline_aot(fn)
             r = compile_kernel(fn=fn, signature=sig, num_warps=nw, grid=grid)
             ir = r.ttgir_text or r.ttir_text
             write_if_changed(ttir_dir / f"{name}.ttir", ir)

@@ -13,8 +13,11 @@ fn main() {
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let kernels_dir = manifest_dir.join("kernels");
-    let triton_dir = manifest_dir.parent().unwrap().join("triton");
-    let triton_metal_dir = manifest_dir.join("triton_backend");
+    let triton_dir = std::env::var_os("TRITON_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| manifest_dir.parent().unwrap().join("triton"));
+    let triton_metal_dir = triton_dir.join("third_party/metal");
+    println!("cargo:rerun-if-env-changed=TRITON_DIR");
 
     // Determine which platform(s) to build
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
@@ -125,6 +128,7 @@ fn main() {
     let status = Command::new(&venv_python)
         .arg("build.py")
         .args(&platforms)
+        .env("TRITON_DIR", &triton_dir)
         .current_dir(&kernels_dir)
         .status();
 

@@ -10,10 +10,14 @@ Metallib compilation is handled directly by xcrun in build.ninja:
     .metal -> xcrun metal -> .metallib
 """
 import json
+import os
 import sys
 from pathlib import Path
 
-TRITON_METAL_DIR = Path(__file__).resolve().parent.parent / "triton_backend"
+TRITON_DIR = Path(
+    os.environ.get("TRITON_DIR", Path(__file__).resolve().parents[2] / "triton")
+).resolve()
+TRITON_METAL_DIR = TRITON_DIR / "third_party" / "metal"
 sys.path.insert(0, str(TRITON_METAL_DIR))
 
 
