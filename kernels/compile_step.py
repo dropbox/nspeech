@@ -14,11 +14,10 @@ import os
 import sys
 from pathlib import Path
 
-TRITON_DIR = Path(
-    os.environ.get("TRITON_DIR", Path(__file__).resolve().parents[2] / "triton")
+NESO_DIR = Path(
+    os.environ.get("NESO_DIR", Path(__file__).resolve().parents[2] / "neso")
 ).resolve()
-TRITON_METAL_DIR = TRITON_DIR / "third_party" / "metal"
-sys.path.insert(0, str(TRITON_METAL_DIR))
+sys.path.insert(0, str(NESO_DIR / "src"))
 
 
 def write_if_changed(path: Path, content: str) -> bool:
@@ -37,19 +36,19 @@ def main():
     cmd, inp, out = sys.argv[1], sys.argv[2], sys.argv[3]
 
     if cmd == "msl_metal":
-        from backend.codegen import ttir_to_msl_with_metadata
+        from neso.backend.codegen import ttir_to_msl_with_metadata
         msl, _, _, _ = ttir_to_msl_with_metadata(
             Path(inp).read_text(), block_size=256, use_simdgroup=True)
         write_if_changed(Path(out), msl)
 
     elif cmd == "msl_metal_nosimd":
-        from backend.codegen import ttir_to_msl_with_metadata
+        from neso.backend.codegen import ttir_to_msl_with_metadata
         msl, _, _, _ = ttir_to_msl_with_metadata(
             Path(inp).read_text(), block_size=256, use_simdgroup=False)
         write_if_changed(Path(out), msl)
 
     elif cmd == "hlsl":
-        from backend.codegen import ttir_to_hlsl_with_metadata
+        from neso.backend.codegen import ttir_to_hlsl_with_metadata
         meta_path = Path(inp).with_suffix(".json")
         force_fp16 = False
         if meta_path.exists():

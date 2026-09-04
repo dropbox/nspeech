@@ -69,21 +69,19 @@ def write_if_changed(path: Path, content: str) -> bool:
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 OUT = SCRIPT_DIR / "out"
-TRITON = Path(os.environ.get("TRITON_DIR", SCRIPT_DIR.parent.parent / "triton")).resolve()
-TRITON_METAL = TRITON / "third_party" / "metal"
-_VENV = TRITON / "env"
-_BIN = _VENV / "Scripts" if sys.platform == "win32" else _VENV / "bin"
-PYTHON = str(_BIN / "python")
-NINJA = str(_BIN / "ninja")
+NESO = Path(os.environ.get("NESO_DIR", SCRIPT_DIR.parent.parent / "neso")).resolve()
+NESO_PACKAGE = NESO / "src" / "neso"
+sys.path.insert(0, str(NESO / "src"))
+PYTHON = sys.executable
+NINJA = "ninja"
 COMPILE_STEP = str(SCRIPT_DIR / "compile_step.py")
 
 
 def gen_ttir():
     """Generate TTIR for every kernel config (one Python process)."""
-    sys.path.insert(0, str(TRITON_METAL))
     sys.path.insert(0, str(SCRIPT_DIR))
 
-    from aot_compile import compile_kernel
+    from neso.aot_compile import compile_kernel
     import triton
     import moonshine_kernels as K
     import kokoro_kernels as KK
@@ -91,7 +89,7 @@ def gen_ttir():
     from kokoro_configs import KOKORO_KERNELS
 
     # AOT compilation does not need a live GPU, but JITFunction.create_binder()
-    # asks Triton's runtime for one before aot_compile.py selects its offline
+    # asks Triton's runtime for one before Neso selects its offline
     # Metal target. Let the sibling checkout compile on hosts whose venv does
     # not include the optional PyObjC Metal driver.
     try:
@@ -160,7 +158,7 @@ def gen_ttir():
 
 def _ninja_preamble():
     """Common ninja preamble: python path and compile_step path."""
-    codegen_dir = TRITON_METAL / "backend" / "codegen"
+    codegen_dir = NESO_PACKAGE / "backend" / "codegen"
     compiler_deps = " ".join(str(p) for p in sorted(codegen_dir.glob("*.py")))
     implicit = f"| {compiler_deps} {COMPILE_STEP}"
     return [
@@ -280,25 +278,34 @@ def gen_ninja_hlsl():
 
     import os
     dxc_host = os.environ.get("DXC_HOST", "")
-    dxc_path = os.environ.get("DXC_PATH",
-        "C:/Program Files (x86)/Windows Kits/10/bin/10.0.22621.0/x64/dxc.exe")
-    dxc_flags = "-T cs_6_2 -enable-16bit-types -O3 -Wno-for-redefinition"
+    dxc_path = os.environ.get("DXC_PATH")
+    dxc_flags = "-T cs_6_6 -enable-16bit-types -O3 -Wno-for-redefinition"
 
     w, implicit = _ninja_preamble()
     w.append("rule hlsl\n  command = $python $step hlsl $in $out\n  restat = 1\n  description = HLSL $out")
     if dxc_host:
         remote_dir = "dxil_build"
+        remote_dxc = dxc_path or (
+            "C:/Program Files (x86)/Windows Kits/10/bin/10.0.22621.0/x64/dxc.exe"
+        )
         # Single-quote the ssh command so parens in the Windows path don't get interpreted locally.
         # Inside single quotes, the remote shell sees: "C:/Program Files (x86)/..." with double quotes.
-        remote_cmd = f'"{dxc_path}" {dxc_flags} -E $entry -Fo {remote_dir}/$out_name {remote_dir}/$in_name'
+        remote_cmd = f'"{remote_dxc}" {dxc_flags} -E $entry -Fo {remote_dir}/$out_name {remote_dir}/$in_name'
         dxil_cmd = (f"scp -q $in {dxc_host}:{remote_dir}/$in_name "
                     f"&& ssh {dxc_host} '{remote_cmd}' "
                     f"&& scp -q {dxc_host}:{remote_dir}/$out_name $out")
         w.append("pool dxc_pool\n  depth = 4")
         w.append(f"rule dxil\n  command = {dxil_cmd}\n  pool = dxc_pool\n  description = DXIL $out")
     else:
-        local_dxc = SCRIPT_DIR / "dxc" / "dxc"
-        dxil_cmd = f'DYLD_LIBRARY_PATH={SCRIPT_DIR / "dxc"} {local_dxc} {dxc_flags} -E $entry -Fo $out $in'
+        local_dxc = Path(dxc_path).expanduser() if dxc_path else SCRIPT_DIR / "dxc" / "dxc"
+        if not local_dxc.is_absolute():
+            # Environment paths are normally supplied relative to the project root,
+            # while build.py is commonly run from kernels/ via the Makefile.
+            project_relative = SCRIPT_DIR.parent / local_dxc
+            local_dxc = project_relative if project_relative.exists() else Path.cwd() / local_dxc
+        local_dxc = local_dxc.resolve()
+        dxil_cmd = (f'DYLD_LIBRARY_PATH="{local_dxc.parent}" "{local_dxc}" '
+                    f'{dxc_flags} -E $entry -Fo $out $in')
         w.append(f"rule dxil\n  command = {dxil_cmd}\n  description = DXIL $out")
     w.append(_pack_tar_zst_rule())
     w.append("")

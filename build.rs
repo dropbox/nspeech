@@ -13,11 +13,11 @@ fn main() {
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let kernels_dir = manifest_dir.join("kernels");
-    let triton_dir = std::env::var_os("TRITON_DIR")
+    let neso_dir = std::env::var_os("NESO_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| manifest_dir.parent().unwrap().join("triton"));
-    let triton_metal_dir = triton_dir.join("third_party/metal");
-    println!("cargo:rerun-if-env-changed=TRITON_DIR");
+        .unwrap_or_else(|| manifest_dir.parent().unwrap().join("neso"));
+    let neso_package_dir = neso_dir.join("src/neso");
+    println!("cargo:rerun-if-env-changed=NESO_DIR");
 
     // Determine which platform(s) to build
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
@@ -66,7 +66,7 @@ fn main() {
         println!("cargo:rerun-if-changed={}", manifest_dir.join(src).display());
     }
     for src in compiler_sources {
-        println!("cargo:rerun-if-changed={}", triton_metal_dir.join(src).display());
+        println!("cargo:rerun-if-changed={}", neso_package_dir.join(src).display());
     }
 
     // Track output directories for current platform only
@@ -87,9 +87,9 @@ fn main() {
     // Find python — venv uses Scripts/ on Windows, bin/ elsewhere.
     // Use host OS (not target), since build.py runs on the build machine.
     let venv_python = if cfg!(windows) {
-        triton_dir.join("env/Scripts/python.exe")
+        neso_dir.join("env/Scripts/python.exe")
     } else {
-        triton_dir.join("env/bin/python")
+        neso_dir.join("env/bin/python")
     };
 
     // Check if pre-built kernel archives exist for all requested platforms
@@ -108,15 +108,15 @@ fn main() {
             .map(|d| d.count() > 0)
             .unwrap_or(false);
 
-    // Skip build if triton venv is not available and we have pre-built outputs
+    // Skip build if the Neso environment is unavailable and we have pre-built outputs.
     if !venv_python.exists() {
         if has_prebuilt && has_generated {
-            println!("cargo:warning=Triton venv not found, using pre-built kernel archives.");
+            println!("cargo:warning=Neso environment not found, using pre-built kernel archives.");
             return;
         } else {
             panic!(
-                "Triton venv not found at {} and no pre-built kernel archives exist. \
-                 Set up the triton venv or provide pre-built kernels/out/*.tar.zst files.",
+                "Neso environment not found at {} and no pre-built kernel archives exist. \
+                 Run `make sync` in Neso or provide pre-built kernels/out/*.tar.zst files.",
                 venv_python.display()
             );
         }
@@ -128,7 +128,7 @@ fn main() {
     let status = Command::new(&venv_python)
         .arg("build.py")
         .args(&platforms)
-        .env("TRITON_DIR", &triton_dir)
+        .env("NESO_DIR", &neso_dir)
         .current_dir(&kernels_dir)
         .status();
 

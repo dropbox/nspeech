@@ -141,8 +141,14 @@ cp target/release/libspeech.dylib index.node  # macOS
 
 The `triton-metal` and `triton-d3d12` features use pre-compiled GPU kernels (Metal AIR / DXIL bytecode) that are checked into the repo under `kernels/out/*.tar.zst`. These are embedded into the binary at build time — no runtime kernel compilation occurs.
 
-The kernels are compiled from Triton Python sources (`kernels/*.py`) using a custom Triton compiler fork that targets Metal and D3D12, as well as the appropriate shader compiler for each hardware platform ("xcrun metal" for MacOS and "dxc" for Windows.
-Our Triton compiler-backed is not yet publicly available, but we expect it to be in the near future. We currently do not include iOS kernels, but expect this to be a fairly trivial change, please file an issue on interest.
+The kernels are compiled from Triton Python sources (`kernels/*.py`) using the
+Neso AOT backend, which targets Metal and HLSL. `make kernels` runs
+Neso through uv using the sibling `../neso` checkout and its `env` virtual
+environment. Set `NESO_DIR=/path/to/neso` to use another checkout. Metal output
+is compiled with `xcrun metal`; HLSL output is compiled with `dxc`.
+
+Prebuilt archives keep normal Rust builds independent of Python and Neso. iOS
+kernels are not currently included.
 
 ## Audio Requirements
 

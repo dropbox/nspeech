@@ -171,8 +171,26 @@ assets/vad16_q8_0.gguf: env/.requirements.stamp
 
 assets: assets/kokoro_q8_0.gguf assets/kokoro-config.json assets/kokoro-af_heart.safetensors assets/us_gold.json assets/us_silver.json assets/moonshine_q8_0.gguf assets/parakeet-tdt-model_q8_0.gguf assets/vad16_q8_0.gguf
 
-# Kernel compilation (Triton → Metal/DXIL)
-kernels:
-	cd kernels && python build.py
+# Kernel compilation (Triton → Metal/DXIL via Neso)
+UV ?= uv
+NESO_DIR ?= ../neso
+NESO_ROOT := $(abspath $(NESO_DIR))
+NESO_NINJA := $(firstword $(wildcard $(NESO_ROOT)/env/bin/ninja $(NESO_ROOT)/env/Scripts/ninja.exe))
+ifeq ($(NESO_NINJA),)
+  NESO_NINJA := ninja
+endif
 
-.PHONY: build kokoro audio-check speek listen speek-install listen-install bench win deploy-win test-win bench-win module kernels assets
+kernels:
+	cd kernels && NESO_DIR="$(NESO_ROOT)" UV_PROJECT_ENVIRONMENT="$(NESO_ROOT)/env" \
+		UV_DEFAULT_INDEX="$(UV_PYPI_INDEX)" \
+		$(UV) run --project "$(NESO_ROOT)" --locked python build.py
+
+clean-shaders:
+	@set -e; \
+	for build_file in kernels/out/build_metal.ninja kernels/out/build_metal_nosimd.ninja kernels/out/build_hlsl.ninja; do \
+		if [ -f "$$build_file" ]; then \
+			"$(NESO_NINJA)" -f "$$build_file" -t clean; \
+		fi; \
+	done
+
+.PHONY: build kokoro audio-check speek listen speek-install listen-install bench win deploy-win test-win bench-win module kernels clean-shaders assets
