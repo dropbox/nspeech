@@ -98,6 +98,9 @@ napi-build = "2.2.3"
 candle-core = { git = "https://github.com/jacobgorm/candle", branch = "windows", features = ["metal", "accelerate"] }
 candle-nn = { git = "https://github.com/jacobgorm/candle", branch = "windows", features = ["metal", "accelerate"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 candle-core = { git = "https://github.com/jacobgorm/candle", branch = "windows" }
 candle-nn = { git = "https://github.com/jacobgorm/candle", branch = "windows" }

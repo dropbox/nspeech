@@ -6,10 +6,15 @@
 //! Usage:
 //!   speek "Hello, world!"
 //!   echo "piped text" | speek
+//!   speek --foreground "Wait until playback finishes"
 
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(unix)]
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 
 static GGUF_DATA: &[u8] = include_bytes!("../assets/kokoro_q8_0.gguf");
@@ -19,7 +24,11 @@ static GOLD_JSON: &str = include_str!("../assets/us_gold.json");
 static SILVER_JSON: &str = include_str!("../assets/us_silver.json");
 
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let foreground = args.first().is_some_and(|arg| arg == "--foreground");
+    if foreground {
+        args.remove(0);
+    }
 
     let text = if args.is_empty() {
         let mut buf = String::new();
@@ -32,7 +41,14 @@ fn main() -> Result<()> {
     if text.is_empty() {
         eprintln!("Usage: speek <text>");
         eprintln!("       echo \"text\" | speek");
+        eprintln!("       speek --foreground <text>");
         std::process::exit(1);
+    }
+
+    #[cfg(unix)]
+    if !foreground {
+        spawn_detached(&text)?;
+        return Ok(());
     }
 
     let config = speech::kokoro::KokoroConfig::from_json(CONFIG_JSON)?;
@@ -53,6 +69,38 @@ fn main() -> Result<()> {
 
     play_audio(&audio, 24000)?;
 
+    Ok(())
+}
+
+#[cfg(unix)]
+fn spawn_detached(text: &str) -> Result<()> {
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/speek.log")?;
+    let stderr = log.try_clone()?;
+
+    let mut child = Command::new(std::env::current_exe()?);
+    child
+        .arg("--foreground")
+        .arg(text)
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr));
+
+    // Start a new session in the freshly exec'd child. Re-execing avoids
+    // initializing Metal and CoreAudio in a process created by a raw fork.
+    unsafe {
+        child.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    child.spawn()?;
     Ok(())
 }
 
