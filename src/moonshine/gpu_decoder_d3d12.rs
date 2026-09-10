@@ -36,7 +36,11 @@ impl D3D12Backend {
     }
 
     fn barrier(&self) {
-        self.gpu.record_uav_barrier();
+        if self.gpu.is_batch_active() {
+            self.gpu.record_uav_barrier();
+        } else {
+            self.gpu.begin_batch().unwrap();
+        }
     }
 }
 
@@ -71,8 +75,8 @@ impl DecoderBackend for D3D12Backend {
     }
 
     fn begin_pass(&self) -> Result<()> {
-        self.gpu.begin_batch()
-            .map_err(|e| anyhow::anyhow!("begin_batch: {e}"))
+        assert!(!self.gpu.is_batch_active(), "nested decoder pass");
+        Ok(())
     }
 
     fn upload_embed(&self, dst: &GpuBuffer, data: &[f32]) -> Result<()> {
@@ -91,7 +95,9 @@ impl DecoderBackend for D3D12Backend {
             .map_err(|e| anyhow::anyhow!("end_batch: {e}"))
     }
 
-    fn argmax_logits(&self, _logits: &GpuBuffer, vocab_size: usize) -> Result<u32> {
+    fn argmax_logits(&self, logits: &GpuBuffer, vocab_size: usize) -> Result<u32> {
+        self.gpu.record_copy(logits, &self.logits_readback, (vocab_size * 2) as u64)
+            .map_err(|e| anyhow::anyhow!("copy logits: {e}"))?;
         let bytes = self.gpu.map_readback_buffer(&self.logits_readback, (vocab_size * 2) as u64)
             .map_err(|e| anyhow::anyhow!("map readback: {e}"))?;
         let f16_data: Vec<half::f16> = bytes.chunks_exact(2)
@@ -246,12 +252,11 @@ impl DecoderBackend for D3D12Backend {
             x, dim as u32, w, (dim * vocab) as u32, out, vocab as u32,
             vocab as i32, dim as i32, 1, vocab as i32,
         ).unwrap();
-        self.barrier();
-        self.gpu.record_copy(out, &self.logits_readback, (vocab * 2) as u64).unwrap();
     }
 
     fn matmul_cross_kv(&self, enc_proj: &GpuBuffer, w: &GpuBuffer, out: &GpuBuffer,
                         m: usize, n: usize, k: usize) {
+        self.barrier();
         self.kernels.dispatch_matmul_f32w(
             enc_proj, (m * k) as u32, w, (k * n) as u32, out, (m * n) as u32,
             m as i32, n as i32, k as i32,
