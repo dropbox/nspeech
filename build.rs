@@ -94,15 +94,17 @@ fn main() {
 
     // Check if pre-built kernel archives exist for all requested platforms
     let out_dir = kernels_dir.join("out");
-    let has_prebuilt = platforms.iter().all(|p| {
-        let tar_name = match *p {
-            "metal" => "kernels_metal.tar.zst",
-            "metal_nosimd" => "kernels_metal_nosimd.tar.zst",
-            "hlsl" => "kernels_dxil.tar.zst",
-            _ => return false,
-        };
-        out_dir.join(tar_name).exists()
-    });
+    let has_prebuilt = || {
+        platforms.iter().all(|p| {
+            let tar_name = match *p {
+                "metal" => "kernels_metal.tar.zst",
+                "metal_nosimd" => "kernels_metal_nosimd.tar.zst",
+                "hlsl" => "kernels_dxil.tar.zst",
+                _ => return false,
+            };
+            out_dir.join(tar_name).exists()
+        })
+    };
     let has_generated = out_dir.join("generated").exists()
         && std::fs::read_dir(out_dir.join("generated"))
             .map(|d| d.count() > 0)
@@ -110,7 +112,7 @@ fn main() {
 
     // Skip build if the Neso environment is unavailable and we have pre-built outputs.
     if !venv_python.exists() {
-        if has_prebuilt && has_generated {
+        if has_prebuilt() && has_generated {
             println!("cargo:warning=Neso environment not found, using pre-built kernel archives.");
             return;
         } else {
@@ -136,7 +138,7 @@ fn main() {
         Ok(s) if s.success() => {
             println!("cargo:warning=Triton kernels compiled successfully ({platform_str}).");
         }
-        Ok(s) if has_prebuilt && has_generated => {
+        Ok(s) if has_prebuilt() && has_generated => {
             println!(
                 "cargo:warning=Kernel build failed (exit {:?}), using pre-built archives.",
                 s.code()
@@ -148,7 +150,7 @@ fn main() {
                 s.code()
             );
         }
-        Err(e) if has_prebuilt && has_generated => {
+        Err(e) if has_prebuilt() && has_generated => {
             println!("cargo:warning=Could not run kernel build ({e}), using pre-built archives.");
         }
         Err(e) => {

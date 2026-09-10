@@ -58,6 +58,14 @@ impl MetalBackend {
     fn enc(&self) -> std::cell::Ref<'_, ComputeCommandEncoder> {
         std::cell::Ref::map(self.encoder.borrow(), |e| e.as_ref().unwrap())
     }
+
+    #[cfg(target_arch = "x86_64")]
+    fn finish_dispatch(&self) {
+        self.enc().insert_memory_barrier();
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn finish_dispatch(&self) {}
 }
 
 impl DecoderBackend for MetalBackend {
@@ -123,6 +131,7 @@ impl DecoderBackend for MetalBackend {
     fn layernorm_f32in(&self, x: &GpuBuffer, w: &GpuBuffer, out: &GpuBuffer, dim: usize) {
         enc_layernorm_std_f32in(&self.enc(), &self.kernels.layernorm_std_f32in,
             x, w, out, 1, dim);
+        self.finish_dispatch();
     }
 
     fn qkv_proj(&self, norm: &GpuBuffer, attn: &AttentionW<GpuBuffer>,
@@ -135,6 +144,7 @@ impl DecoderBackend for MetalBackend {
             q, k, v,
             &self.f16_partial,
             q_dim, dim, 16);
+        self.finish_dispatch();
     }
 
     fn rope_kv_cache(&self, q: &GpuBuffer, k: &GpuBuffer, v: &GpuBuffer,
@@ -147,6 +157,8 @@ impl DecoderBackend for MetalBackend {
         enc_kv_cache_append(&enc, &self.kernels.kv_cache_append,
             v, cache_v,
             p.n_kv_heads, p.head_dim, p.max_kv_len, p.pos);
+        drop(enc);
+        self.finish_dispatch();
     }
 
     fn self_attention(&self, q: &GpuBuffer, cache_k: &GpuBuffer, cache_v: &GpuBuffer,
@@ -157,6 +169,7 @@ impl DecoderBackend for MetalBackend {
             p.sm_scale,
             p.max_kv_len * p.head_dim,  // stride_kv_head
             p.head_dim);                 // stride_kv_seq
+        self.finish_dispatch();
     }
 
     fn cross_attention(&self, q: &GpuBuffer, k: &GpuBuffer, v: &GpuBuffer,
@@ -167,9 +180,10 @@ impl DecoderBackend for MetalBackend {
             q, k, v, out, &self.f32_splitkv_partial,
             p.kv_len, p.head_dim, p.n_kv_heads, p.n_q_heads,
             p.sm_scale,
-            p.head_dim,                     // stride_kv_head (cross: seq-major)
-            p.n_kv_heads * p.head_dim,      // stride_kv_seq
+            p.head_dim,
+            p.n_kv_heads * p.head_dim,
             n_splits);
+        self.finish_dispatch();
     }
 
     fn gemv_resadd_ln(&self, x: &GpuBuffer, w: &GpuBuffer,
@@ -177,16 +191,17 @@ impl DecoderBackend for MetalBackend {
                        ln_w: &GpuBuffer, norm_out: &GpuBuffer,
                        temp: &GpuBuffer, dim: usize, in_dim: usize) {
         let enc = self.enc();
-        // Phase 1: split-K GEMV (O proj) → temp
         enc_gemv_splitk(&enc,
             &self.kernels.gemv_splitk_partial, &self.kernels.gemv_splitk_reduce,
             x, w, temp, &self.f16_partial,
             dim, in_dim, 16);
-        // Phase 2: residual add + layernorm: temp + res_in → res_out + norm_out
+        #[cfg(target_arch = "x86_64")]
+        enc.insert_memory_barrier();
         enc_residual_add_layernorm(&enc, &self.kernels.residual_add_layernorm,
             temp, res_in, res_out,
             ln_w, norm_out,
             1, dim);
+        self.finish_dispatch();
     }
 
     fn cross_q_proj(&self, x: &GpuBuffer, w: &GpuBuffer, out: &GpuBuffer,
@@ -195,6 +210,7 @@ impl DecoderBackend for MetalBackend {
             &self.kernels.gemv_splitk_partial, &self.kernels.gemv_splitk_reduce,
             x, w, out, &self.f16_partial,
             n, k, 16);
+        self.finish_dispatch();
     }
 
     fn mlp_fc1_glu(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer,
@@ -203,6 +219,7 @@ impl DecoderBackend for MetalBackend {
             &self.kernels.gemv_glu_splitk_partial, &self.kernels.gemv_glu_splitk_reduce,
             x, w, bias, out, &self.f16_partial,
             intermediate, dim, 16);
+        self.finish_dispatch();
     }
 
     fn mlp_fc2_bias(&self, x: &GpuBuffer, w: &GpuBuffer, bias: &GpuBuffer,
@@ -211,6 +228,7 @@ impl DecoderBackend for MetalBackend {
             &self.kernels.gemv_splitk_partial, &self.kernels.gemv_splitk_bias_reduce,
             x, w, bias, out, &self.f16_partial,
             dim, intermediate, 32);
+        self.finish_dispatch();
     }
 
     fn residual_add_ln(&self, proj: &GpuBuffer, res_in: &GpuBuffer, res_out: &GpuBuffer,
@@ -219,12 +237,14 @@ impl DecoderBackend for MetalBackend {
             proj, res_in, res_out,
             ln_w, norm_out,
             1, dim);
+        self.finish_dispatch();
     }
 
     fn lm_head(&self, x: &GpuBuffer, w: &GpuBuffer, out: &GpuBuffer,
                 vocab: usize, dim: usize) {
         enc_gemv_f16w(&self.enc(), &self.kernels.gemv_f16w,
             x, w, out, vocab, dim);
+        self.finish_dispatch();
     }
 
     fn matmul_cross_kv(&self, enc_proj: &GpuBuffer, w: &GpuBuffer, out: &GpuBuffer,
@@ -237,5 +257,6 @@ impl DecoderBackend for MetalBackend {
         enc_matmul(&self.enc(), pipeline,
             enc_proj, w, out,
             m, n, k, block_m, block_m);
+        self.finish_dispatch();
     }
 }

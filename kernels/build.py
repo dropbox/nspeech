@@ -297,7 +297,15 @@ def gen_ninja_hlsl():
         w.append("pool dxc_pool\n  depth = 4")
         w.append(f"rule dxil\n  command = {dxil_cmd}\n  pool = dxc_pool\n  description = DXIL $out")
     else:
-        local_dxc = Path(dxc_path).expanduser() if dxc_path else SCRIPT_DIR / "dxc" / "dxc"
+        if dxc_path:
+            local_dxc = Path(dxc_path).expanduser()
+        else:
+            bundled_dxc = SCRIPT_DIR / "dxc" / "dxc"
+            sibling_dxc = (
+                SCRIPT_DIR.parent.parent
+                / "directxshadercompiler/build-release/bin/dxc"
+            )
+            local_dxc = sibling_dxc if sibling_dxc.exists() else bundled_dxc
         if not local_dxc.is_absolute():
             # Environment paths are normally supplied relative to the project root,
             # while build.py is commonly run from kernels/ via the Makefile.
@@ -400,7 +408,7 @@ def run_ninja(platform):
             print(f"ninja({platform}): {dt:.1f}s - FATAL: missing metallibs for {missing}")
             return False
     print(f"ninja({platform}): {dt:.1f}s (exit={r.returncode})")
-    return True
+    return r.returncode == 0
 
 
 def gen_rust():

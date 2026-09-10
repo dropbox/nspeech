@@ -173,9 +173,29 @@ impl MoonshineModel {
 
         #[cfg(feature = "triton-metal")]
         let (gpu_encoder, gpu_decoder): (Option<GpuEnc>, Option<GpuDec>) = {
-            let metal_dev: Option<candle_core::MetalDevice> = match device {
-                Device::Metal(md) => Some(md.clone()),
-                _ => None,
+            let force_cpu = std::env::var("PARAKEET_DEVICE").as_deref() == Ok("cpu");
+            let metal_dev: Option<candle_core::MetalDevice> = if force_cpu {
+                eprintln!("  Triton Metal disabled by PARAKEET_DEVICE=cpu");
+                None
+            } else {
+                match device {
+                    Device::Metal(md) => Some(md.clone()),
+                    _ => match std::panic::catch_unwind(|| Device::new_metal(0)) {
+                        Ok(Ok(Device::Metal(md))) => Some(md),
+                        Ok(Ok(_)) => {
+                            eprintln!("  Triton Metal device unavailable");
+                            None
+                        }
+                        Ok(Err(e)) => {
+                            eprintln!("  Triton Metal device unavailable: {e}");
+                            None
+                        }
+                        Err(_) => {
+                            eprintln!("  Triton Metal device initialization panicked");
+                            None
+                        }
+                    },
+                }
             };
             let enc = metal_dev.as_ref().and_then(|md| {
                 use super::gpu_encoder_metal::MetalEncoderBackend;
@@ -214,6 +234,14 @@ impl MoonshineModel {
                     }
                 }
             });
+            eprintln!(
+                "  Moonshine encoder backend: {}",
+                if enc.is_some() { "Triton Metal" } else { "CPU fallback" }
+            );
+            eprintln!(
+                "  Moonshine decoder backend: {}",
+                if dec.is_some() { "Triton Metal" } else { "CPU fallback" }
+            );
             (enc, dec)
         };
 
@@ -260,10 +288,20 @@ impl MoonshineModel {
                             }
                         }
                     };
+                    eprintln!(
+                        "  Moonshine encoder backend: {}",
+                        if enc.is_some() { "Triton D3D12" } else { "CPU fallback" }
+                    );
+                    eprintln!(
+                        "  Moonshine decoder backend: {}",
+                        if dec.is_some() { "Triton D3D12" } else { "CPU fallback" }
+                    );
                     (enc, dec)
                 }
                 Err(e) => {
                     eprintln!("  D3D12 GPU unavailable: {e}");
+                    eprintln!("  Moonshine encoder backend: CPU fallback");
+                    eprintln!("  Moonshine decoder backend: CPU fallback");
                     (None, None)
                 }
             }

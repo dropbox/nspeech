@@ -1442,6 +1442,17 @@ def rope_qk_cache_fused(
     cache_dst = k_pass_head * max_kv_len * HEAD_DIM + pos * HEAD_DIM + rotary_dim + k_pass_offset
     tl.store(cache_k_ptr + cache_dst, k_val, mask=k_pass_mask)
 
+    # BLOCK_SIZE is kept within older Intel Metal threadgroup limits. Cover
+    # the tail of the pass-through region with a second element per lane.
+    tid_tail = tid + BLOCK_SIZE
+    k_pass_tail_mask = tid_tail < k_pass_total
+    k_pass_tail_head = tid_tail // pass_per_head
+    k_pass_tail_offset = tid_tail % pass_per_head
+    k_tail_src = k_pass_tail_head * HEAD_DIM + rotary_dim + k_pass_tail_offset
+    k_tail_val = tl.load(k_ptr + k_tail_src, mask=k_pass_tail_mask, other=0.0)
+    cache_tail_dst = k_pass_tail_head * max_kv_len * HEAD_DIM + pos * HEAD_DIM + rotary_dim + k_pass_tail_offset
+    tl.store(cache_k_ptr + cache_tail_dst, k_tail_val, mask=k_pass_tail_mask)
+
 
 @triton.jit
 def attention_decode_fwd(

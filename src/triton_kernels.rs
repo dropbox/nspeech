@@ -902,6 +902,8 @@ pub fn enc_attention_splitkv(
         MTLSize { width: n_q_heads * n_splits, height: 1, depth: 1 },
         tg_size(partial_pipeline, 128),
     );
+    #[cfg(target_arch = "x86_64")]
+    enc.insert_memory_barrier();
 
     // Phase 2: reduce partials to final output
     enc.set_compute_pipeline_state(reduce_pipeline);
@@ -931,7 +933,7 @@ pub fn enc_rope_qk_cache_fused(
     enc.set_bytes(5, &(max_kv_len as i32));
     enc.dispatch_thread_groups(
         MTLSize { width: 1, height: 1, depth: 1 },
-        tg_size(pipeline, 512),
+        tg_size(pipeline, 256),
     );
 }
 
@@ -1003,6 +1005,8 @@ pub fn enc_gemv_splitk_bias(
         MTLSize { width: n_n_blocks * n_splits, height: 1, depth: 1 },
         tg_size(partial_pipeline, 128),
     );
+    #[cfg(target_arch = "x86_64")]
+    enc.insert_memory_barrier();
     // Phase 2: reduce + bias
     enc.set_compute_pipeline_state(reduce_pipeline);
     enc.set_buffer(0, Some(partial_buf.buf()), partial_buf.offset);
@@ -1042,6 +1046,8 @@ pub fn enc_gemv_splitk(
         MTLSize { width: n_n_blocks * n_splits, height: 1, depth: 1 },
         tg_size(partial_pipeline, 128),
     );
+    #[cfg(target_arch = "x86_64")]
+    enc.insert_memory_barrier();
     // Phase 2: reduce
     enc.set_compute_pipeline_state(reduce_pipeline);
     enc.set_buffer(0, Some(partial_buf.buf()), partial_buf.offset);
@@ -1084,6 +1090,8 @@ pub fn enc_gemv_qkv_splitk(
         MTLSize { width: n_n_blocks * n_splits, height: 3, depth: 1 },
         tg_size(partial_pipeline, 128),
     );
+    #[cfg(target_arch = "x86_64")]
+    enc.insert_memory_barrier();
     // Phase 2: fused QKV reduce (grid: cdiv(N,128) × 3)
     enc.set_compute_pipeline_state(reduce_pipeline);
     enc.set_buffer(0, Some(partial_buf.buf()), partial_buf.offset);
@@ -1124,6 +1132,8 @@ pub fn enc_gemv_glu_splitk(
         MTLSize { width: n_n_blocks * n_splits, height: 1, depth: 1 },
         tg_size(partial_pipeline, 128),
     );
+    #[cfg(target_arch = "x86_64")]
+    enc.insert_memory_barrier();
     // Phase 2: reduce + bias + GLU-SiLU
     enc.set_compute_pipeline_state(reduce_pipeline);
     enc.set_buffer(0, Some(partial_buf.buf()), partial_buf.offset);
@@ -1358,4 +1368,3 @@ pub fn enc_convert_f32_to_f16(
     let grid = MTLSize { width: cdiv(n_elements, 1024), height: 1, depth: 1 };
     enc.dispatch_thread_groups(grid, tg_size(pipeline, 1024));
 }
-

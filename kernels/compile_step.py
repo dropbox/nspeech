@@ -34,6 +34,9 @@ def write_if_changed(path: Path, content: str) -> bool:
 
 def main():
     cmd, inp, out = sys.argv[1], sys.argv[2], sys.argv[3]
+    meta_path = Path(inp).with_suffix(".json")
+    metadata = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+    block_size = metadata.get("threadgroup_size", 256)
 
     if cmd == "msl_metal":
         from neso.backend.codegen import ttir_to_msl_with_metadata
@@ -44,15 +47,15 @@ def main():
     elif cmd == "msl_metal_nosimd":
         from neso.backend.codegen import ttir_to_msl_with_metadata
         msl, _, _, _ = ttir_to_msl_with_metadata(
-            Path(inp).read_text(), block_size=256, use_simdgroup=False)
+            Path(inp).read_text(), block_size=block_size,
+            use_simdgroup=False, max_threads=416)
         write_if_changed(Path(out), msl)
 
     elif cmd == "hlsl":
         from neso.backend.codegen import ttir_to_hlsl_with_metadata
-        meta_path = Path(inp).with_suffix(".json")
         force_fp16 = False
-        if meta_path.exists():
-            force_fp16 = json.loads(meta_path.read_text()).get("force_acc_fp16", False)
+        if metadata:
+            force_fp16 = metadata.get("force_acc_fp16", False)
         hlsl, name, _, threads, half4_args = ttir_to_hlsl_with_metadata(
             Path(inp).read_text(), block_size=256, force_acc_fp16=force_fp16)
         write_if_changed(Path(out), hlsl)

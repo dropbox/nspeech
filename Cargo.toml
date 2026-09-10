@@ -109,9 +109,10 @@ candle-nn = { git = "https://github.com/jacobgorm/candle", branch = "windows" }
 candle-core = { git = "https://github.com/jacobgorm/candle", branch = "windows" }
 candle-nn = { git = "https://github.com/jacobgorm/candle", branch = "windows" }
 
-## Override candle git deps with local worktree that has D3D12 backend
-#[patch."https://github.com/jacobgorm/candle"]
-#candle-core = { path = "../candle/windows/candle-core" }
-#candle-nn = { path = "../candle/windows/candle-nn" }
-#candle-transformers = { path = "../candle/windows/candle-transformers" }
-#candle-metal-kernels = { path = "../candle/windows/candle-metal-kernels" }
+## Override Candle git deps with the local worktree that has D3D12 and Metal barriers.
+[patch."https://github.com/jacobgorm/candle"]
+candle-core = { path = "../candle/windows/candle-core" }
+candle-nn = { path = "../candle/windows/candle-nn" }
+candle-transformers = { path = "../candle/windows/candle-transformers" }
+candle-metal-kernels = { path = "../candle/windows/candle-metal-kernels" }
+candle-d3d12-kernels = { path = "../candle/windows/candle-d3d12-kernels" }

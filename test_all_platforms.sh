@@ -30,17 +30,17 @@ fail()   { FAIL=$((FAIL+1)); RESULTS+="  FAIL  $1\n"; }
 header "Building for M2 Mac (aarch64-apple-darwin)"
 cargo build --release --features triton-metal --example $EXAMPLE \
   --target aarch64-apple-darwin 2>&1 \
-  | grep -E 'Compiling speech|Finished|error' || true
+  | grep -E 'Compiling speech|Finished|error'
 
 header "Building for Intel Mac (x86_64-apple-darwin)"
 cargo build --release --features triton-metal --example $EXAMPLE \
   --target x86_64-apple-darwin 2>&1 \
-  | grep -E 'Compiling speech|Finished|error' || true
+  | grep -E 'Compiling speech|Finished|error'
 
 header "Building for Windows (x86_64-pc-windows-msvc)"
 cargo xwin build --release --features triton-d3d12 --example $EXAMPLE \
   --target x86_64-pc-windows-msvc 2>&1 \
-  | grep -E 'Compiling speech|Finished|error' || true
+  | grep -E 'Compiling speech|Finished|error'
 
 # ── 2. Deploy to remote hosts ──────────────────────────────────────────────
 
