@@ -114,8 +114,7 @@ impl MoonshineStream {
 pub struct MoonshineModel {
     pub cfg: MoonshineConfig,
     frontend: MoonshineFrontend,
-    #[allow(dead_code)] // fallback when triton_encoder is None
-    encoder: MoonshineEncoder,
+    encoder: Option<MoonshineEncoder>,
     #[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
     gpu_encoder: Option<GpuEnc>,
     #[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
@@ -169,7 +168,6 @@ impl MoonshineModel {
 
         // Build model components
         let frontend = MoonshineFrontend::new(&cfg, vb.pp("model.encoder.embedder"))?;
-        let encoder = MoonshineEncoder::new(&cfg, vb.pp("model.encoder"))?;
 
         #[cfg(feature = "triton-metal")]
         let (gpu_encoder, gpu_decoder): (Option<GpuEnc>, Option<GpuDec>) = {
@@ -307,6 +305,15 @@ impl MoonshineModel {
             }
         };
 
+        #[cfg(any(feature = "triton-metal", feature = "triton-d3d12"))]
+        let encoder = if gpu_encoder.is_some() {
+            None
+        } else {
+            Some(MoonshineEncoder::new(&cfg, vb.pp("model.encoder"))?)
+        };
+        #[cfg(not(any(feature = "triton-metal", feature = "triton-d3d12")))]
+        let encoder = Some(MoonshineEncoder::new(&cfg, vb.pp("model.encoder"))?);
+
         let decoder = MoonshineDecoder::new(&cfg, device, vb.pp("model.decoder"))?;
 
         // Output projection: decoder_dim -> vocab_size (quantized, no bias)
@@ -336,7 +343,10 @@ impl MoonshineModel {
         if let Some(enc) = &self.gpu_encoder {
             return gpu_encode(enc, features);
         }
-        self.encoder.forward(features)
+        self.encoder
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("CPU encoder fallback not initialized"))?
+            .forward(features)
     }
 
     pub fn encode(&self, audio: &Tensor) -> Result<Tensor> {

@@ -8,6 +8,7 @@ use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 
 use super::config::MoonshineConfig;
+use crate::q8_dequant;
 
 type QVarBuilder = candle_transformers::quantized_var_builder::VarBuilder;
 
@@ -179,9 +180,7 @@ pub struct Scratch<B> {
 /// Dequantize 2D weight: GGUF → f32, transpose, flatten.
 fn dequant_2d(shape: (usize, usize), vb: &QVarBuilder) -> Result<Vec<f32>> {
     let qt = vb.get(shape, "weight")?;
-    let t = qt.dequantize(&Device::Cpu)?;
-    let t = t.t()?.contiguous()?.flatten_all()?;
-    Ok(t.to_vec1::<f32>()?)
+    q8_dequant::dequant_2d(shape, &qt)
 }
 
 /// Dequantize 1D weight/bias: GGUF → f32.

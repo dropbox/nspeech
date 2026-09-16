@@ -9,6 +9,7 @@ use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 
 use super::config::MoonshineConfig;
+use crate::q8_dequant;
 
 type QVarBuilder = candle_transformers::quantized_var_builder::VarBuilder;
 
@@ -138,9 +139,9 @@ pub struct EncoderLinearBiasW<W, B> {
 }
 
 pub struct EncoderAttentionW<W> {
-    pub q_proj: W,  // baked: (1+gamma) * W
-    pub k_proj: W,
-    pub v_proj: W,
+    pub q_proj: Option<W>,  // baked: (1+gamma) * W; absent when fused
+    pub k_proj: Option<W>,
+    pub v_proj: Option<W>,
     pub qkv_proj: Option<W>,  // fused [dim, 3*kv_dim] weight (if backend supports buf_slice)
     pub o_proj: W,
     pub num_heads: usize,
@@ -163,9 +164,9 @@ pub struct EncoderLayerW<W, B> {
 
 struct EncoderScratch<B> {
     normed: B,      // [padded_seq, encoder_dim] f16
-    q: B,           // [padded_seq, kv_dim] f16
-    k: B,           // [padded_seq, kv_dim] f16
-    v: B,           // [padded_seq, kv_dim] f16
+    q: Option<B>,   // [padded_seq, kv_dim] f16; absent when fused
+    k: Option<B>,
+    v: Option<B>,
     qkv: Option<B>, // [padded_seq, 3*kv_dim] f16 — fused QKV output
     attn_out: B,    // [padded_seq, kv_dim] f16
     attn_proj: B,   // [padded_seq, encoder_dim] f16
@@ -180,9 +181,7 @@ struct EncoderScratch<B> {
 /// Dequantize 2D weight: GGUF → f32, transpose, flatten row-major.
 fn dequant_2d(shape: (usize, usize), vb: &QVarBuilder) -> Result<Vec<f32>> {
     let qt = vb.get(shape, "weight")?;
-    let t = qt.dequantize(&Device::Cpu)?;
-    let t = t.t()?.contiguous()?.flatten_all()?;
-    Ok(t.to_vec1::<f32>()?)
+    q8_dequant::dequant_2d(shape, &qt)
 }
 
 /// Dequantize 1D weight/bias: GGUF → f32.
@@ -242,9 +241,9 @@ impl<B: EncoderBackend> GpuEncoder<B> {
         // Pre-allocate scratch buffers
         let scratch = EncoderScratch {
             normed: backend.alloc_activation(padded_seq * dim)?,
-            q: backend.alloc_activation(padded_seq * kv_dim)?,
-            k: backend.alloc_activation(padded_seq * kv_dim)?,
-            v: backend.alloc_activation(padded_seq * kv_dim)?,
+            q: if fuse_qkv { None } else { Some(backend.alloc_activation(padded_seq * kv_dim)?) },
+            k: if fuse_qkv { None } else { Some(backend.alloc_activation(padded_seq * kv_dim)?) },
+            v: if fuse_qkv { None } else { Some(backend.alloc_activation(padded_seq * kv_dim)?) },
             qkv: if fuse_qkv {
                 Some(backend.alloc_activation(padded_seq * 3 * kv_dim)?)
             } else { None },
@@ -275,20 +274,27 @@ impl<B: EncoderBackend> GpuEncoder<B> {
             bake_gamma(&mut w_v, &input_ln_gamma, dim, kv_dim);
 
             // Fused QKV weight: [dim, 3*kv_dim] row-major (q|k|v interleaved per row)
-            let qkv_proj = if fuse_qkv {
+            let (q_proj, k_proj, v_proj, qkv_proj) = if fuse_qkv {
                 let mut w_qkv = Vec::with_capacity(dim * 3 * kv_dim);
                 for row in 0..dim {
                     w_qkv.extend_from_slice(&w_q[row * kv_dim..(row + 1) * kv_dim]);
                     w_qkv.extend_from_slice(&w_k[row * kv_dim..(row + 1) * kv_dim]);
                     w_qkv.extend_from_slice(&w_v[row * kv_dim..(row + 1) * kv_dim]);
                 }
-                Some(backend.upload_matmul_weight(&w_qkv, dim, 3 * kv_dim)?)
-            } else { None };
+                (None, None, None, Some(backend.upload_matmul_weight(&w_qkv, dim, 3 * kv_dim)?))
+            } else {
+                (
+                    Some(backend.upload_matmul_weight(&w_q, dim, kv_dim)?),
+                    Some(backend.upload_matmul_weight(&w_k, dim, kv_dim)?),
+                    Some(backend.upload_matmul_weight(&w_v, dim, kv_dim)?),
+                    None,
+                )
+            };
 
             let self_attn = EncoderAttentionW {
-                q_proj: backend.upload_matmul_weight(&w_q, dim, kv_dim)?,
-                k_proj: backend.upload_matmul_weight(&w_k, dim, kv_dim)?,
-                v_proj: backend.upload_matmul_weight(&w_v, dim, kv_dim)?,
+                q_proj,
+                k_proj,
+                v_proj,
                 qkv_proj,
                 o_proj: backend.upload_matmul_weight(&dequant_2d((dim, kv_dim), &avb.pp("o_proj"))?, kv_dim, dim)?,
                 num_heads: cfg.encoder_num_heads,
@@ -397,11 +403,17 @@ impl<B: EncoderBackend> GpuEncoder<B> {
                 });
             } else {
                 // 3 independent matmuls — no barriers between them
-                b.matmul(&s.normed, &layer.self_attn.q_proj, &s.q, padded_seq, kv_dim, dim);
-                b.matmul(&s.normed, &layer.self_attn.k_proj, &s.k, padded_seq, kv_dim, dim);
-                b.matmul(&s.normed, &layer.self_attn.v_proj, &s.v, padded_seq, kv_dim, dim);
+                let q_proj = layer.self_attn.q_proj.as_ref().expect("unfused Q weight");
+                let k_proj = layer.self_attn.k_proj.as_ref().expect("unfused K weight");
+                let v_proj = layer.self_attn.v_proj.as_ref().expect("unfused V weight");
+                let q = s.q.as_ref().expect("unfused Q scratch");
+                let k = s.k.as_ref().expect("unfused K scratch");
+                let v = s.v.as_ref().expect("unfused V scratch");
+                b.matmul(&s.normed, q_proj, q, padded_seq, kv_dim, dim);
+                b.matmul(&s.normed, k_proj, k, padded_seq, kv_dim, dim);
+                b.matmul(&s.normed, v_proj, v, padded_seq, kv_dim, dim);
                 b.barrier();
-                b.flash_attention(&s.q, &s.k, &s.v, &s.attn_out, &FlashAttentionParams {
+                b.flash_attention(q, k, v, &s.attn_out, &FlashAttentionParams {
                     n_heads: layer.self_attn.num_heads,
                     padded_seq,
                     seq_len,
@@ -539,12 +551,18 @@ impl<B: EncoderBackend> GpuEncoder<B> {
                     window_left: win_left as i32, window_right: win_right as i32,
                 }));
             } else {
+                let q_proj = layer.self_attn.q_proj.as_ref().expect("unfused Q weight");
+                let k_proj = layer.self_attn.k_proj.as_ref().expect("unfused K weight");
+                let v_proj = layer.self_attn.v_proj.as_ref().expect("unfused V weight");
+                let q = s.q.as_ref().expect("unfused Q scratch");
+                let k = s.k.as_ref().expect("unfused K scratch");
+                let v = s.v.as_ref().expect("unfused V scratch");
                 timed!("qkv_matmul", {
-                    b.matmul(&s.normed, &layer.self_attn.q_proj, &s.q, padded_seq, kv_dim, dim);
-                    b.matmul(&s.normed, &layer.self_attn.k_proj, &s.k, padded_seq, kv_dim, dim);
-                    b.matmul(&s.normed, &layer.self_attn.v_proj, &s.v, padded_seq, kv_dim, dim);
+                    b.matmul(&s.normed, q_proj, q, padded_seq, kv_dim, dim);
+                    b.matmul(&s.normed, k_proj, k, padded_seq, kv_dim, dim);
+                    b.matmul(&s.normed, v_proj, v, padded_seq, kv_dim, dim);
                 });
-                timed!("flash_attn", b.flash_attention(&s.q, &s.k, &s.v, &s.attn_out, &FlashAttentionParams {
+                timed!("flash_attn", b.flash_attention(q, k, v, &s.attn_out, &FlashAttentionParams {
                     n_heads: layer.self_attn.num_heads,
                     padded_seq, seq_len,
                     head_dim: layer.self_attn.head_dim,

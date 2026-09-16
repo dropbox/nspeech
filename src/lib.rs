@@ -4,6 +4,8 @@ pub mod kokoro;
 pub mod silero;
 pub mod streaming;
 
+mod q8_dequant;
+
 #[cfg(feature = "fast-cpu")]
 pub mod fast_matmul;
 #[cfg(feature = "fast-cpu")]

@@ -69,8 +69,8 @@ impl KokoroModel {
 
         let mut tensors: HashMap<String, Tensor> = HashMap::new();
         for (name, info) in &gguf.tensor_infos {
-            let qtensor = info.read(&mut file, gguf.tensor_data_offset, device)?;
-            let tensor = qtensor.dequantize(device)?;
+            let qtensor = info.read(&mut file, gguf.tensor_data_offset, &Device::Cpu)?;
+            let tensor = crate::q8_dequant::dequantize(&qtensor, device)?;
             // Restore 3D conv shape: if name contains conv/ups/noise_convs weight and
             // the original model has 3D weights, reshape from [out, in*kernel] -> [out, in, kernel]
             let tensor = Self::maybe_reshape_conv(name, tensor, &config);
@@ -112,8 +112,8 @@ impl KokoroModel {
 
         let mut tensors: HashMap<String, Tensor> = HashMap::new();
         for (name, info) in &gguf.tensor_infos {
-            let qtensor = info.read(&mut cursor, gguf.tensor_data_offset, device)?;
-            let tensor = qtensor.dequantize(device)?;
+            let qtensor = info.read(&mut cursor, gguf.tensor_data_offset, &Device::Cpu)?;
+            let tensor = crate::q8_dequant::dequantize(&qtensor, device)?;
             let tensor = Self::maybe_reshape_conv(name, tensor, &config);
             tensors.insert(name.clone(), tensor);
         }
