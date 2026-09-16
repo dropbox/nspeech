@@ -35,21 +35,24 @@ impl Deref for CommandEncoderGuard<'_> {
     }
 }
 
-/// Compatibility for generated dispatch code which predates Candle's split
-/// input/output binding API. Treating an unclassified binding as an output is
-/// conservative: it preserves RAW/WAR/WAW ordering, at the cost of an
-/// occasional unnecessary barrier. New dispatch code should use the explicit
-/// `set_input_buffer` and `set_output_buffer` methods instead.
-pub trait LegacyBufferBinding {
-    fn set_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize);
+/// Forward the compute-encoder operations that Candle's pooled guard exposes
+/// through `AsRef`. Buffer access is classified explicitly so Candle can add
+/// only the Metal barriers that are actually required.
+pub trait CommandEncoderExt {
+    fn set_input_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize);
+    fn set_output_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize);
     fn set_bytes<T>(&self, index: usize, data: &T);
     fn set_threadgroup_memory_length(&self, index: usize, length: usize);
     fn dispatch_threads(&self, grid: MTLSize, threadgroup: MTLSize);
     fn dispatch_thread_groups(&self, grid: MTLSize, threadgroup: MTLSize);
 }
 
-impl<T: AsRef<ComputeCommandEncoder>> LegacyBufferBinding for T {
-    fn set_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize) {
+impl<T: AsRef<ComputeCommandEncoder>> CommandEncoderExt for T {
+    fn set_input_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize) {
+        self.as_ref().set_input_buffer(index, buffer, offset);
+    }
+
+    fn set_output_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize) {
         self.as_ref().set_output_buffer(index, buffer, offset);
     }
 
@@ -180,9 +183,9 @@ pub fn triton_matmul(
     with_metal_buffers!(a, b, &out, |a_buf, a_off, b_buf, b_off, o_buf, o_off| {
         let encoder = device.command_encoder()?;
         encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(a_buf), a_off);
-        encoder.set_buffer(1, Some(b_buf), b_off);
-        encoder.set_buffer(2, Some(o_buf), o_off);
+        encoder.set_input_buffer(0, Some(a_buf), a_off);
+        encoder.set_input_buffer(1, Some(b_buf), b_off);
+        encoder.set_output_buffer(2, Some(o_buf), o_off);
         encoder.set_bytes(3, &(m as i32));
         encoder.set_bytes(4, &(n as i32));
         encoder.set_bytes(5, &(k as i32));
@@ -228,10 +231,10 @@ pub fn triton_matmul_bias(
     with_metal_buffers!(a, b, bias, &out, |a_buf, a_off, b_buf, b_off, bias_buf, bias_off, o_buf, o_off| {
         let encoder = device.command_encoder()?;
         encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(a_buf), a_off);
-        encoder.set_buffer(1, Some(b_buf), b_off);
-        encoder.set_buffer(2, Some(bias_buf), bias_off);
-        encoder.set_buffer(3, Some(o_buf), o_off);
+        encoder.set_input_buffer(0, Some(a_buf), a_off);
+        encoder.set_input_buffer(1, Some(b_buf), b_off);
+        encoder.set_input_buffer(2, Some(bias_buf), bias_off);
+        encoder.set_output_buffer(3, Some(o_buf), o_off);
         encoder.set_bytes(4, &(m as i32));
         encoder.set_bytes(5, &(n as i32));
         encoder.set_bytes(6, &(k as i32));
@@ -277,10 +280,10 @@ pub fn triton_matmul_bias_gelu(
     with_metal_buffers!(a, b, bias, &out, |a_buf, a_off, b_buf, b_off, bias_buf, bias_off, o_buf, o_off| {
         let encoder = device.command_encoder()?;
         encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(a_buf), a_off);
-        encoder.set_buffer(1, Some(b_buf), b_off);
-        encoder.set_buffer(2, Some(bias_buf), bias_off);
-        encoder.set_buffer(3, Some(o_buf), o_off);
+        encoder.set_input_buffer(0, Some(a_buf), a_off);
+        encoder.set_input_buffer(1, Some(b_buf), b_off);
+        encoder.set_input_buffer(2, Some(bias_buf), bias_off);
+        encoder.set_output_buffer(3, Some(o_buf), o_off);
         encoder.set_bytes(4, &(m as i32));
         encoder.set_bytes(5, &(n as i32));
         encoder.set_bytes(6, &(k as i32));
@@ -319,9 +322,9 @@ pub fn triton_layernorm_unit_offset(
     with_metal_buffers!(x, gamma, &out, |x_buf, x_off, g_buf, g_off, o_buf, o_off| {
         let encoder = device.command_encoder()?;
         encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(x_buf), x_off);
-        encoder.set_buffer(1, Some(g_buf), g_off);
-        encoder.set_buffer(2, Some(o_buf), o_off);
+        encoder.set_input_buffer(0, Some(x_buf), x_off);
+        encoder.set_input_buffer(1, Some(g_buf), g_off);
+        encoder.set_output_buffer(2, Some(o_buf), o_off);
         encoder.set_bytes(3, &(n_rows as i32));
         encoder.set_bytes(4, &(n_cols as i32));
         encoder.set_bytes(5, &(n_cols as i32));
@@ -357,8 +360,8 @@ pub fn triton_layernorm_bare(
             (Storage::Metal(mx), Storage::Metal(mo)) => {
                 let encoder = device.command_encoder()?;
                 encoder.set_compute_pipeline_state(pipeline);
-                encoder.set_buffer(0, Some(mx.buffer()), x_off);
-                encoder.set_buffer(1, Some(mo.buffer()), o_off);
+                encoder.set_input_buffer(0, Some(mx.buffer()), x_off);
+                encoder.set_output_buffer(1, Some(mo.buffer()), o_off);
                 encoder.set_bytes(2, &(n_rows as i32));
                 encoder.set_bytes(3, &(n_cols as i32));
                 encoder.set_bytes(4, &(n_cols as i32));
@@ -389,9 +392,9 @@ pub fn triton_residual_add(
     with_metal_buffers!(x, residual, &out, |x_buf, x_off, r_buf, r_off, o_buf, o_off| {
         let encoder = device.command_encoder()?;
         encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(x_buf), x_off);
-        encoder.set_buffer(1, Some(r_buf), r_off);
-        encoder.set_buffer(2, Some(o_buf), o_off);
+        encoder.set_input_buffer(0, Some(x_buf), x_off);
+        encoder.set_input_buffer(1, Some(r_buf), r_off);
+        encoder.set_output_buffer(2, Some(o_buf), o_off);
         encoder.set_bytes(3, &(n_elements as i32));
 
         let tg_w = tg_size(pipeline, 1024).width;
@@ -423,8 +426,8 @@ pub fn triton_gelu(
             (Storage::Metal(mx), Storage::Metal(mo)) => {
                 let encoder = device.command_encoder()?;
                 encoder.set_compute_pipeline_state(pipeline);
-                encoder.set_buffer(0, Some(mx.buffer()), x_off);
-                encoder.set_buffer(1, Some(mo.buffer()), o_off);
+                encoder.set_input_buffer(0, Some(mx.buffer()), x_off);
+                encoder.set_output_buffer(1, Some(mo.buffer()), o_off);
                 encoder.set_bytes(2, &(n_elements as i32));
 
                 // Kernel hardcodes BLOCK_SIZE=1024
@@ -452,9 +455,9 @@ pub fn triton_bias_add(
     with_metal_buffers!(x, bias, &out, |x_buf, x_off, b_buf, b_off, o_buf, o_off| {
         let encoder = device.command_encoder()?;
         encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(x_buf), x_off);
-        encoder.set_buffer(1, Some(b_buf), b_off);
-        encoder.set_buffer(2, Some(o_buf), o_off);
+        encoder.set_input_buffer(0, Some(x_buf), x_off);
+        encoder.set_input_buffer(1, Some(b_buf), b_off);
+        encoder.set_output_buffer(2, Some(o_buf), o_off);
         encoder.set_bytes(3, &(n_elements as i32));
         encoder.set_bytes(4, &(n_cols as i32));
 
@@ -500,10 +503,10 @@ pub fn triton_flash_attention(
     with_metal_buffers!(q, k, v, out, |q_buf, q_off, k_buf, k_off, v_buf, v_off, o_buf, o_off| {
         let encoder = device.command_encoder()?;
         encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(q_buf), q_off);
-        encoder.set_buffer(1, Some(k_buf), k_off);
-        encoder.set_buffer(2, Some(v_buf), v_off);
-        encoder.set_buffer(3, Some(o_buf), o_off);
+        encoder.set_input_buffer(0, Some(q_buf), q_off);
+        encoder.set_input_buffer(1, Some(k_buf), k_off);
+        encoder.set_input_buffer(2, Some(v_buf), v_off);
+        encoder.set_output_buffer(3, Some(o_buf), o_off);
         encoder.set_bytes(4, &(seq_len as i32));
         encoder.set_bytes(5, &stride_h);
         encoder.set_bytes(6, &stride_qkv);
@@ -548,9 +551,9 @@ pub fn triton_gemv_f16w(
     with_metal_buffers!(x, w, out, |x_buf, x_off, w_buf, w_off, o_buf, o_off| {
         let encoder = device.command_encoder()?;
         encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(x_buf), x_off);
-        encoder.set_buffer(1, Some(w_buf), w_off);
-        encoder.set_buffer(2, Some(o_buf), o_off);
+        encoder.set_input_buffer(0, Some(x_buf), x_off);
+        encoder.set_input_buffer(1, Some(w_buf), w_off);
+        encoder.set_output_buffer(2, Some(o_buf), o_off);
         encoder.set_bytes(3, &(n as i32));
         encoder.set_bytes(4, &(k as i32));
         encoder.set_bytes(5, &1i32);          // stride_wn = 1 (W[K,N])
@@ -574,10 +577,10 @@ pub fn triton_gemv_bias_f16w(
     with_metal_buffers!(x, w, bias, out, |x_buf, x_off, w_buf, w_off, b_buf, b_off, o_buf, o_off| {
         let encoder = device.command_encoder()?;
         encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(x_buf), x_off);
-        encoder.set_buffer(1, Some(w_buf), w_off);
-        encoder.set_buffer(2, Some(b_buf), b_off);
-        encoder.set_buffer(3, Some(o_buf), o_off);
+        encoder.set_input_buffer(0, Some(x_buf), x_off);
+        encoder.set_input_buffer(1, Some(w_buf), w_off);
+        encoder.set_input_buffer(2, Some(b_buf), b_off);
+        encoder.set_output_buffer(3, Some(o_buf), o_off);
         encoder.set_bytes(4, &(n as i32));
         encoder.set_bytes(5, &(k as i32));
         encoder.set_bytes(6, &1i32);          // stride_wn = 1
@@ -601,9 +604,9 @@ pub fn triton_layernorm_std_f32in(
     with_metal_buffers!(x, weight, out, |x_buf, x_off, w_buf, w_off, o_buf, o_off| {
         let encoder = device.command_encoder()?;
         encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(x_buf), x_off);
-        encoder.set_buffer(1, Some(w_buf), w_off);
-        encoder.set_buffer(2, Some(o_buf), o_off);
+        encoder.set_input_buffer(0, Some(x_buf), x_off);
+        encoder.set_input_buffer(1, Some(w_buf), w_off);
+        encoder.set_output_buffer(2, Some(o_buf), o_off);
         encoder.set_bytes(3, &(n_rows as i32));
         encoder.set_bytes(4, &(n_cols as i32));
         encoder.set_bytes(5, &(n_cols as i32)); // stride_x
@@ -628,9 +631,9 @@ pub fn triton_residual_add_f32(
     with_metal_buffers!(x, residual, out, |x_buf, x_off, r_buf, r_off, o_buf, o_off| {
         let encoder = device.command_encoder()?;
         encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(x_buf), x_off);
-        encoder.set_buffer(1, Some(r_buf), r_off);
-        encoder.set_buffer(2, Some(o_buf), o_off);
+        encoder.set_input_buffer(0, Some(x_buf), x_off);
+        encoder.set_input_buffer(1, Some(r_buf), r_off);
+        encoder.set_output_buffer(2, Some(o_buf), o_off);
         encoder.set_bytes(3, &(n_elements as i32));
         let grid_x = cdiv(n_elements, 1024);
         encoder.dispatch_thread_groups(
@@ -652,10 +655,10 @@ pub fn triton_attention_decode(
     with_metal_buffers!(q, k, v, out, |q_buf, q_off, k_buf, k_off, v_buf, v_off, o_buf, o_off| {
         let encoder = device.command_encoder()?;
         encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(q_buf), q_off);
-        encoder.set_buffer(1, Some(k_buf), k_off);
-        encoder.set_buffer(2, Some(v_buf), v_off);
-        encoder.set_buffer(3, Some(o_buf), o_off);
+        encoder.set_input_buffer(0, Some(q_buf), q_off);
+        encoder.set_input_buffer(1, Some(k_buf), k_off);
+        encoder.set_input_buffer(2, Some(v_buf), v_off);
+        encoder.set_output_buffer(3, Some(o_buf), o_off);
         encoder.set_bytes(4, &(kv_len as i32));
         encoder.set_bytes(5, &(n_q_heads as i32));
         encoder.set_bytes(6, &(n_kv_heads as i32));
@@ -689,8 +692,8 @@ pub fn triton_kv_cache_append(
         (Storage::Metal(m0), Storage::Metal(m1)) => {
             let encoder = device.command_encoder()?;
             encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(m0.buffer()), off0);
-            encoder.set_buffer(1, Some(m1.buffer()), off1);
+            encoder.set_input_buffer(0, Some(m0.buffer()), off0);
+            encoder.set_output_buffer(1, Some(m1.buffer()), off1);
             encoder.set_bytes(2, &(total_elems as i32));
             encoder.set_bytes(3, &(max_kv_len as i32));
             encoder.set_bytes(4, &(head_dim as i32));
@@ -721,8 +724,8 @@ pub fn triton_glu_silu(
         (Storage::Metal(m0), Storage::Metal(m1)) => {
             let encoder = device.command_encoder()?;
             encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(m0.buffer()), off0);
-            encoder.set_buffer(1, Some(m1.buffer()), off1);
+            encoder.set_input_buffer(0, Some(m0.buffer()), off0);
+            encoder.set_output_buffer(1, Some(m1.buffer()), off1);
             encoder.set_bytes(2, &(n_elements as i32));
             let grid_x = cdiv(n_elements, 1024);
             encoder.dispatch_thread_groups(
@@ -757,11 +760,11 @@ pub fn triton_residual_add_layernorm(
         (Storage::Metal(m0), Storage::Metal(m1), Storage::Metal(m2), Storage::Metal(m3), Storage::Metal(m4)) => {
             let encoder = device.command_encoder()?;
             encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(m0.buffer()), off0);
-            encoder.set_buffer(1, Some(m1.buffer()), off1);
-            encoder.set_buffer(2, Some(m2.buffer()), off2);
-            encoder.set_buffer(3, Some(m3.buffer()), off3);
-            encoder.set_buffer(4, Some(m4.buffer()), off4);
+            encoder.set_input_buffer(0, Some(m0.buffer()), off0);
+            encoder.set_input_buffer(1, Some(m1.buffer()), off1);
+            encoder.set_output_buffer(2, Some(m2.buffer()), off2);
+            encoder.set_input_buffer(3, Some(m3.buffer()), off3);
+            encoder.set_output_buffer(4, Some(m4.buffer()), off4);
             encoder.set_bytes(5, &(n_rows as i32));
             encoder.set_bytes(6, &(dim as i32));
             encoder.set_bytes(7, &(dim as i32)); // stride_in
@@ -788,10 +791,10 @@ pub fn triton_gemv_bias_glu(
     with_metal_buffers!(x, w, bias, out, |x_buf, x_off, w_buf, w_off, b_buf, b_off, o_buf, o_off| {
         let encoder = device.command_encoder()?;
         encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(x_buf), x_off);
-        encoder.set_buffer(1, Some(w_buf), w_off);
-        encoder.set_buffer(2, Some(b_buf), b_off);
-        encoder.set_buffer(3, Some(o_buf), o_off);
+        encoder.set_input_buffer(0, Some(x_buf), x_off);
+        encoder.set_input_buffer(1, Some(w_buf), w_off);
+        encoder.set_input_buffer(2, Some(b_buf), b_off);
+        encoder.set_output_buffer(3, Some(o_buf), o_off);
         encoder.set_bytes(4, &(n_intermediate as i32));
         encoder.set_bytes(5, &(k as i32));
         encoder.set_bytes(6, &1i32);                               // stride_wn = 1
@@ -830,12 +833,12 @@ pub fn triton_gemv_resadd_ln(
         (Storage::Metal(m0), Storage::Metal(m1), Storage::Metal(m2), Storage::Metal(m3), Storage::Metal(m4), Storage::Metal(m5)) => {
             let encoder = device.command_encoder()?;
             encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(m0.buffer()), off0);
-            encoder.set_buffer(1, Some(m1.buffer()), off1);
-            encoder.set_buffer(2, Some(m2.buffer()), off2);
-            encoder.set_buffer(3, Some(m3.buffer()), off3);
-            encoder.set_buffer(4, Some(m4.buffer()), off4);
-            encoder.set_buffer(5, Some(m5.buffer()), off5);
+            encoder.set_input_buffer(0, Some(m0.buffer()), off0);
+            encoder.set_input_buffer(1, Some(m1.buffer()), off1);
+            encoder.set_input_buffer(2, Some(m2.buffer()), off2);
+            encoder.set_output_buffer(3, Some(m3.buffer()), off3);
+            encoder.set_input_buffer(4, Some(m4.buffer()), off4);
+            encoder.set_output_buffer(5, Some(m5.buffer()), off5);
             encoder.set_bytes(6, &(dim as i32));
             encoder.set_bytes(7, &(gemv_k as i32));
             encoder.set_bytes(8, &1i32);          // stride_wn = 1
@@ -861,9 +864,9 @@ pub fn enc_gemv_f16w(
     x: &GpuBuffer, w: &GpuBuffer, out: &GpuBuffer, n: usize, k: usize,
 ) {
     enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(0, Some(x.buf()), x.offset);
-    enc.set_buffer(1, Some(w.buf()), w.offset);
-    enc.set_buffer(2, Some(out.buf()), out.offset);
+    enc.set_input_buffer(0, Some(x.buf()), x.offset);
+    enc.set_input_buffer(1, Some(w.buf()), w.offset);
+    enc.set_output_buffer(2, Some(out.buf()), out.offset);
     enc.set_bytes(3, &(n as i32));
     enc.set_bytes(4, &(k as i32));
     enc.set_bytes(5, &1i32);
@@ -879,9 +882,9 @@ pub fn enc_layernorm_std_f32in(
     x: &GpuBuffer, weight: &GpuBuffer, out: &GpuBuffer, n_rows: usize, n_cols: usize,
 ) {
     enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(0, Some(x.buf()), x.offset);
-    enc.set_buffer(1, Some(weight.buf()), weight.offset);
-    enc.set_buffer(2, Some(out.buf()), out.offset);
+    enc.set_input_buffer(0, Some(x.buf()), x.offset);
+    enc.set_input_buffer(1, Some(weight.buf()), weight.offset);
+    enc.set_output_buffer(2, Some(out.buf()), out.offset);
     enc.set_bytes(3, &(n_rows as i32));
     enc.set_bytes(4, &(n_cols as i32));
     enc.set_bytes(5, &(n_cols as i32));
@@ -901,10 +904,10 @@ pub fn enc_attention_decode(
     sm_scale: f32, stride_kv_head: usize, stride_kv_seq: usize,
 ) {
     enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(0, Some(q.buf()), q.offset);
-    enc.set_buffer(1, Some(k.buf()), k.offset);
-    enc.set_buffer(2, Some(v.buf()), v.offset);
-    enc.set_buffer(3, Some(out.buf()), out.offset);
+    enc.set_input_buffer(0, Some(q.buf()), q.offset);
+    enc.set_input_buffer(1, Some(k.buf()), k.offset);
+    enc.set_input_buffer(2, Some(v.buf()), v.offset);
+    enc.set_output_buffer(3, Some(out.buf()), out.offset);
     enc.set_bytes(4, &(kv_len as i32));
     enc.set_bytes(5, &(n_q_heads as i32));
     enc.set_bytes(6, &(n_kv_heads as i32));
@@ -934,10 +937,10 @@ pub fn enc_attention_splitkv(
 
     // Phase 1: partial attention per (head, split)
     enc.set_compute_pipeline_state(partial_pipeline);
-    enc.set_buffer(0, Some(q.buf()), q.offset);
-    enc.set_buffer(1, Some(k.buf()), k.offset);
-    enc.set_buffer(2, Some(v.buf()), v.offset);
-    enc.set_buffer(3, Some(partial_buf.buf()), partial_buf.offset);
+    enc.set_input_buffer(0, Some(q.buf()), q.offset);
+    enc.set_input_buffer(1, Some(k.buf()), k.offset);
+    enc.set_input_buffer(2, Some(v.buf()), v.offset);
+    enc.set_output_buffer(3, Some(partial_buf.buf()), partial_buf.offset);
     enc.set_bytes(4, &(kv_len as i32));
     enc.set_bytes(5, &(n_q_heads as i32));
     enc.set_bytes(6, &(n_kv_heads as i32));
@@ -957,8 +960,8 @@ pub fn enc_attention_splitkv(
 
     // Phase 2: reduce partials to final output
     enc.set_compute_pipeline_state(reduce_pipeline);
-    enc.set_buffer(0, Some(partial_buf.buf()), partial_buf.offset);
-    enc.set_buffer(1, Some(out.buf()), out.offset);
+    enc.set_input_buffer(0, Some(partial_buf.buf()), partial_buf.offset);
+    enc.set_output_buffer(1, Some(out.buf()), out.offset);
     enc.set_bytes(2, &(n_q_heads as i32));
     enc.set_bytes(3, &(n_splits as i32));
     enc.set_bytes(4, &(head_dim as i32));
@@ -975,10 +978,10 @@ pub fn enc_rope_qk_cache_fused(
     pos: usize, max_kv_len: usize,
 ) {
     enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(0, Some(q.buf()), q.offset);
-    enc.set_buffer(1, Some(k.buf()), k.offset);
-    enc.set_buffer(2, Some(rope_table.buf()), rope_table.offset);
-    enc.set_buffer(3, Some(cache_k.buf()), cache_k.offset);
+    enc.set_output_buffer(0, Some(q.buf()), q.offset);
+    enc.set_output_buffer(1, Some(k.buf()), k.offset);
+    enc.set_input_buffer(2, Some(rope_table.buf()), rope_table.offset);
+    enc.set_output_buffer(3, Some(cache_k.buf()), cache_k.offset);
     enc.set_bytes(4, &(pos as i32));
     enc.set_bytes(5, &(max_kv_len as i32));
     enc.dispatch_thread_groups(
@@ -994,8 +997,8 @@ pub fn enc_kv_cache_append(
 ) {
     let total_elems = n_kv_heads * head_dim;
     enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(0, Some(new_kv.buf()), new_kv.offset);
-    enc.set_buffer(1, Some(cache.buf()), cache.offset);
+    enc.set_input_buffer(0, Some(new_kv.buf()), new_kv.offset);
+    enc.set_output_buffer(1, Some(cache.buf()), cache.offset);
     enc.set_bytes(2, &(total_elems as i32));
     enc.set_bytes(3, &(max_kv_len as i32));
     enc.set_bytes(4, &(head_dim as i32));
@@ -1013,11 +1016,11 @@ pub fn enc_residual_add_layernorm(
     n_rows: usize, dim: usize,
 ) {
     enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(0, Some(f16_proj.buf()), f16_proj.offset);
-    enc.set_buffer(1, Some(f32_residual.buf()), f32_residual.offset);
-    enc.set_buffer(2, Some(f32_out.buf()), f32_out.offset);
-    enc.set_buffer(3, Some(weight.buf()), weight.offset);
-    enc.set_buffer(4, Some(f16_norm.buf()), f16_norm.offset);
+    enc.set_input_buffer(0, Some(f16_proj.buf()), f16_proj.offset);
+    enc.set_input_buffer(1, Some(f32_residual.buf()), f32_residual.offset);
+    enc.set_output_buffer(2, Some(f32_out.buf()), f32_out.offset);
+    enc.set_input_buffer(3, Some(weight.buf()), weight.offset);
+    enc.set_output_buffer(4, Some(f16_norm.buf()), f16_norm.offset);
     enc.set_bytes(5, &(n_rows as i32));
     enc.set_bytes(6, &(dim as i32));
     enc.set_bytes(7, &(dim as i32));
@@ -1043,9 +1046,9 @@ pub fn enc_gemv_splitk_bias(
 
     // Phase 1: partial GEMV (n_n_blocks baked into kernel as constexpr)
     enc.set_compute_pipeline_state(partial_pipeline);
-    enc.set_buffer(0, Some(x.buf()), x.offset);
-    enc.set_buffer(1, Some(w.buf()), w.offset);
-    enc.set_buffer(2, Some(partial_buf.buf()), partial_buf.offset);
+    enc.set_input_buffer(0, Some(x.buf()), x.offset);
+    enc.set_input_buffer(1, Some(w.buf()), w.offset);
+    enc.set_output_buffer(2, Some(partial_buf.buf()), partial_buf.offset);
     enc.set_bytes(3, &(n as i32));
     enc.set_bytes(4, &(k as i32));
     enc.set_bytes(5, &(stride_wk as i32));
@@ -1059,9 +1062,9 @@ pub fn enc_gemv_splitk_bias(
     enc.insert_memory_barrier();
     // Phase 2: reduce + bias
     enc.set_compute_pipeline_state(reduce_pipeline);
-    enc.set_buffer(0, Some(partial_buf.buf()), partial_buf.offset);
-    enc.set_buffer(1, Some(bias.buf()), bias.offset);
-    enc.set_buffer(2, Some(out.buf()), out.offset);
+    enc.set_input_buffer(0, Some(partial_buf.buf()), partial_buf.offset);
+    enc.set_input_buffer(1, Some(bias.buf()), bias.offset);
+    enc.set_output_buffer(2, Some(out.buf()), out.offset);
     enc.set_bytes(3, &(n as i32));
     enc.set_bytes(4, &(n_splits as i32));
     enc.set_bytes(5, &(stride_partial as i32));
@@ -1084,9 +1087,9 @@ pub fn enc_gemv_splitk(
 
     // Phase 1: partial GEMV (n_n_blocks baked into kernel as constexpr)
     enc.set_compute_pipeline_state(partial_pipeline);
-    enc.set_buffer(0, Some(x.buf()), x.offset);
-    enc.set_buffer(1, Some(w.buf()), w.offset);
-    enc.set_buffer(2, Some(partial_buf.buf()), partial_buf.offset);
+    enc.set_input_buffer(0, Some(x.buf()), x.offset);
+    enc.set_input_buffer(1, Some(w.buf()), w.offset);
+    enc.set_output_buffer(2, Some(partial_buf.buf()), partial_buf.offset);
     enc.set_bytes(3, &(n as i32));
     enc.set_bytes(4, &(k as i32));
     enc.set_bytes(5, &(stride_wk as i32));
@@ -1100,8 +1103,8 @@ pub fn enc_gemv_splitk(
     enc.insert_memory_barrier();
     // Phase 2: reduce
     enc.set_compute_pipeline_state(reduce_pipeline);
-    enc.set_buffer(0, Some(partial_buf.buf()), partial_buf.offset);
-    enc.set_buffer(1, Some(out.buf()), out.offset);
+    enc.set_input_buffer(0, Some(partial_buf.buf()), partial_buf.offset);
+    enc.set_output_buffer(1, Some(out.buf()), out.offset);
     enc.set_bytes(2, &(n as i32));
     enc.set_bytes(3, &(n_splits as i32));
     enc.set_bytes(4, &(stride_partial as i32));
@@ -1126,11 +1129,11 @@ pub fn enc_gemv_qkv_splitk(
 
     // Phase 1: fused QKV partial (n_n_blocks baked into kernel as constexpr)
     enc.set_compute_pipeline_state(partial_pipeline);
-    enc.set_buffer(0, Some(x.buf()), x.offset);
-    enc.set_buffer(1, Some(wq.buf()), wq.offset);
-    enc.set_buffer(2, Some(wk.buf()), wk.offset);
-    enc.set_buffer(3, Some(wv.buf()), wv.offset);
-    enc.set_buffer(4, Some(partial_buf.buf()), partial_buf.offset);
+    enc.set_input_buffer(0, Some(x.buf()), x.offset);
+    enc.set_input_buffer(1, Some(wq.buf()), wq.offset);
+    enc.set_input_buffer(2, Some(wk.buf()), wk.offset);
+    enc.set_input_buffer(3, Some(wv.buf()), wv.offset);
+    enc.set_output_buffer(4, Some(partial_buf.buf()), partial_buf.offset);
     enc.set_bytes(5, &(n as i32));
     enc.set_bytes(6, &(k as i32));
     enc.set_bytes(7, &(stride_wk as i32));
@@ -1144,10 +1147,10 @@ pub fn enc_gemv_qkv_splitk(
     enc.insert_memory_barrier();
     // Phase 2: fused QKV reduce (grid: cdiv(N,128) × 3)
     enc.set_compute_pipeline_state(reduce_pipeline);
-    enc.set_buffer(0, Some(partial_buf.buf()), partial_buf.offset);
-    enc.set_buffer(1, Some(oq.buf()), oq.offset);
-    enc.set_buffer(2, Some(ok.buf()), ok.offset);
-    enc.set_buffer(3, Some(ov.buf()), ov.offset);
+    enc.set_input_buffer(0, Some(partial_buf.buf()), partial_buf.offset);
+    enc.set_output_buffer(1, Some(oq.buf()), oq.offset);
+    enc.set_output_buffer(2, Some(ok.buf()), ok.offset);
+    enc.set_output_buffer(3, Some(ov.buf()), ov.offset);
     enc.set_bytes(4, &(n as i32));
     enc.set_bytes(5, &(n_splits as i32));
     enc.set_bytes(6, &(stride_partial as i32));
@@ -1170,9 +1173,9 @@ pub fn enc_gemv_glu_splitk(
 
     // Phase 1: partial GEMV (n_n_blocks baked into kernel as constexpr)
     enc.set_compute_pipeline_state(partial_pipeline);
-    enc.set_buffer(0, Some(x.buf()), x.offset);
-    enc.set_buffer(1, Some(w.buf()), w.offset);
-    enc.set_buffer(2, Some(partial_buf.buf()), partial_buf.offset);
+    enc.set_input_buffer(0, Some(x.buf()), x.offset);
+    enc.set_input_buffer(1, Some(w.buf()), w.offset);
+    enc.set_output_buffer(2, Some(partial_buf.buf()), partial_buf.offset);
     enc.set_bytes(3, &(n_intermediate as i32));
     enc.set_bytes(4, &(k as i32));
     enc.set_bytes(5, &(stride_wk as i32));
@@ -1186,9 +1189,9 @@ pub fn enc_gemv_glu_splitk(
     enc.insert_memory_barrier();
     // Phase 2: reduce + bias + GLU-SiLU
     enc.set_compute_pipeline_state(reduce_pipeline);
-    enc.set_buffer(0, Some(partial_buf.buf()), partial_buf.offset);
-    enc.set_buffer(1, Some(bias.buf()), bias.offset);
-    enc.set_buffer(2, Some(out.buf()), out.offset);
+    enc.set_input_buffer(0, Some(partial_buf.buf()), partial_buf.offset);
+    enc.set_input_buffer(1, Some(bias.buf()), bias.offset);
+    enc.set_output_buffer(2, Some(out.buf()), out.offset);
     enc.set_bytes(3, &(n_intermediate as i32));
     enc.set_bytes(4, &(n_splits as i32));
     enc.set_bytes(5, &(stride_partial as i32));
@@ -1205,9 +1208,9 @@ pub fn enc_matmul(
     m: usize, n: usize, k: usize, block_m: usize, block_n: usize,
 ) {
     enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(0, Some(a.buf()), a.offset);
-    enc.set_buffer(1, Some(b.buf()), b.offset);
-    enc.set_buffer(2, Some(out.buf()), out.offset);
+    enc.set_input_buffer(0, Some(a.buf()), a.offset);
+    enc.set_input_buffer(1, Some(b.buf()), b.offset);
+    enc.set_output_buffer(2, Some(out.buf()), out.offset);
     enc.set_bytes(3, &(m as i32));
     enc.set_bytes(4, &(n as i32));
     enc.set_bytes(5, &(k as i32));
@@ -1233,10 +1236,10 @@ pub fn enc_matmul_bias(
     m: usize, n: usize, k: usize, block_m: usize, block_n: usize,
 ) {
     enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(0, Some(a.buf()), a.offset);
-    enc.set_buffer(1, Some(b.buf()), b.offset);
-    enc.set_buffer(2, Some(bias.buf()), bias.offset);
-    enc.set_buffer(3, Some(out.buf()), out.offset);
+    enc.set_input_buffer(0, Some(a.buf()), a.offset);
+    enc.set_input_buffer(1, Some(b.buf()), b.offset);
+    enc.set_input_buffer(2, Some(bias.buf()), bias.offset);
+    enc.set_output_buffer(3, Some(out.buf()), out.offset);
     enc.set_bytes(4, &(m as i32));
     enc.set_bytes(5, &(n as i32));
     enc.set_bytes(6, &(k as i32));
@@ -1262,10 +1265,10 @@ pub fn enc_matmul_bias_gelu(
     m: usize, n: usize, k: usize, block_m: usize, block_n: usize,
 ) {
     enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(0, Some(a.buf()), a.offset);
-    enc.set_buffer(1, Some(b.buf()), b.offset);
-    enc.set_buffer(2, Some(bias.buf()), bias.offset);
-    enc.set_buffer(3, Some(out.buf()), out.offset);
+    enc.set_input_buffer(0, Some(a.buf()), a.offset);
+    enc.set_input_buffer(1, Some(b.buf()), b.offset);
+    enc.set_input_buffer(2, Some(bias.buf()), bias.offset);
+    enc.set_output_buffer(3, Some(out.buf()), out.offset);
     enc.set_bytes(4, &(m as i32));
     enc.set_bytes(5, &(n as i32));
     enc.set_bytes(6, &(k as i32));
@@ -1291,8 +1294,8 @@ pub fn enc_layernorm_bare(
     n_rows: usize, n_cols: usize,
 ) {
     enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(0, Some(x.buf()), x.offset);
-    enc.set_buffer(1, Some(out.buf()), out.offset);
+    enc.set_input_buffer(0, Some(x.buf()), x.offset);
+    enc.set_output_buffer(1, Some(out.buf()), out.offset);
     enc.set_bytes(2, &(n_rows as i32));
     enc.set_bytes(3, &(n_cols as i32));
     enc.set_bytes(4, &(n_cols as i32));
@@ -1309,9 +1312,9 @@ pub fn enc_layernorm_unit_offset(
     n_rows: usize, n_cols: usize,
 ) {
     enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(0, Some(x.buf()), x.offset);
-    enc.set_buffer(1, Some(gamma.buf()), gamma.offset);
-    enc.set_buffer(2, Some(out.buf()), out.offset);
+    enc.set_input_buffer(0, Some(x.buf()), x.offset);
+    enc.set_input_buffer(1, Some(gamma.buf()), gamma.offset);
+    enc.set_output_buffer(2, Some(out.buf()), out.offset);
     enc.set_bytes(3, &(n_rows as i32));
     enc.set_bytes(4, &(n_cols as i32));
     enc.set_bytes(5, &(n_cols as i32));
@@ -1327,8 +1330,8 @@ pub fn enc_gelu(
     x: &GpuBuffer, out: &GpuBuffer, n_elements: usize,
 ) {
     enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(0, Some(x.buf()), x.offset);
-    enc.set_buffer(1, Some(out.buf()), out.offset);
+    enc.set_input_buffer(0, Some(x.buf()), x.offset);
+    enc.set_output_buffer(1, Some(out.buf()), out.offset);
     enc.set_bytes(2, &(n_elements as i32));
     let grid = MTLSize { width: cdiv(n_elements, 1024), height: 1, depth: 1 };
     enc.dispatch_thread_groups(grid, tg_size(pipeline, 1024));
@@ -1339,9 +1342,9 @@ pub fn enc_residual_add(
     x: &GpuBuffer, residual: &GpuBuffer, out: &GpuBuffer, n_elements: usize,
 ) {
     enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(0, Some(x.buf()), x.offset);
-    enc.set_buffer(1, Some(residual.buf()), residual.offset);
-    enc.set_buffer(2, Some(out.buf()), out.offset);
+    enc.set_input_buffer(0, Some(x.buf()), x.offset);
+    enc.set_input_buffer(1, Some(residual.buf()), residual.offset);
+    enc.set_output_buffer(2, Some(out.buf()), out.offset);
     enc.set_bytes(3, &(n_elements as i32));
     let tg_w = tg_size(pipeline, 1024).width;
     let grid = MTLSize { width: cdiv(n_elements, tg_w), height: 1, depth: 1 };
@@ -1353,9 +1356,9 @@ pub fn enc_bias_add(
     x: &GpuBuffer, bias: &GpuBuffer, out: &GpuBuffer, n_elements: usize, n_cols: usize,
 ) {
     enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(0, Some(x.buf()), x.offset);
-    enc.set_buffer(1, Some(bias.buf()), bias.offset);
-    enc.set_buffer(2, Some(out.buf()), out.offset);
+    enc.set_input_buffer(0, Some(x.buf()), x.offset);
+    enc.set_input_buffer(1, Some(bias.buf()), bias.offset);
+    enc.set_output_buffer(2, Some(out.buf()), out.offset);
     enc.set_bytes(3, &(n_elements as i32));
     enc.set_bytes(4, &(n_cols as i32));
     let tg_w = tg_size(pipeline, 1024).width;
@@ -1371,10 +1374,10 @@ pub fn enc_flash_attention(
     sm_scale: f32, window_left: i32, window_right: i32,
 ) {
     enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(0, Some(q.buf()), q.offset);
-    enc.set_buffer(1, Some(k.buf()), k.offset);
-    enc.set_buffer(2, Some(v.buf()), v.offset);
-    enc.set_buffer(3, Some(out.buf()), out.offset);
+    enc.set_input_buffer(0, Some(q.buf()), q.offset);
+    enc.set_input_buffer(1, Some(k.buf()), k.offset);
+    enc.set_input_buffer(2, Some(v.buf()), v.offset);
+    enc.set_output_buffer(3, Some(out.buf()), out.offset);
     enc.set_bytes(4, &(seq_len as i32));
     enc.set_bytes(5, &stride_h);
     enc.set_bytes(6, &stride_m);
@@ -1412,8 +1415,8 @@ pub fn enc_convert_f32_to_f16(
     dst: &GpuBuffer, n_elements: usize,
 ) {
     enc.set_compute_pipeline_state(pipeline);
-    enc.set_buffer(0, Some(src_buf), src_offset);
-    enc.set_buffer(1, Some(dst.buf()), dst.offset);
+    enc.set_input_buffer(0, Some(src_buf), src_offset);
+    enc.set_output_buffer(1, Some(dst.buf()), dst.offset);
     enc.set_bytes(2, &(n_elements as i32));
     let grid = MTLSize { width: cdiv(n_elements, 1024), height: 1, depth: 1 };
     enc.dispatch_thread_groups(grid, tg_size(pipeline, 1024));

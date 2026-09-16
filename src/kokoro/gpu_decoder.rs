@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::cell::RefCell;
 
 use super::gpu_backend::KokoroGpuBackend;
-use crate::triton_kernels::LegacyBufferBinding;
+use crate::triton_kernels::CommandEncoderExt;
 
 include!("../../kernels/out/generated/kokoro_metal_gen.rs");
 
@@ -139,8 +139,8 @@ impl KokoroGpuDecoder {
         let stats_buf = self.alloc_f32(channels * 2).unwrap();
         let encoder = self.device.command_encoder().unwrap();
         encoder.set_compute_pipeline_state(&self.kernels.instance_norm_stats_f32in_2k);
-        encoder.set_buffer(0, Some(x_f32_buf.buf()), x_f32_buf.offset);
-        encoder.set_buffer(1, Some(stats_buf.buf()), stats_buf.offset);
+        encoder.set_input_buffer(0, Some(x_f32_buf.buf()), x_f32_buf.offset);
+        encoder.set_output_buffer(1, Some(stats_buf.buf()), stats_buf.offset);
         encoder.set_bytes(2, &(channels as i32));
         encoder.set_bytes(3, &(seq_len as i32));
         let max_tg = self.kernels.instance_norm_stats_f32in_2k.max_total_threads_per_threadgroup() as usize;
@@ -270,8 +270,8 @@ impl KokoroGpuDecoder {
         // Use 2k variant (seq_len <= 2048)
         let encoder = self.device.command_encoder().unwrap();
         encoder.set_compute_pipeline_state(&self.kernels.instance_norm_stats_f32in_2k);
-        encoder.set_buffer(0, Some(x_buf.buf()), x_buf.offset);
-        encoder.set_buffer(1, Some(stats_buf.buf()), stats_buf.offset);
+        encoder.set_input_buffer(0, Some(x_buf.buf()), x_buf.offset);
+        encoder.set_output_buffer(1, Some(stats_buf.buf()), stats_buf.offset);
         encoder.set_bytes(2, &(channels as i32));
         encoder.set_bytes(3, &(seq_len as i32));
         let max_tg = self.kernels.instance_norm_stats_f32in_2k.max_total_threads_per_threadgroup() as usize;
@@ -494,9 +494,9 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         let out = self.alloc(n)?;
         let encoder = self.device.command_encoder()?;
         encoder.set_compute_pipeline_state(&self.kernels.add);
-        encoder.set_buffer(0, Some(a.buf()), a.offset);
-        encoder.set_buffer(1, Some(b.buf()), b.offset);
-        encoder.set_buffer(2, Some(out.buf()), out.offset);
+        encoder.set_input_buffer(0, Some(a.buf()), a.offset);
+        encoder.set_input_buffer(1, Some(b.buf()), b.offset);
+        encoder.set_output_buffer(2, Some(out.buf()), out.offset);
         encoder.set_bytes(3, &(n as i32));
         let max_tg = self.kernels.add.max_total_threads_per_threadgroup() as usize;
         let tg_width = 1024.min(max_tg);
@@ -510,8 +510,8 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         let out = self.alloc(n)?;
         let encoder = self.device.command_encoder()?;
         encoder.set_compute_pipeline_state(&self.kernels.scale_third);
-        encoder.set_buffer(0, Some(x.buf()), x.offset);
-        encoder.set_buffer(1, Some(out.buf()), out.offset);
+        encoder.set_input_buffer(0, Some(x.buf()), x.offset);
+        encoder.set_output_buffer(1, Some(out.buf()), out.offset);
         encoder.set_bytes(2, &(n as i32));
         let max_tg = self.kernels.scale_third.max_total_threads_per_threadgroup() as usize;
         let tg_width = 1024.min(max_tg);
@@ -531,8 +531,8 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         };
         let encoder = self.device.command_encoder()?;
         encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(x.buf()), x.offset);
-        encoder.set_buffer(1, Some(out.buf()), out.offset);
+        encoder.set_input_buffer(0, Some(x.buf()), x.offset);
+        encoder.set_output_buffer(1, Some(out.buf()), out.offset);
         encoder.set_bytes(2, &(n_elements as i32));
         let max_tg = pipeline.max_total_threads_per_threadgroup() as usize;
         let tg_width = 1024.min(max_tg);
@@ -546,9 +546,9 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
              n_elements: usize, channels: usize, seq_len: usize) -> Result<()> {
         let encoder = self.device.command_encoder()?;
         encoder.set_compute_pipeline_state(&self.kernels.snake);
-        encoder.set_buffer(0, Some(x.buf()), x.offset);
-        encoder.set_buffer(1, Some(alpha.buf()), alpha.offset);
-        encoder.set_buffer(2, Some(out.buf()), out.offset);
+        encoder.set_input_buffer(0, Some(x.buf()), x.offset);
+        encoder.set_input_buffer(1, Some(alpha.buf()), alpha.offset);
+        encoder.set_output_buffer(2, Some(out.buf()), out.offset);
         encoder.set_bytes(3, &(n_elements as i32));
         encoder.set_bytes(4, &(channels as i32));
         encoder.set_bytes(5, &(seq_len as i32));
@@ -572,11 +572,11 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         };
         let encoder = self.device.command_encoder()?;
         encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(x.buf()), x.offset);
-        encoder.set_buffer(1, Some(gamma.buf()), gamma.offset);
-        encoder.set_buffer(2, Some(beta.buf()), beta.offset);
-        encoder.set_buffer(3, Some(alpha.buf()), alpha.offset);
-        encoder.set_buffer(4, Some(out.buf()), out.offset);
+        encoder.set_input_buffer(0, Some(x.buf()), x.offset);
+        encoder.set_input_buffer(1, Some(gamma.buf()), gamma.offset);
+        encoder.set_input_buffer(2, Some(beta.buf()), beta.offset);
+        encoder.set_input_buffer(3, Some(alpha.buf()), alpha.offset);
+        encoder.set_output_buffer(4, Some(out.buf()), out.offset);
         encoder.set_bytes(5, &(channels as i32));
         encoder.set_bytes(6, &(seq_len as i32));
         let grid = MTLSize { width: channels, height: 1, depth: 1 };
@@ -592,10 +592,10 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
               k: usize, stride: usize, padding: usize, dilation: usize) -> Result<()> {
         let encoder = self.device.command_encoder()?;
         encoder.set_compute_pipeline_state(&self.kernels.conv1d);
-        encoder.set_buffer(0, Some(x.buf()), x.offset);
-        encoder.set_buffer(1, Some(w.buf()), w.offset);
-        encoder.set_buffer(2, Some(bias.buf()), bias.offset);
-        encoder.set_buffer(3, Some(out.buf()), out.offset);
+        encoder.set_input_buffer(0, Some(x.buf()), x.offset);
+        encoder.set_input_buffer(1, Some(w.buf()), w.offset);
+        encoder.set_input_buffer(2, Some(bias.buf()), bias.offset);
+        encoder.set_output_buffer(3, Some(out.buf()), out.offset);
         encoder.set_bytes(4, &(c_in as i32));
         encoder.set_bytes(5, &(c_out as i32));
         encoder.set_bytes(6, &(t_in as i32));
@@ -629,10 +629,10 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
                         k: usize, stride: usize, padding: usize) -> Result<()> {
         let encoder = self.device.command_encoder()?;
         encoder.set_compute_pipeline_state(&self.kernels.conv_transpose1d);
-        encoder.set_buffer(0, Some(x.buf()), x.offset);
-        encoder.set_buffer(1, Some(w.buf()), w.offset);
-        encoder.set_buffer(2, Some(bias.buf()), bias.offset);
-        encoder.set_buffer(3, Some(out.buf()), out.offset);
+        encoder.set_input_buffer(0, Some(x.buf()), x.offset);
+        encoder.set_input_buffer(1, Some(w.buf()), w.offset);
+        encoder.set_input_buffer(2, Some(bias.buf()), bias.offset);
+        encoder.set_output_buffer(3, Some(out.buf()), out.offset);
         encoder.set_bytes(4, &(c_in as i32));
         encoder.set_bytes(5, &(c_out as i32));
         encoder.set_bytes(6, &(t_in as i32));
@@ -676,8 +676,8 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         let n_out = channels * (seq_len + 1);
         let encoder = self.device.command_encoder()?;
         encoder.set_compute_pipeline_state(&self.kernels.reflection_pad1d);
-        encoder.set_buffer(0, Some(x.buf()), x.offset);
-        encoder.set_buffer(1, Some(out.buf()), out.offset);
+        encoder.set_input_buffer(0, Some(x.buf()), x.offset);
+        encoder.set_output_buffer(1, Some(out.buf()), out.offset);
         encoder.set_bytes(2, &(channels as i32));
         encoder.set_bytes(3, &(seq_len as i32));
         let max_tg = self.kernels.reflection_pad1d.max_total_threads_per_threadgroup() as usize;
@@ -694,8 +694,8 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         let n_elements = c_in * k * t_out;
         let encoder = self.device.command_encoder()?;
         encoder.set_compute_pipeline_state(&self.kernels.im2col);
-        encoder.set_buffer(0, Some(x.buf()), x.offset);
-        encoder.set_buffer(1, Some(out.buf()), out.offset);
+        encoder.set_input_buffer(0, Some(x.buf()), x.offset);
+        encoder.set_output_buffer(1, Some(out.buf()), out.offset);
         encoder.set_bytes(2, &(c_in as i32));
         encoder.set_bytes(3, &(t_in as i32));
         encoder.set_bytes(4, &(t_out as i32));
@@ -717,8 +717,8 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         let n_elements = c_in * k * t_out;
         let encoder = self.device.command_encoder()?;
         encoder.set_compute_pipeline_state(&self.kernels.im2col_lrelu);
-        encoder.set_buffer(0, Some(x.buf()), x.offset);
-        encoder.set_buffer(1, Some(out.buf()), out.offset);
+        encoder.set_input_buffer(0, Some(x.buf()), x.offset);
+        encoder.set_output_buffer(1, Some(out.buf()), out.offset);
         encoder.set_bytes(2, &(c_in as i32));
         encoder.set_bytes(3, &(t_in as i32));
         encoder.set_bytes(4, &(t_out as i32));
@@ -740,9 +740,9 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         let encoder = self.device.command_encoder()?;
 
         encoder.set_compute_pipeline_state(&self.kernels.matmul);
-        encoder.set_buffer(0, Some(w.buf()), w.offset);       // A
-        encoder.set_buffer(1, Some(col.buf()), col.offset);   // B
-        encoder.set_buffer(2, Some(out.buf()), out.offset);   // C
+        encoder.set_input_buffer(0, Some(w.buf()), w.offset);       // A
+        encoder.set_input_buffer(1, Some(col.buf()), col.offset);   // B
+        encoder.set_output_buffer(2, Some(out.buf()), out.offset);   // C
         encoder.set_bytes(3, &(c_out as i32));    // M
         encoder.set_bytes(4, &(t_out as i32));    // N
         encoder.set_bytes(5, &(kk as i32));       // K
@@ -760,9 +760,9 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         // Row-broadcast bias add (reads/writes out written by matmul above)
         let n = c_out * t_out;
         encoder.set_compute_pipeline_state(&self.kernels.row_bias_add);
-        encoder.set_buffer(0, Some(out.buf()), out.offset);
-        encoder.set_buffer(1, Some(bias.buf()), bias.offset);
-        encoder.set_buffer(2, Some(out.buf()), out.offset);
+        encoder.set_input_buffer(0, Some(out.buf()), out.offset);
+        encoder.set_input_buffer(1, Some(bias.buf()), bias.offset);
+        encoder.set_output_buffer(2, Some(out.buf()), out.offset);
         encoder.set_bytes(3, &(n as i32));
         encoder.set_bytes(4, &(t_out as i32));
         let max_tg = self.kernels.row_bias_add.max_total_threads_per_threadgroup() as usize;
@@ -789,8 +789,8 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
     fn f16_to_f32(&self, x: &GpuBuffer, out: &GpuBuffer, n: usize) -> Result<()> {
         let encoder = self.device.command_encoder()?;
         encoder.set_compute_pipeline_state(&self.kernels.f16_to_f32);
-        encoder.set_buffer(0, Some(x.buf()), x.offset);
-        encoder.set_buffer(1, Some(out.buf()), out.offset);
+        encoder.set_input_buffer(0, Some(x.buf()), x.offset);
+        encoder.set_output_buffer(1, Some(out.buf()), out.offset);
         encoder.set_bytes(2, &(n as i32));
         let max_tg = self.kernels.f16_to_f32.max_total_threads_per_threadgroup() as usize;
         let tg_width = 1024.min(max_tg);
@@ -803,8 +803,8 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
     fn f32_to_f16(&self, x: &GpuBuffer, out: &GpuBuffer, n: usize) -> Result<()> {
         let encoder = self.device.command_encoder()?;
         encoder.set_compute_pipeline_state(&self.kernels.f32_to_f16);
-        encoder.set_buffer(0, Some(x.buf()), x.offset);
-        encoder.set_buffer(1, Some(out.buf()), out.offset);
+        encoder.set_input_buffer(0, Some(x.buf()), x.offset);
+        encoder.set_output_buffer(1, Some(out.buf()), out.offset);
         encoder.set_bytes(2, &(n as i32));
         let max_tg = self.kernels.f32_to_f16.max_total_threads_per_threadgroup() as usize;
         let tg_width = 1024.min(max_tg);
@@ -820,8 +820,8 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         let n_elements = c_in * k * t_out;
         let encoder = self.device.command_encoder()?;
         encoder.set_compute_pipeline_state(&self.kernels.im2col_f32_to_f16);
-        encoder.set_buffer(0, Some(x.buf()), x.offset);
-        encoder.set_buffer(1, Some(out.buf()), out.offset);
+        encoder.set_input_buffer(0, Some(x.buf()), x.offset);
+        encoder.set_output_buffer(1, Some(out.buf()), out.offset);
         encoder.set_bytes(2, &(c_in as i32));
         encoder.set_bytes(3, &(t_in as i32));
         encoder.set_bytes(4, &(t_out as i32));
@@ -865,10 +865,10 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         // Fallback to naive kernel
         let encoder = self.device.command_encoder()?;
         encoder.set_compute_pipeline_state(&self.kernels.conv1d_f32io);
-        encoder.set_buffer(0, Some(x.buf()), x.offset);
-        encoder.set_buffer(1, Some(w.buf()), w.offset);
-        encoder.set_buffer(2, Some(bias.buf()), bias.offset);
-        encoder.set_buffer(3, Some(out.buf()), out.offset);
+        encoder.set_input_buffer(0, Some(x.buf()), x.offset);
+        encoder.set_input_buffer(1, Some(w.buf()), w.offset);
+        encoder.set_input_buffer(2, Some(bias.buf()), bias.offset);
+        encoder.set_output_buffer(3, Some(out.buf()), out.offset);
         encoder.set_bytes(4, &(c_in as i32));
         encoder.set_bytes(5, &(c_out as i32));
         encoder.set_bytes(6, &(t_in as i32));
@@ -905,8 +905,8 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         if max_tg >= 1024 {
             let encoder = self.device.command_encoder()?;
             encoder.set_compute_pipeline_state(stats_pipeline);
-            encoder.set_buffer(0, Some(x.buf()), x.offset);
-            encoder.set_buffer(1, Some(stats_buf.buf()), stats_buf.offset);
+            encoder.set_input_buffer(0, Some(x.buf()), x.offset);
+            encoder.set_output_buffer(1, Some(stats_buf.buf()), stats_buf.offset);
             encoder.set_bytes(2, &(channels as i32));
             encoder.set_bytes(3, &(seq_len as i32));
             let grid = MTLSize { width: channels, height: 1, depth: 1 };
@@ -932,12 +932,12 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         // 2) Normalize + style + snake (reads stats_buf written above)
         let encoder = self.device.command_encoder()?;
         encoder.set_compute_pipeline_state(&self.kernels.norm_style_snake_f32io);
-        encoder.set_buffer(0, Some(x.buf()), x.offset);
-        encoder.set_buffer(1, Some(stats_buf.buf()), stats_buf.offset);
-        encoder.set_buffer(2, Some(gamma.buf()), gamma.offset);
-        encoder.set_buffer(3, Some(beta.buf()), beta.offset);
-        encoder.set_buffer(4, Some(alpha.buf()), alpha.offset);
-        encoder.set_buffer(5, Some(out.buf()), out.offset);
+        encoder.set_input_buffer(0, Some(x.buf()), x.offset);
+        encoder.set_input_buffer(1, Some(stats_buf.buf()), stats_buf.offset);
+        encoder.set_input_buffer(2, Some(gamma.buf()), gamma.offset);
+        encoder.set_input_buffer(3, Some(beta.buf()), beta.offset);
+        encoder.set_input_buffer(4, Some(alpha.buf()), alpha.offset);
+        encoder.set_output_buffer(5, Some(out.buf()), out.offset);
         encoder.set_bytes(6, &(n_elements as i32));
         encoder.set_bytes(7, &(channels as i32));
         encoder.set_bytes(8, &(seq_len as i32));
@@ -952,9 +952,9 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
     fn add_f32(&self, a: &GpuBuffer, b: &GpuBuffer, out: &GpuBuffer, n: usize) -> Result<()> {
         let encoder = self.device.command_encoder()?;
         encoder.set_compute_pipeline_state(&self.kernels.add_f32);
-        encoder.set_buffer(0, Some(a.buf()), a.offset);
-        encoder.set_buffer(1, Some(b.buf()), b.offset);
-        encoder.set_buffer(2, Some(out.buf()), out.offset);
+        encoder.set_input_buffer(0, Some(a.buf()), a.offset);
+        encoder.set_input_buffer(1, Some(b.buf()), b.offset);
+        encoder.set_output_buffer(2, Some(out.buf()), out.offset);
         encoder.set_bytes(3, &(n as i32));
         let max_tg = self.kernels.add_f32.max_total_threads_per_threadgroup() as usize;
         let tg_width = 1024.min(max_tg);
@@ -967,8 +967,8 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
     fn scale_third_f32(&self, x: &GpuBuffer, out: &GpuBuffer, n: usize) -> Result<()> {
         let encoder = self.device.command_encoder()?;
         encoder.set_compute_pipeline_state(&self.kernels.scale_third_f32);
-        encoder.set_buffer(0, Some(x.buf()), x.offset);
-        encoder.set_buffer(1, Some(out.buf()), out.offset);
+        encoder.set_input_buffer(0, Some(x.buf()), x.offset);
+        encoder.set_output_buffer(1, Some(out.buf()), out.offset);
         encoder.set_bytes(2, &(n as i32));
         let max_tg = self.kernels.scale_third_f32.max_total_threads_per_threadgroup() as usize;
         let tg_width = 1024.min(max_tg);
@@ -986,8 +986,8 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         };
         let encoder = self.device.command_encoder()?;
         encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(x.buf()), x.offset);
-        encoder.set_buffer(1, Some(out.buf()), out.offset);
+        encoder.set_input_buffer(0, Some(x.buf()), x.offset);
+        encoder.set_output_buffer(1, Some(out.buf()), out.offset);
         encoder.set_bytes(2, &(n as i32));
         let max_tg = pipeline.max_total_threads_per_threadgroup() as usize;
         let tg_width = 1024.min(max_tg);
@@ -1002,10 +1002,10 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
                                     k: usize, stride: usize, padding: usize) -> Result<()> {
         let encoder = self.device.command_encoder()?;
         encoder.set_compute_pipeline_state(&self.kernels.conv_transpose1d_f32io_lrelu);
-        encoder.set_buffer(0, Some(x.buf()), x.offset);
-        encoder.set_buffer(1, Some(w.buf()), w.offset);
-        encoder.set_buffer(2, Some(bias.buf()), bias.offset);
-        encoder.set_buffer(3, Some(out.buf()), out.offset);
+        encoder.set_input_buffer(0, Some(x.buf()), x.offset);
+        encoder.set_input_buffer(1, Some(w.buf()), w.offset);
+        encoder.set_input_buffer(2, Some(bias.buf()), bias.offset);
+        encoder.set_output_buffer(3, Some(out.buf()), out.offset);
         encoder.set_bytes(4, &(c_in as i32));
         encoder.set_bytes(5, &(c_out as i32));
         encoder.set_bytes(6, &(t_in as i32));
@@ -1025,10 +1025,10 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
                               k: usize, stride: usize, padding: usize) -> Result<()> {
         let encoder = self.device.command_encoder()?;
         encoder.set_compute_pipeline_state(&self.kernels.conv_transpose1d_f32io);
-        encoder.set_buffer(0, Some(x.buf()), x.offset);
-        encoder.set_buffer(1, Some(w.buf()), w.offset);
-        encoder.set_buffer(2, Some(bias.buf()), bias.offset);
-        encoder.set_buffer(3, Some(out.buf()), out.offset);
+        encoder.set_input_buffer(0, Some(x.buf()), x.offset);
+        encoder.set_input_buffer(1, Some(w.buf()), w.offset);
+        encoder.set_input_buffer(2, Some(bias.buf()), bias.offset);
+        encoder.set_output_buffer(3, Some(out.buf()), out.offset);
         encoder.set_bytes(4, &(c_in as i32));
         encoder.set_bytes(5, &(c_out as i32));
         encoder.set_bytes(6, &(t_in as i32));
@@ -1047,8 +1047,8 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
         let n_out = channels * (seq_len + 1);
         let encoder = self.device.command_encoder()?;
         encoder.set_compute_pipeline_state(&self.kernels.reflection_pad1d_f32);
-        encoder.set_buffer(0, Some(x.buf()), x.offset);
-        encoder.set_buffer(1, Some(out.buf()), out.offset);
+        encoder.set_input_buffer(0, Some(x.buf()), x.offset);
+        encoder.set_output_buffer(1, Some(out.buf()), out.offset);
         encoder.set_bytes(2, &(channels as i32));
         encoder.set_bytes(3, &(seq_len as i32));
         let max_tg = self.kernels.reflection_pad1d_f32.max_total_threads_per_threadgroup() as usize;
@@ -1062,8 +1062,8 @@ impl KokoroGpuBackend for KokoroGpuDecoder {
     fn istft_gpu(&self, x: &GpuBuffer, out: &GpuBuffer, n_frames: usize, out_len: usize) -> Result<()> {
         let encoder = self.device.command_encoder()?;
         encoder.set_compute_pipeline_state(&self.kernels.istft_fused);
-        encoder.set_buffer(0, Some(x.buf()), x.offset);
-        encoder.set_buffer(1, Some(out.buf()), out.offset);
+        encoder.set_input_buffer(0, Some(x.buf()), x.offset);
+        encoder.set_output_buffer(1, Some(out.buf()), out.offset);
         encoder.set_bytes(2, &(n_frames as i32));
         encoder.set_bytes(3, &(out_len as i32));
         let max_tg = self.kernels.istft_fused.max_total_threads_per_threadgroup() as usize;

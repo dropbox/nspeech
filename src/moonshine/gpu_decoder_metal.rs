@@ -195,6 +195,7 @@ impl DecoderBackend for MetalBackend {
             temp, res_in, res_out,
             ln_w, norm_out,
             1, dim);
+        drop(enc);
         self.finish_dispatch();
     }
 
