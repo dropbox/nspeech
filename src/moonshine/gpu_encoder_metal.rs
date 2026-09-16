@@ -2,10 +2,10 @@
 
 use anyhow::Result;
 use candle_core::{MetalDevice, Storage, Tensor};
-use candle_metal_kernels::metal::{ComputeCommandEncoder, ComputePipeline};
+use candle_metal_kernels::metal::ComputePipeline;
 
 use crate::triton_kernels::{
-    GpuBuffer, TritonKernels,
+    CommandEncoderGuard, GpuBuffer, TritonKernels,
     enc_matmul, enc_matmul_bias, enc_matmul_bias_gelu,
     enc_layernorm_bare, enc_layernorm_unit_offset,
     enc_gelu, enc_residual_add, enc_bias_add, enc_flash_attention,
@@ -55,8 +55,10 @@ impl MetalEncoderBackend {
     /// Get a command encoder from Candle's command buffer pool.
     /// Each call may return an encoder on the same or a different command buffer,
     /// matching the per-dispatch pattern that gives the GPU scheduler maximum freedom.
-    fn enc(&self) -> ComputeCommandEncoder {
-        self.device.command_encoder().expect("Failed to get command encoder")
+    fn enc(&self) -> CommandEncoderGuard<'_> {
+        CommandEncoderGuard(
+            self.device.command_encoder().expect("Failed to get command encoder")
+        )
     }
 
     /// Select the best matmul pipeline and tile size.
@@ -111,10 +113,9 @@ impl EncoderBackend for MetalEncoderBackend {
             let ptr = staging.contents_ptr() as *mut half::f16;
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
         }
-        let blit = self.device.blit_command_encoder()
+        let mut blit = self.device.blit_command_encoder()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         blit.copy_from_buffer(staging.buf(), 0, dst.buf(), 0, data.len() * 2);
-        blit.end_encoding();
         Ok(())
     }
 
@@ -124,10 +125,10 @@ impl EncoderBackend for MetalEncoderBackend {
 
     fn download_f16(&self, buf: &GpuBuffer, count: usize) -> Result<Vec<half::f16>> {
         let staging = self.staging_f16(count)?;
-        let blit = self.device.blit_command_encoder()
+        let mut blit = self.device.blit_command_encoder()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         blit.copy_from_buffer(buf.buf(), 0, staging.buf(), 0, count * 2);
-        blit.end_encoding();
+        drop(blit);
         self.device.wait_until_completed()?;
         let ptr = staging.contents_ptr() as *const half::f16;
         let data = unsafe { std::slice::from_raw_parts(ptr, count) };
@@ -255,10 +256,9 @@ impl EncoderBackend for MetalEncoderBackend {
 
         // Zero padding region via blit fill (buffer is private storage).
         if padded_n > n {
-            let blit = self.device.blit_command_encoder()
+            let mut blit = self.device.blit_command_encoder()
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             blit.fill_buffer(dst.buf(), (n * 2, (padded_n - n) * 2), 0);
-            blit.end_encoding();
         }
 
         // Dispatch f32→f16 convert kernel.

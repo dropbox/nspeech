@@ -1,12 +1,10 @@
 //! Metal backend for the shared GPU decoder.
 
-use std::cell::RefCell;
 use anyhow::Result;
 use candle_core::MetalDevice;
-use candle_metal_kernels::metal::ComputeCommandEncoder;
 
 use crate::triton_kernels::{
-    DecoderKernels, GpuBuffer, TritonKernels,
+    CommandEncoderGuard, DecoderKernels, GpuBuffer, TritonKernels,
     enc_gemv_f16w, enc_matmul,
     enc_layernorm_std_f32in, enc_attention_decode, enc_attention_splitkv,
     enc_rope_qk_cache_fused, enc_kv_cache_append,
@@ -24,8 +22,6 @@ pub struct MetalBackend {
     device: MetalDevice,
     kernels: DecoderKernels,
     encoder_kernels: TritonKernels,
-    /// Active compute command encoder (set during begin_pass..end_pass).
-    encoder: RefCell<Option<ComputeCommandEncoder>>,
     /// Split-KV partial buffer for cross-attention.
     f32_splitkv_partial: GpuBuffer,
     /// Split-K partial buffer for GEMV operations.
@@ -47,7 +43,6 @@ impl MetalBackend {
             device: device.clone(),
             kernels,
             encoder_kernels,
-            encoder: RefCell::new(None),
             f32_splitkv_partial,
             f16_partial,
         })
@@ -55,8 +50,10 @@ impl MetalBackend {
 
     pub fn device(&self) -> &MetalDevice { &self.device }
 
-    fn enc(&self) -> std::cell::Ref<'_, ComputeCommandEncoder> {
-        std::cell::Ref::map(self.encoder.borrow(), |e| e.as_ref().unwrap())
+    fn enc(&self) -> CommandEncoderGuard<'_> {
+        CommandEncoderGuard(
+            self.device.command_encoder().expect("Failed to get command encoder")
+        )
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -94,7 +91,6 @@ impl DecoderBackend for MetalBackend {
     }
 
     fn begin_pass(&self) -> Result<()> {
-        *self.encoder.borrow_mut() = Some(self.device.command_encoder()?);
         Ok(())
     }
 
@@ -107,8 +103,6 @@ impl DecoderBackend for MetalBackend {
     }
 
     fn end_pass(&self) -> Result<()> {
-        let enc = self.encoder.borrow_mut().take().unwrap();
-        drop(enc);
         self.device.wait_until_completed()?;
         Ok(())
     }

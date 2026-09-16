@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::cell::RefCell;
 
 use super::gpu_backend::KokoroGpuBackend;
+use crate::triton_kernels::LegacyBufferBinding;
 
 include!("../../kernels/out/generated/kokoro_metal_gen.rs");
 

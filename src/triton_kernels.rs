@@ -7,8 +7,11 @@
 use anyhow::Result;
 use candle_core::{DType, MetalDevice, Shape, Storage, Tensor};
 pub use candle_core::GpuBuffer;
-use candle_metal_kernels::metal::{Buffer, ComputePipeline};
+use candle_metal_kernels::metal::{
+    Buffer, CommandsGuard, ComputeCommandEncoder, ComputePipeline,
+};
 use objc2_metal::MTLSize;
+use std::ops::Deref;
 
 // Auto-generated: kernel_data module, TritonKernels struct + load(),
 // DecoderKernels struct + load().
@@ -18,12 +21,61 @@ fn cdiv(a: usize, b: usize) -> usize {
     (a + b - 1) / b
 }
 
+/// A deref-able wrapper around Candle's pooled command-encoder guard.
+///
+/// Candle 0.11 deliberately stopped returning a clonable encoder here: the
+/// guard keeps the command-pool lock held for the duration of one dispatch.
+pub struct CommandEncoderGuard<'a>(pub CommandsGuard<'a>);
+
+impl Deref for CommandEncoderGuard<'_> {
+    type Target = ComputeCommandEncoder;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
+    }
+}
+
+/// Compatibility for generated dispatch code which predates Candle's split
+/// input/output binding API. Treating an unclassified binding as an output is
+/// conservative: it preserves RAW/WAR/WAW ordering, at the cost of an
+/// occasional unnecessary barrier. New dispatch code should use the explicit
+/// `set_input_buffer` and `set_output_buffer` methods instead.
+pub trait LegacyBufferBinding {
+    fn set_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize);
+    fn set_bytes<T>(&self, index: usize, data: &T);
+    fn set_threadgroup_memory_length(&self, index: usize, length: usize);
+    fn dispatch_threads(&self, grid: MTLSize, threadgroup: MTLSize);
+    fn dispatch_thread_groups(&self, grid: MTLSize, threadgroup: MTLSize);
+}
+
+impl<T: AsRef<ComputeCommandEncoder>> LegacyBufferBinding for T {
+    fn set_buffer(&self, index: usize, buffer: Option<&Buffer>, offset: usize) {
+        self.as_ref().set_output_buffer(index, buffer, offset);
+    }
+
+    fn set_bytes<U>(&self, index: usize, data: &U) {
+        self.as_ref().set_bytes(index, data);
+    }
+
+    fn set_threadgroup_memory_length(&self, index: usize, length: usize) {
+        self.as_ref().set_threadgroup_memory_length(index, length);
+    }
+
+    fn dispatch_threads(&self, grid: MTLSize, threadgroup: MTLSize) {
+        self.as_ref().dispatch_threads(grid, threadgroup);
+    }
+
+    fn dispatch_thread_groups(&self, grid: MTLSize, threadgroup: MTLSize) {
+        self.as_ref().dispatch_thread_groups(grid, threadgroup);
+    }
+}
+
 /// Set dynamic threadgroup memory for AIR kernels.
 /// AIR kernels declare threadgroup memory as a function parameter (ptr addrspace(3)),
 /// unlike MSL which uses static `threadgroup` declarations. This must be called before
 /// dispatch for any AIR kernel that uses shared memory. Safe to call for MSL too (no-op).
 #[cfg(target_arch = "aarch64")]
-fn set_air_tg_mem(encoder: &candle_metal_kernels::metal::ComputeCommandEncoder, bytes: usize) {
+fn set_air_tg_mem(encoder: &impl AsRef<ComputeCommandEncoder>, bytes: usize) {
     if bytes > 0 {
         encoder.set_threadgroup_memory_length(0, bytes);
     }
@@ -803,8 +855,6 @@ pub fn triton_gemv_resadd_ln(
 // ── Batched dispatch (shared encoder, MetalBuffer) ──────────────────────────
 // These variants accept a &ComputeCommandEncoder + &GpuBuffer, allowing ~200
 // dispatches per decoder token to share a single encoder. No Tensor overhead.
-
-use candle_metal_kernels::metal::ComputeCommandEncoder;
 
 pub fn enc_gemv_f16w(
     enc: &ComputeCommandEncoder, pipeline: &ComputePipeline,
