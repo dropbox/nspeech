@@ -60,13 +60,15 @@ impl Phonemizer {
         let mut result = String::new();
         let normalized = normalize_text(text);
         let segments = split_segments(&normalized);
+        let mut join_next_word = false;
 
         for segment in &segments {
             match segment {
                 Segment::Word(w) => {
-                    if !result.is_empty() && !result.ends_with(' ') {
+                    if !join_next_word && !result.is_empty() && !result.ends_with(' ') {
                         result.push(' ');
                     }
+                    join_next_word = false;
                     let (ipa, _is_acronym) = self.word_to_ipa_tagged(w);
                     result.push_str(&ipa);
                 }
@@ -82,6 +84,7 @@ impl Phonemizer {
                         result.push(' ');
                     }
                 }
+                Segment::Join => join_next_word = true,
             }
         }
         result
@@ -95,6 +98,22 @@ impl Phonemizer {
         // R2D2, V2, R2, R3000, etc.
         if is_spelled_alphanumeric(word) {
             return (spell_out(word), true);
+        }
+
+        // A lowercase plural/possessive suffix belongs to the whole acronym:
+        // GPUs is GPU + z, rather than the camel-case parts GP + Us.
+        if let Some(base) = word.strip_suffix("'s").or_else(|| word.strip_suffix('s')) {
+            if base.len() > 1 && base.chars().all(|c| c.is_ascii_uppercase()) {
+                let (ipa, is_spelled) = self.word_to_ipa_tagged(base);
+                let suffix = if ipa.ends_with(['s', 'z', 'ʃ', 'ʒ', 'ʧ', 'ʤ']) {
+                    "ɪz"
+                } else if ends_voiced(&ipa) {
+                    "z"
+                } else {
+                    "s"
+                };
+                return (format!("{ipa}{suffix}"), is_spelled);
+            }
         }
 
         // Mixed case: split at case boundaries (e.g. macOS→"mac"+"OS", DBApp→"DB"+"App")
@@ -430,20 +449,29 @@ enum Segment {
     Word(String),
     Punct(char),
     Space,
+    Join,
 }
 
 fn split_segments(text: &str) -> Vec<Segment> {
     let mut segments = Vec::new();
     let mut current_word = String::new();
 
-    for ch in text.chars() {
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
         if ch.is_alphanumeric() || ch == '\'' {
             current_word.push(ch);
         } else {
+            // Compound hyphens join pronunciations without a pause token.
+            // Spaced hyphens and sentence dashes remain punctuation.
+            let joins_words = matches!(ch, '-' | '\u{2010}' | '\u{2011}')
+                && current_word.chars().last().is_some_and(|c| c.is_alphabetic())
+                && chars.peek().is_some_and(|c| c.is_alphabetic());
             if !current_word.is_empty() {
                 segments.push(Segment::Word(std::mem::take(&mut current_word)));
             }
-            if ch.is_whitespace() {
+            if joins_words {
+                segments.push(Segment::Join);
+            } else if ch.is_whitespace() {
                 segments.push(Segment::Space);
             } else {
                 segments.push(Segment::Punct(ch));
@@ -737,6 +765,36 @@ mod tests {
     }
 
     #[test]
+    fn hyphenated_compounds_have_no_pause_token() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../../assets/kokoro-config.json")).unwrap();
+        let vocab = serde_json::from_value(config["vocab"].clone()).unwrap();
+        let phonemizer = Phonemizer::new(
+            include_str!("../../assets/us_gold.json"),
+            include_str!("../../assets/us_silver.json"),
+            &vocab,
+        ).unwrap();
+
+        let joined = format!("{}{}", phonemizer.to_ipa("stress"), phonemizer.to_ipa("tested"));
+        for compound in ["stress-tested", "stress‐tested", "stress‑tested"] {
+            assert_eq!(phonemizer.to_ipa(compound), joined);
+            assert_eq!(phonemizer.phonemize(compound), tokenize_ipa(&joined, &vocab));
+        }
+        assert_eq!(
+            phonemizer.to_ipa("stress-tested well-known"),
+            format!("{joined} {}{}", phonemizer.to_ipa("well"), phonemizer.to_ipa("known")),
+        );
+        assert_eq!(
+            phonemizer.to_ipa("stress—tested"),
+            format!("{}— {}", phonemizer.to_ipa("stress"), phonemizer.to_ipa("tested")),
+        );
+        assert_eq!(
+            phonemizer.to_ipa("stress - tested"),
+            format!("{} - {}", phonemizer.to_ipa("stress"), phonemizer.to_ipa("tested")),
+        );
+    }
+
+    #[test]
     fn spells_uppercase_alphanumeric_sequences() {
         let phonemizer = empty_phonemizer();
 
@@ -744,6 +802,34 @@ mod tests {
             phonemizer.to_ipa("R2D2 V2 R2 R3000"),
             "ˌɑɹ-tˌu-dˌi-tˈu vˈi-tˈu ˈɑɹ-tˈu ˌɑɹ-θɹˌi-zˌɪɹO-zˌɪɹO-zˈɪɹO"
         );
+    }
+
+    #[test]
+    fn plural_acronyms_keep_all_letters() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../../assets/kokoro-config.json")).unwrap();
+        let vocab = serde_json::from_value(config["vocab"].clone()).unwrap();
+        let phonemizer = Phonemizer::new(
+            include_str!("../../assets/us_gold.json"),
+            include_str!("../../assets/us_silver.json"),
+            &vocab,
+        ).unwrap();
+
+        assert_eq!(phonemizer.to_ipa("GPUs"), "ʤˌi-pˌi-jˈuz");
+        for base in ["GPU", "CPU", "API", "SSD", "URL", "NASA"] {
+            let expected = format!("{}z", phonemizer.to_ipa(base));
+            assert_eq!(phonemizer.to_ipa(&format!("{base}s")), expected);
+            assert_eq!(phonemizer.to_ipa(&format!("{base}'s")), expected);
+        }
+        assert_eq!(phonemizer.to_ipa("PDFs"), format!("{}s", phonemizer.to_ipa("PDF")));
+        assert_eq!(phonemizer.to_ipa("GPSs"), format!("{}ɪz", phonemizer.to_ipa("GPS")));
+        assert_eq!(
+            phonemizer.phonemize("I need more GPUs"),
+            tokenize_ipa(&format!("{} ʤˌi-pˌi-jˈuz", phonemizer.to_ipa("I need more")), &vocab),
+        );
+        assert_ne!(phonemizer.phonemize("GPUs"), phonemizer.phonemize("GPS"));
+        assert_eq!(split_camel_case("DBApp"), ["DB", "App"]);
+        assert_eq!(split_camel_case("macOS"), ["mac", "OS"]);
     }
 
     #[test]
